@@ -1,0 +1,17 @@
+# secrets & local state
+.env
+.env.*
+creds/
+**/database.sqlite
+n8n/db/
+infra/nginx/
+
+# python/node cruft
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/node_modules/
+
+# editor cruft
+.DS_Store
+*.log

@@ -1,0 +1,6 @@
+HTTP/1.1 200 OK
+content-type: application/json
+content-length: 44
+date: Sat, 25 Oct 2025 08:48:34 GMT
+
+{"nanosecond heartbeat":1761382114585517270}

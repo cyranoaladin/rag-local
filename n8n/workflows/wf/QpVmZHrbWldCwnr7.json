@@ -1,0 +1,84 @@
+{
+  "createdAt": "2025-10-22T22:11:43.969Z",
+  "updatedAt": "2025-10-22T22:14:26.000Z",
+  "id": "QpVmZHrbWldCwnr7",
+  "name": "RAG Ingestion (rag-ingest-1761171100)",
+  "active": true,
+  "isArchived": false,
+  "nodes": [
+    {
+      "parameters": {
+        "path": "rag-ingest-1761171100",
+        "httpMethod": "POST",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "WebhookIngest",
+      "name": "Webhook Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "url": "http://ingestor:8001/ingest",
+        "method": "POST",
+        "sendBody": true,
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "={{ $json }}"
+      },
+      "id": "HTTPIngestor",
+      "name": "HTTP to Ingestor API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        560,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook Ingest": {
+      "main": [
+        [
+          {
+            "node": "HTTP to Ingestor API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": null,
+  "staticData": null,
+  "meta": null,
+  "pinData": null,
+  "versionId": null,
+  "triggerCount": 1,
+  "tags": [],
+  "shared": [
+    {
+      "createdAt": "2025-10-22T22:11:43.976Z",
+      "updatedAt": "2025-10-22T22:11:43.976Z",
+      "role": "workflow:owner",
+      "workflowId": "QpVmZHrbWldCwnr7",
+      "projectId": "lo2DsPhno4snIlB1",
+      "project": {
+        "createdAt": "2025-10-22T18:49:12.211Z",
+        "updatedAt": "2025-10-22T18:49:12.211Z",
+        "id": "lo2DsPhno4snIlB1",
+        "name": "Unnamed Project",
+        "type": "personal",
+        "icon": null,
+        "description": null
+      }
+    }
+  ]
+}

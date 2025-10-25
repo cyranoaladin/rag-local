@@ -1,0 +1,6 @@
+NAME             IMAGE                            COMMAND                  SERVICE    CREATED        STATUS                PORTS
+rag-chroma-1     chromadb/chroma:1.1.1            "dumb-init -- chroma…"   chroma     40 hours ago   Up 40 hours           8000/tcp
+rag-ingestor-1   rag-ingestor                     "/usr/bin/tini -- uv…"   ingestor   2 days ago     Up 2 days (healthy)   
+rag-n8n-1        docker.n8n.io/n8nio/n8n:stable   "tini -- /docker-ent…"   n8n        2 days ago     Up 40 hours           127.0.0.1:15678->5678/tcp
+rag-ollama-1     ollama/ollama:0.3.13             "/bin/ollama serve"      ollama     2 days ago     Up 2 days (healthy)   11434/tcp
+rag-ui-1         rag-ui                           "streamlit run app.p…"   ui         2 days ago     Up 2 days             127.0.0.1:18501->8501/tcp
