@@ -1,0 +1,55 @@
+{
+  "name": "rag-local dev",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.11" },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": { "version": "latest", "moby": true },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "hostRequirements": { "cpus": 4, "memory": "8gb" },
+  "remoteUser": "vscode",
+  "updateRemoteUserUID": true,
+
+  "containerEnv": {
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_CACHE_DIR": "1"
+  },
+
+  "forwardPorts": [8001, 18501, 15678],
+  "portsAttributes": {
+    "8001":  { "label": "ingestor (FastAPI)" },
+    "18501": { "label": "UI (Streamlit via Nginx 18501→8501)" },
+    "15678": { "label": "n8n (loopback 15678→5678)" }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "GitHub.copilot",
+        "GitHub.copilot-chat",
+        "eamodio.gitlens",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "charliermarsh.ruff",
+        "ms-python.black-formatter",
+        "ms-azuretools.vscode-docker",
+        "ms-vscode-remote.remote-containers",
+        "humao.rest-client",
+        "42Crunch.vscode-openapi",
+        "alexcvzz.vscode-sqlite",
+        "redhat.vscode-yaml",
+        "mikestead.dotenv",
+        "yzhang.markdown-all-in-one",
+        "EditorConfig.EditorConfig",
+        "usernamehw.errorlens"
+      ]
+    }
+  },
+
+  "postCreateCommand": "python -m pip install --upgrade pip && pip install -r src/ingestor/requirements.txt -r src/ui/requirements.txt || true",
+  "postStartCommand": "echo 'Tip: docker compose -f infra/docker-compose.yml --env-file infra/.env up -d'",
+
+  "mounts": [
+    "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,consistency=cached"
+  ]
+}
