@@ -4,7 +4,7 @@
 creds/
 **/database.sqlite
 n8n/db/
-infra/nginx/
+infra/nginx/*.conf
 
 # python/node cruft
 **/__pycache__/

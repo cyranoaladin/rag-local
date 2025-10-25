@@ -1,0 +1,37 @@
+# Remplacez __UI_DOMAIN__ par votre domaine (ex: rag-ui.example.com)
+# et __UI_PORT__ par la valeur NGINX_UI_PORT de infra/.env (ex: 18501)
+
+server {
+  listen 80;
+  server_name __UI_DOMAIN__;
+  # HTTP -> HTTPS (certbot créera les blocs SSL)
+  location /.well-known/acme-challenge/ { root /var/www/html; }
+  location / { return 301 https://$host$request_uri; }
+}
+
+# Exemple de bloc HTTPS après certbot (à activer/ajuster sur le VPS)
+# server {
+#   listen 443 ssl http2;
+#   server_name __UI_DOMAIN__;
+#   ssl_certificate /etc/letsencrypt/live/__UI_DOMAIN__/fullchain.pem;
+#   ssl_certificate_key /etc/letsencrypt/live/__UI_DOMAIN__/privkey.pem;
+#   include /etc/letsencrypt/options-ssl-nginx.conf;
+#   ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+#
+#   client_max_body_size 64m;
+#
+#   location / {
+#     proxy_http_version 1.1;
+#     proxy_set_header Host $host;
+#     proxy_set_header X-Real-IP $remote_addr;
+#     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#     proxy_set_header X-Forwarded-Proto $scheme;
+#     proxy_set_header Upgrade $http_upgrade;
+#     proxy_set_header Connection "upgrade";
+#     proxy_read_timeout 600s;
+#     proxy_send_timeout 600s;
+#     proxy_pass http://127.0.0.1:__UI_PORT__;
+#   }
+#
+#   add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+# }
