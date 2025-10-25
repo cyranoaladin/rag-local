@@ -46,7 +46,7 @@ services:
           memory: 24G
 
   ingestor:
-    build: ./ingestor
+    build: ../src/ingestor
     restart: unless-stopped
     networks: [rag_net]
     environment:
@@ -94,7 +94,7 @@ services:
       - "127.0.0.1:${NGINX_N8N_PORT}:${N8N_PORT}"
 
   ui:
-    build: ./ui
+    build: ../src/ui
     restart: unless-stopped
     networks: [rag_net]
     environment:
