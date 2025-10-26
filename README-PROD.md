@@ -5,7 +5,7 @@ Ce projet fournit un **RAG 100% local** (LLM & embeddings via **Ollama**) avec *
 ## Prérequis VPS
 - Ubuntu 22.04/24.04, accès sudo, ports 80/443 ouverts, DNS des domaines pointés sur le VPS.
 - Docker + Compose plugin.
-- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN`, mots de passe n8n, etc.
+- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN`, les secrets n8n, ainsi qu’un `INGEST_AUTH_TOKEN` fort (ex: `openssl rand -hex 32`).
 
 ## Démarrage (services internes, non exposés)
 ```bash
