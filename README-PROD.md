@@ -15,9 +15,24 @@ docker compose -f infra/docker-compose.yml ps
 
 ## Exposition HTTPS (Nginx + Certbot)
 
-* Utiliser `infra/nginx/*.template` avec `envsubst` pour générer les vhosts.
+* Utiliser `infra/nginx/*.template` avec `envsubst` pour générer les vhosts (les templates n’emploient **pas** la syntaxe `${VAR:-def}`).
 * `certbot --nginx -d <domaines> --agree-tos -m <email> --redirect -n`
 * Les templates intègrent des headers de sécurité (HSTS, CSP, etc.).
+
+Exemple :
+```bash
+export RAG_EXTERNAL_DOMAIN="rag.example.com"
+export N8N_EXTERNAL_DOMAIN="automations.example.com"
+export NGINX_UI_PORT="18501"
+export NGINX_N8N_PORT="15678"
+export NGINX_CLIENT_MAX_BODY_SIZE="${NGINX_CLIENT_MAX_BODY_SIZE:-16m}"
+
+envsubst < infra/nginx/rag-ui.conf.template  | sudo tee /etc/nginx/sites-available/rag-ui.conf  >/dev/null
+envsubst < infra/nginx/rag-n8n.conf.template | sudo tee /etc/nginx/sites-available/rag-n8n.conf >/dev/null
+sudo ln -sf /etc/nginx/sites-available/rag-ui.conf  /etc/nginx/sites-enabled/rag-ui.conf
+sudo ln -sf /etc/nginx/sites-available/rag-n8n.conf /etc/nginx/sites-enabled/rag-n8n.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
 
 ## Ingestion
 
