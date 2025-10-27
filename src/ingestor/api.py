@@ -1,4 +1,4 @@
-# pylint: disable=missing-module-docstring,missing-class-docstring,missing-function-docstring
+# pylint: disable=missing-module-docstring,missing-class-docstring,missing-function-docstring,line-too-long,too-many-locals,too-many-branches,too-many-statements,wrong-import-position
 # cspell:ignore chromadb docx bs4 fastapi langchain gdrive nomic sha256 ollama allowlist metadatas CIDR
 # File: /srv/rag/ingestor/api.py
 from __future__ import annotations
@@ -11,11 +11,43 @@ import logging
 import os
 import socket
 import tempfile
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Optional, Protocol
 from urllib.parse import urlparse
 
-import requests  # type: ignore[import-untyped]
+import requests
+
+if TYPE_CHECKING:
+    class ChromaCollectionProtocol(Protocol):
+        def get(self, *, ids: Sequence[str]) -> Mapping[str, Sequence[Any]]: ...
+
+        def add(
+            self,
+            *,
+            documents: Sequence[str],
+            ids: Sequence[str],
+            metadatas: Sequence[Mapping[str, Any]],
+            embeddings: Sequence[Sequence[float]],
+        ) -> None: ...
+
+    class ChromaHttpClient(Protocol):
+        def get_or_create_collection(
+            self,
+            name: str,
+            metadata: Mapping[str, Any] | None = None,
+        ) -> ChromaCollectionProtocol: ...
+else:  # pragma: no cover - runtime fallback for optional deps
+    ChromaCollectionProtocol = Any
+    ChromaHttpClient = Any
+
+try:
+    from fastapi import FastAPI, Header, HTTPException, Request, status
+except ImportError as exc:  # pragma: no cover - fail fast with guidance
+    raise RuntimeError(
+        "Required module 'fastapi' is missing for the ingestion service. "
+        "Install dependencies with `pip install -r src/ingestor/requirements.txt`."
+    ) from exc
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -32,29 +64,22 @@ def _require_module(module_path: str, friendly_name: str):
 chromadb = _require_module("chromadb", "chromadb")
 docx = _require_module("docx", "python-docx")
 bs4_module = _require_module("bs4", "beautifulsoup4")
-BeautifulSoup = getattr(bs4_module, "BeautifulSoup")
-
-fastapi_module = _require_module("fastapi", "fastapi")
-FastAPI = getattr(fastapi_module, "FastAPI")
-Header = getattr(fastapi_module, "Header")
-HTTPException = getattr(fastapi_module, "HTTPException")
-Request = getattr(fastapi_module, "Request")
-status = getattr(fastapi_module, "status")
+BeautifulSoup = bs4_module.BeautifulSoup
 
 doc_loaders_module = _require_module("langchain_community.document_loaders", "langchain-community")
-PyPDFLoader = getattr(doc_loaders_module, "PyPDFLoader")
+PyPDFLoader = doc_loaders_module.PyPDFLoader
 
 embeddings_module = _require_module("langchain_community.embeddings", "langchain-community")
-OllamaEmbeddings = getattr(embeddings_module, "OllamaEmbeddings")
+OllamaEmbeddings = embeddings_module.OllamaEmbeddings
 
 documents_module = _require_module("langchain_core.documents", "langchain-core")
-Document = getattr(documents_module, "Document")
+Document = documents_module.Document
 
 google_module = _require_module("langchain_google_community", "langchain-google-community")
-GoogleDriveLoader = getattr(google_module, "GoogleDriveLoader")
+GoogleDriveLoader = google_module.GoogleDriveLoader
 
 splitters_module = _require_module("langchain_text_splitters", "langchain-text-splitters")
-RecursiveCharacterTextSplitter = getattr(splitters_module, "RecursiveCharacterTextSplitter")
+RecursiveCharacterTextSplitter = splitters_module.RecursiveCharacterTextSplitter
 
 
 # --- Configuration ---
@@ -99,7 +124,7 @@ for fallback in ("X-API-Token", "X-INGEST-TOKEN"):
     if fallback not in TOKEN_HEADER_CANDIDATES:
         TOKEN_HEADER_CANDIDATES.append(fallback)
 
-IP_ALLOWLIST_NETWORKS: list = []
+IP_ALLOWLIST_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 for cidr in IP_ALLOWLIST:
     try:
         IP_ALLOWLIST_NETWORKS.append(ipaddress.ip_network(cidr, strict=False))
@@ -115,12 +140,12 @@ class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     source_type: Literal["url", "gdrive_folder", "pdf", "docx"]
     source: str
-    metadata_hints: Dict[str, str] = Field(default_factory=dict, alias="hints")
+    metadata_hints: dict[str, str] = Field(default_factory=dict, alias="hints")
 
 # --- Utilities ---
 
 
-def normalize_metadata(d: Dict) -> Dict:
+def normalize_metadata(d: Mapping[str, Any]) -> dict[str, Any]:
     return {
         str(k).strip().lower().replace(" ", "_"): v
         for k, v in d.items()
@@ -258,7 +283,7 @@ def load_from_url(url: str):
 # --- Chroma client factory ---
 
 
-def get_chroma_client() -> chromadb.HttpClient:
+def get_chroma_client() -> ChromaHttpClient:
     return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 
 # --- Endpoint helpers ---
@@ -271,7 +296,7 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
-def _enforce_token(request: Request, provided_header: Optional[str]) -> None:
+def _enforce_token(request: Request, provided_header: str | None) -> None:
     if not API_TOKEN:
         return
     candidate = provided_header
@@ -301,14 +326,11 @@ def _enforce_ip_allowlist(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
 
-app = FastAPI(title="RAG Ingestor API")
-
-
 @app.post("/ingest")
 def ingest_data(
     req: IngestRequest,
     request: Request,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+    x_api_token: Annotated[Optional[str], Header(alias="X-API-Token")] = None,  # noqa: UP007,UP045 - Optional keeps py39 happy
 ):
     # 1) Load & access controls
     _enforce_token(request, x_api_token)
@@ -359,7 +381,7 @@ def ingest_data(
             "source": req.source,
         }
         merged.update(ch.metadata or {})
-        merged.update(req.metadata_hints or {})
+        merged.update(req.metadata_hints)
         ids.append(content_hash)
         documents.append(text)
         metadatas.append(normalize_metadata(merged))

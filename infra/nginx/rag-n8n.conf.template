@@ -13,7 +13,9 @@ server {
   add_header Referrer-Policy "no-referrer" always;
   add_header X-Frame-Options "SAMEORIGIN" always;
   add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
-  add_header Content-Security-Policy "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https: http:;" always;
+  add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; frame-ancestors 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';" always;
+  # À activer après mise en HTTPS :
+  # add_header Strict-Transport-Security "max-age=63072000" always;
 
   proxy_connect_timeout 5s;
   proxy_buffering off;
@@ -22,7 +24,7 @@ server {
     ${N8N_BASIC_AUTH_DIRECTIVE}
     ${N8N_BASIC_AUTH_USER_FILE_DIRECTIVE}
 
-    proxy_pass http://127.0.0.1:${NGINX_N8N_PORT};
+  proxy_pass http://${NGINX_N8N_UPSTREAM};
     proxy_http_version 1.1;
     proxy_set_header Upgrade $$http_upgrade;
     proxy_set_header Connection "upgrade";
