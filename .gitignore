@@ -18,3 +18,11 @@ infra/nginx/*.conf
 
 # local backups
 *.bak*
+# caches & env
+.mypy_cache/
+.pytest_cache/
+infra/.env
+infra/creds/*.json
+# local artifacts
+arborescence.txt
+compose-ps.txt

@@ -1,5 +1,9 @@
-import streamlit as st, requests, pandas as pd, os
+import os
+
 import chromadb
+import pandas as pd
+import requests
+import streamlit as st
 
 CHROMA_HOST = os.getenv("CHROMA_HOST","chroma")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT","8000"))
@@ -12,7 +16,7 @@ st.header("1) Lancer une ingestion (via n8n)")
 webhook = st.text_input("URL Webhook n8n (production)", "https://EXEMPLE.webhook.url/ingestion")
 with st.form("ingest"):
     source = st.text_input("URL / ID GDrive / Chemin", "https://eduscol.education.fr/...")
-    source_type = st.selectbox("Type", ["url","gdrive_folder","pdf","docx","py_dir"])
+    source_type = st.selectbox("Type", ["url", "gdrive_folder", "pdf", "docx"])
     c1,c2,c3 = st.columns(3)
     with c1:
         matiere = st.text_input("Matière","NSI"); voie = st.selectbox("Voie",["générale","technologique","commun"])
@@ -22,7 +26,7 @@ with st.form("ingest"):
         annee = st.number_input("Année", min_value=2010, max_value=2035, value=2024)
     if st.form_submit_button("Envoyer"):
         if not webhook.startswith("http"):
-            st.error("URL webhook invalide"); 
+            st.error("URL webhook invalide")
         else:
             payload = {"source":source, "source_type":source_type,
                        "hints":{"matiere":matiere,"voie":voie,"niveau":niveau,"document_type":doc_type,"annee_programme":annee}}

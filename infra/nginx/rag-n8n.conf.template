@@ -1,40 +1,38 @@
-# Remplacez __N8N_DOMAIN__ par votre domaine (ex: rag-n8n.example.com)
-# et __N8N_PORT__ par la valeur NGINX_N8N_PORT de infra/.env (ex: 15678)
-
+# n8n reverse proxy — HTTP loopback (Certbot gèrera HTTPS)
 server {
   listen 80;
-  server_name __N8N_DOMAIN__;
-  location /.well-known/acme-challenge/ { root /var/www/html; }
-  location / { return 301 https://$host$request_uri; }
-}
+  server_name ${N8N_EXTERNAL_DOMAIN};
+  client_max_body_size ${NGINX_CLIENT_MAX_BODY_SIZE};
 
-# Exemple de bloc HTTPS après certbot
-# server {
-#   listen 443 ssl http2;
-#   server_name __N8N_DOMAIN__;
-#   ssl_certificate /etc/letsencrypt/live/__N8N_DOMAIN__/fullchain.pem;
-#   ssl_certificate_key /etc/letsencrypt/live/__N8N_DOMAIN__/privkey.pem;
-#   include /etc/letsencrypt/options-ssl-nginx.conf;
-#   ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
-#
-#   # (Optionnel) Double BasicAuth Nginx en plus de celle de n8n
-#   # auth_basic "Restricted";
-#   # auth_basic_user_file /etc/nginx/.htpasswd-n8n;
-#
-#   client_max_body_size 32m;
-#
-#   location / {
-#     proxy_http_version 1.1;
-#     proxy_set_header Host $host;
-#     proxy_set_header X-Real-IP $remote_addr;
-#     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-#     proxy_set_header X-Forwarded-Proto $scheme;
-#     proxy_set_header Upgrade $http_upgrade;
-#     proxy_set_header Connection "upgrade";
-#     proxy_read_timeout 600s;
-#     proxy_send_timeout 600s;
-#     proxy_pass http://127.0.0.1:__N8N_PORT__;
-#   }
-#
-#   add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-# }
+  location ^~ /.well-known/acme-challenge/ {
+    root /var/www/html;
+  }
+
+  # --- Security headers ---
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer" always;
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+  add_header Content-Security-Policy "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: https: http:;" always;
+
+  proxy_connect_timeout 5s;
+  proxy_buffering off;
+
+  location / {
+    ${N8N_BASIC_AUTH_DIRECTIVE}
+    ${N8N_BASIC_AUTH_USER_FILE_DIRECTIVE}
+
+    proxy_pass http://127.0.0.1:${NGINX_N8N_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $$host;
+    proxy_set_header X-Real-IP $$remote_addr;
+    proxy_set_header X-Forwarded-Proto $$scheme;
+    proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $$host;
+    proxy_read_timeout 120s;
+    proxy_send_timeout 120s;
+    send_timeout 120s;
+  }
+}
