@@ -1,114 +1,66 @@
-# pylint: disable=missing-module-docstring,missing-class-docstring,missing-function-docstring
-# cspell:ignore chromadb docx bs4 fastapi langchain gdrive nomic sha256 ollama allowlist metadatas CIDR
-# File: /srv/rag/ingestor/api.py
+"""FastAPI entrypoint for the ingestion service."""
+
 from __future__ import annotations
 
 import hashlib
-import hmac
-import importlib
 import ipaddress
 import logging
 import os
 import socket
 import tempfile
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from typing import Dict, Iterable, Literal, Mapping, Sequence, cast
 from urllib.parse import urlparse
 
-import requests  # type: ignore[import-untyped]
+import chromadb
+import docx
+import requests
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from chromadb.api.types import SparseVector
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_core.documents import Document
+from langchain_google_community import GoogleDriveLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, ConfigDict, Field
 
-
-def _require_module(module_path: str, friendly_name: str):
-    try:
-        return importlib.import_module(module_path)
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError(
-            f"Required module '{friendly_name}' is missing for the ingestion service. "
-            "Install dependencies with `pip install -r src/ingestor/requirements.txt`."
-        ) from exc
+from mm_adapter import Chunk, MMConfig, yield_chunks_from_path
+from schemas import IngestResponse
 
 
-chromadb = _require_module("chromadb", "chromadb")
-docx = _require_module("docx", "python-docx")
-bs4_module = _require_module("bs4", "beautifulsoup4")
-BeautifulSoup = getattr(bs4_module, "BeautifulSoup")
-
-fastapi_module = _require_module("fastapi", "fastapi")
-FastAPI = getattr(fastapi_module, "FastAPI")
-Header = getattr(fastapi_module, "Header")
-HTTPException = getattr(fastapi_module, "HTTPException")
-Request = getattr(fastapi_module, "Request")
-status = getattr(fastapi_module, "status")
-
-doc_loaders_module = _require_module("langchain_community.document_loaders", "langchain-community")
-PyPDFLoader = getattr(doc_loaders_module, "PyPDFLoader")
-
-embeddings_module = _require_module("langchain_community.embeddings", "langchain-community")
-OllamaEmbeddings = getattr(embeddings_module, "OllamaEmbeddings")
-
-documents_module = _require_module("langchain_core.documents", "langchain-core")
-Document = getattr(documents_module, "Document")
-
-google_module = _require_module("langchain_google_community", "langchain-google-community")
-GoogleDriveLoader = getattr(google_module, "GoogleDriveLoader")
-
-splitters_module = _require_module("langchain_text_splitters", "langchain-text-splitters")
-RecursiveCharacterTextSplitter = getattr(splitters_module, "RecursiveCharacterTextSplitter")
-
-
-# --- Configuration ---
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-COLLECTION_NAME = "ressources_pedagogiques_terminale"
+COLLECTION_NAME = os.getenv(
+    "COLLECTION_NAME", "ressources_pedagogiques_terminale"
+)
 MAX_REMOTE_BYTES = int(os.getenv("MAX_REMOTE_BYTES", str(10 * 1024 * 1024)))
 LOCAL_SOURCE_ROOT = Path(os.getenv("LOCAL_SOURCE_ROOT", "/data/uploads")).resolve()
 ALLOW_UNRESTRICTED_LOCAL = os.getenv("ALLOW_UNRESTRICTED_LOCAL", "false").lower() == "true"
 URL_SCHEMES_ALLOWED = {"http", "https"}
-API_TOKEN = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
-API_TOKEN_HEADER = os.getenv(
-    "INGESTOR_TOKEN_HEADER",
-    os.getenv("INGEST_AUTH_HEADER", "X-API-Token"),
-)
-IP_ALLOWLIST = [
-    entry.strip()
-    for entry in os.getenv("INGESTOR_IP_ALLOWLIST", "").split(",")
-    if entry.strip()
-]
-USER_AGENT = os.getenv(
-    "USER_AGENT",
-    os.getenv(
-        "INGEST_REQUEST_UA",
-        "rag-local-ingestor/1.0 (+https://github.com/cyranoaladin/rag-local)",
-    ),
-)
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
+DISALLOWED_UPLOAD_SUFFIXES = {".exe", ".bat", ".cmd", ".zip", ".tar", ".gz", ".7z"}
+ALLOWED_UPLOAD_SUFFIXES = {
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+}
+ALLOWED_UPLOAD_MIME = {
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+}
 
-logger = logging.getLogger("ingestor")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.addHandler(handler)
-logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
-
-TOKEN_HEADER_CANDIDATES = [header for header in (API_TOKEN_HEADER or "",) if header]
-for fallback in ("X-API-Token", "X-INGEST-TOKEN"):
-    if fallback not in TOKEN_HEADER_CANDIDATES:
-        TOKEN_HEADER_CANDIDATES.append(fallback)
-
-IP_ALLOWLIST_NETWORKS: list = []
-for cidr in IP_ALLOWLIST:
-    try:
-        IP_ALLOWLIST_NETWORKS.append(ipaddress.ip_network(cidr, strict=False))
-    except ValueError:
-        logger.warning("CIDR ignored in INGESTOR_IP_ALLOWLIST: %s", cidr)
+LOGGER = logging.getLogger("rag.ingestor")
+if not LOGGER.handlers:
+    logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="RAG Ingestor API")
-
-# --- Request model ---
 
 
 class IngestRequest(BaseModel):
@@ -117,19 +69,224 @@ class IngestRequest(BaseModel):
     source: str
     metadata_hints: Dict[str, str] = Field(default_factory=dict, alias="hints")
 
-# --- Utilities ---
+
+MetadataValue = str | int | float | bool | SparseVector | None
 
 
-def normalize_metadata(d: Dict) -> Dict:
-    return {
-        str(k).strip().lower().replace(" ", "_"): v
-        for k, v in d.items()
-        if v not in (None, "")
-    }
+def normalize_metadata(data: Dict[str, object]) -> Dict[str, MetadataValue]:
+    converted: Dict[str, MetadataValue] = {}
+    for key, value in data.items():
+        if value in (None, ""):
+            continue
+        normalized_key = str(key).strip().lower().replace(" ", "_")
+        converted[normalized_key] = _metadata_value(value)
+    return converted
 
 
-def get_content_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _metadata_value(value: object) -> MetadataValue:
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return value.name
+    return str(value)
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _current_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_suffix(filename: str | None) -> str:
+    if not filename:
+        return ""
+    suffix = Path(filename).suffix.lower()
+    if suffix in DISALLOWED_UPLOAD_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Type de fichier interdit")
+    if suffix and suffix not in ALLOWED_UPLOAD_SUFFIXES:
+        raise HTTPException(status_code=400, detail=f"Extension non prise en charge: {suffix}")
+    return suffix
+
+
+def _parse_mode(request: Request, mode: str) -> str:
+    header_mode = request.headers.get("x-parse-mode")
+    candidate = (header_mode or mode or "text").lower()
+    return "multimodal" if candidate == "multimodal" else "text"
+
+
+def _ip_allowlist() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    raw = os.getenv("INGEST_IP_ALLOWLIST", "").strip()
+    if not raw:
+        return []
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            LOGGER.warning("event=invalid_allowlist_entry entry=%s", item)
+    return networks
+
+
+def _enforce_security(request: Request, token: str | None) -> None:
+    expected = os.getenv("INGESTOR_API_TOKEN")
+    if expected and token != expected:
+        raise HTTPException(status_code=401, detail="Token invalide")
+    allowlist = _ip_allowlist()
+    if not allowlist:
+        return
+    if not request.client or not request.client.host:
+        raise HTTPException(status_code=403, detail="Adresse IP inconnue")
+    client_ip = ipaddress.ip_address(request.client.host)
+    if not any(client_ip in net for net in allowlist):
+        raise HTTPException(status_code=403, detail="IP non autorisée")
+
+
+async def _persist_upload(file: UploadFile, max_mb: int) -> tuple[Path, int]:
+    suffix = _safe_suffix(file.filename)
+    total = 0
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix or ".bin")
+    try:
+        while True:
+            chunk = await file.read(1 << 18)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_mb * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="Fichier trop volumineux")
+            tmp.write(chunk)
+        return Path(tmp.name), total
+    except Exception:
+        try:
+            tmp.close()
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+        raise
+    finally:
+        try:
+            tmp.close()
+        except Exception:
+            pass
+
+
+def _multimodal_enabled() -> bool:
+    return _bool_env("MULTIMODAL_ENABLED", False)
+
+
+def _build_mm_config() -> MMConfig:
+    allowed = tuple(s.strip().lower() for s in os.getenv("MM_ALLOWED_SUFFIXES", "").split(",") if s.strip())
+    return MMConfig(
+        parser=os.getenv("MULTIMODAL_PARSER", "raganything"),
+        max_chars_per_chunk=int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "8000")),
+        caption_with_vlm=_bool_env("VLM_ENABLED", False),
+        cache_dir=os.getenv("MM_CACHE_DIR", "/data/cache"),
+        office_enabled=_bool_env("MULTIMODAL_OFFICE_ENABLED", False),
+        allowed_suffixes=allowed or None,
+        parser_timeout=float(os.getenv("MM_PARSER_TIMEOUT", "15")),
+    )
+
+
+def _prepare_chunks_for_chroma(
+    chunks: Iterable[Chunk],
+    base_metadata: Dict[str, str],
+) -> tuple[list[str], list[str], list[Dict[str, MetadataValue]], Dict[str, int]]:
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[Dict[str, MetadataValue]] = []
+    modalities = Counter({"text": 0, "image": 0, "table": 0, "formula": 0, "other": 0})
+    seen: set[str] = set()
+    for chunk in chunks:
+        text = (chunk.text or "").strip()
+        if not text:
+            continue
+        chunk_id = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        modalities[chunk.modality] += 1
+        ids.append(chunk_id)
+        documents.append(text)
+        meta = {**base_metadata, **chunk.meta, "modality": chunk.modality, "sha256": chunk_id}
+        metadatas.append(normalize_metadata(meta))
+    return ids, documents, metadatas, dict(modalities)
+
+
+def _upsert_into_chroma(
+    ids: list[str],
+    documents: list[str],
+    metadatas: list[Dict[str, MetadataValue]],
+) -> tuple[int, int]:
+    if not ids:
+        return 0, 0
+    client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+    existing = collection.get(ids=ids)
+    existing_ids = set(existing.get("ids", []))
+    to_add_idx = [i for i, cid in enumerate(ids) if cid not in existing_ids]
+    if not to_add_idx:
+        return 0, len(ids)
+    embedder = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL)
+    docs_to_add = [documents[i] for i in to_add_idx]
+    ids_to_add = [ids[i] for i in to_add_idx]
+    metas_to_add = [metadatas[i] for i in to_add_idx]
+    embeddings_raw = embedder.embed_documents(docs_to_add)
+    embeddings_processed = [[float(value) for value in vector] for vector in embeddings_raw]
+    typed_metas = cast(list[Mapping[str, MetadataValue]], metas_to_add)
+    typed_embeddings = cast(list[Sequence[float]], embeddings_processed)
+    collection.add(
+        documents=docs_to_add,
+        ids=ids_to_add,
+        metadatas=typed_metas,
+        embeddings=typed_embeddings,
+    )
+    return len(ids_to_add), len(ids) - len(ids_to_add)
+
+
+def _text_chunks_from_path(path: Path) -> Iterable[Chunk]:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        docs = PyPDFLoader(str(path)).load()
+    elif suffix in {".doc", ".docx"}:
+        docs = load_docx(str(path))
+    else:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(errors="ignore")
+        docs = [Document(page_content=text, metadata={"source": path.name})]
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    for doc in splitter.split_documents(docs):
+        text = (doc.page_content or "").strip()
+        if not text:
+            continue
+        meta = dict(doc.metadata or {})
+        meta.setdefault("parser", "text")
+        meta.setdefault("source_path", path.name)
+        meta.setdefault("source", path.name)
+        meta.setdefault("source_tmp_path", str(path))
+        yield Chunk(text=text[:8000], modality="text", meta=meta)
+
+
+def load_docx(file_path: str) -> list[Document]:
+    try:
+        document = docx.Document(file_path)
+    except Exception as exc:  # pragma: no cover - I/O guard
+        raise HTTPException(status_code=400, detail=f"Impossible de lire le DOCX: {exc}")
+    texts = [p.text.strip() for p in document.paragraphs if p.text and p.text.strip()]
+    if not texts:
+        return []
+    joined = "\n".join(texts)
+    return [Document(page_content=joined, metadata={"source": Path(file_path).name})]
 
 
 def _resolve_local_path(raw_path: str) -> Path:
@@ -139,55 +296,34 @@ def _resolve_local_path(raw_path: str) -> Path:
     else:
         candidate = candidate.resolve()
     if not ALLOW_UNRESTRICTED_LOCAL and not str(candidate).startswith(str(LOCAL_SOURCE_ROOT)):
-        raise HTTPException(status_code=400, detail="Local path is outside the allowed area")
+        raise HTTPException(status_code=400, detail="Chemin local en dehors de la zone autorisée")
     if not candidate.exists():
-        raise HTTPException(status_code=400, detail="File not found")
+        raise HTTPException(status_code=400, detail="Fichier introuvable")
     if not candidate.is_file():
-        raise HTTPException(status_code=400, detail="Path is not a file")
+        raise HTTPException(status_code=400, detail="Le chemin indiqué n'est pas un fichier")
     return candidate
-
-
-def load_docx(file_path: str):
-    try:
-        d = docx.Document(file_path)
-    except Exception as e:  # pragma: no cover
-        raise HTTPException(status_code=400, detail=f"DOCX read failed: {e}") from e
-    texts = []
-    for p in d.paragraphs:
-        if p.text and p.text.strip():
-            texts.append(p.text.strip())
-    # simple extraction; tables could be added later if needed
-    content = "\n".join(texts).strip()
-    if not content:
-        return []
-    return [Document(page_content=content, metadata={"source": os.path.basename(file_path)})]
 
 
 def _validate_remote_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme.lower() not in URL_SCHEMES_ALLOWED:
-        raise HTTPException(status_code=400, detail="URL scheme not allowed")
+        raise HTTPException(status_code=400, detail="Schéma d'URL non autorisé")
     if not parsed.hostname:
-        raise HTTPException(status_code=400, detail="Invalid URL")
+        raise HTTPException(status_code=400, detail="URL invalide")
     try:
-        socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        addr_info = socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
     except socket.gaierror as exc:
-        raise HTTPException(status_code=400, detail=f"DNS resolution failed: {exc}") from exc
-    for entry in socket.getaddrinfo(parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)):
-        ip = ipaddress.ip_address(entry[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
-            raise HTTPException(status_code=400, detail="Private/internal URL not allowed")
+        raise HTTPException(status_code=400, detail=f"Résolution DNS impossible: {exc}")
+    for entry in addr_info:
+        address = ipaddress.ip_address(entry[4][0])
+        if address.is_private or address.is_loopback or address.is_link_local or address.is_multicast or address.is_reserved:
+            raise HTTPException(status_code=400, detail="URL interne non autorisée")
 
 
 def _download_to_temp(url: str, suffix: str) -> Path:
     _validate_remote_url(url)
     try:
-        with requests.get(
-            url,
-            timeout=HTTP_TIMEOUT,
-            stream=True,
-            headers={"User-Agent": USER_AGENT},
-        ) as response:
+        with requests.get(url, timeout=30, stream=True) as response:
             response.raise_for_status()
             total = 0
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
@@ -196,30 +332,26 @@ def _download_to_temp(url: str, suffix: str) -> Path:
                         continue
                     total += len(chunk)
                     if total > MAX_REMOTE_BYTES:
-                        raise HTTPException(status_code=400, detail="Remote file too large")
+                        raise HTTPException(status_code=400, detail="Fichier distant trop volumineux")
                     tmp_file.write(chunk)
                 return Path(tmp_file.name)
+    except HTTPException:
+        raise
     except requests.RequestException as exc:
-        raise HTTPException(status_code=400, detail=f"Download failed: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Téléchargement impossible: {exc}")
 
 
 def _fetch_remote_text(url: str) -> tuple[str, str]:
     _validate_remote_url(url)
     try:
-        with requests.get(
-            url,
-            timeout=HTTP_TIMEOUT,
-            allow_redirects=True,
-            stream=True,
-            headers={"User-Agent": USER_AGENT},
-        ) as response:
+        with requests.get(url, timeout=30, allow_redirects=True, stream=True) as response:
             if response.history:
                 for hop in response.history:
                     _validate_remote_url(hop.url)
             _validate_remote_url(response.url)
             declared_length = response.headers.get("content-length")
             if declared_length and int(declared_length) > MAX_REMOTE_BYTES:
-                raise HTTPException(status_code=400, detail="Remote response too large")
+                raise HTTPException(status_code=400, detail="Réponse distante trop volumineuse")
             chunks: list[bytes] = []
             total = 0
             for chunk in response.iter_content(chunk_size=8192):
@@ -227,18 +359,20 @@ def _fetch_remote_text(url: str) -> tuple[str, str]:
                     continue
                 total += len(chunk)
                 if total > MAX_REMOTE_BYTES:
-                    raise HTTPException(status_code=400, detail="Remote response too large")
+                    raise HTTPException(status_code=400, detail="Réponse distante trop volumineuse")
                 chunks.append(chunk)
             encoding = response.encoding or "utf-8"
             text = b"".join(chunks).decode(encoding, errors="ignore")
             if not text.strip():
-                raise HTTPException(status_code=400, detail="No usable content on the page")
+                raise HTTPException(status_code=400, detail="Aucun contenu exploitable sur la page")
             return response.url, text
+    except HTTPException:
+        raise
     except requests.RequestException as exc:
-        raise HTTPException(status_code=400, detail=f"Download failed: {exc}") from exc
+        raise HTTPException(status_code=400, detail=f"Téléchargement impossible: {exc}")
 
 
-def load_from_url(url: str):
+def load_from_url(url: str) -> list[Document]:
     if url.lower().endswith(".pdf"):
         tmp_path = _download_to_temp(url, suffix=".pdf")
         try:
@@ -250,164 +384,131 @@ def load_from_url(url: str):
                 pass
     final_url, text = _fetch_remote_text(url)
     soup = BeautifulSoup(text, "html.parser")
-    text = soup.get_text("\n", strip=True)
-    if not text:
-        raise HTTPException(status_code=400, detail="No usable content on the page")
-    return [Document(page_content=text, metadata={"source": final_url})]
-
-# --- Chroma client factory ---
-
-
-def get_chroma_client() -> chromadb.HttpClient:
-    return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-
-# --- Endpoint helpers ---
-
-
-def _client_ip(request: Request) -> str:
-    forwarded_for = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    if forwarded_for:
-        return forwarded_for
-    return request.client.host if request.client else ""
-
-
-def _enforce_token(request: Request, provided_header: Optional[str]) -> None:
-    if not API_TOKEN:
-        return
-    candidate = provided_header
-    if not candidate:
-        for header_name in TOKEN_HEADER_CANDIDATES:
-            value = request.headers.get(header_name)
-            if value:
-                candidate = value
-                break
-    if not candidate or not hmac.compare_digest(candidate, API_TOKEN):
-        client_ip = _client_ip(request) or "unknown"
-        logger.warning("unauthorized: bad token from %s", client_ip)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-
-
-def _enforce_ip_allowlist(request: Request) -> None:
-    if not IP_ALLOWLIST_NETWORKS:
-        return
-    client_ip = _client_ip(request)
-    try:
-        ip_obj = ipaddress.ip_address(client_ip)
-    except ValueError:
-        logger.warning("forbidden: invalid client IP '%s'", client_ip)
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden") from None
-    if not any(ip_obj in network for network in IP_ALLOWLIST_NETWORKS):
-        logger.warning("forbidden: ip %s not in allowlist", client_ip)
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-
-
-app = FastAPI(title="RAG Ingestor API")
+    text_only = soup.get_text("\n", strip=True)
+    if not text_only:
+        raise HTTPException(status_code=400, detail="Aucun contenu exploitable sur la page")
+    return [Document(page_content=text_only, metadata={"source": final_url})]
 
 
 @app.post("/ingest")
-def ingest_data(
-    req: IngestRequest,
+async def ingest_file(
     request: Request,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
-):
-    # 1) Load & access controls
-    _enforce_token(request, x_api_token)
-    _enforce_ip_allowlist(request)
+    file: UploadFile = File(...),
+    mode: str = Query("text"),
+    x_api_token: str | None = Header(default=None, convert_underscores=False),
+) -> Dict[str, object]:
+    _enforce_security(request, x_api_token)
+    content_type = (file.content_type or "").lower()
+    if content_type not in ALLOWED_UPLOAD_MIME:
+        raise HTTPException(status_code=415, detail="Unsupported media type")
+    max_mb = int(os.getenv("INGEST_MAX_FILE_MB", "20"))
+    tmp_path, total_bytes = await _persist_upload(file, max_mb)
+    parse_mode = _parse_mode(request, mode)
+    source_name = file.filename or tmp_path.name
+    base_metadata = {
+        "source": source_name,
+        "source_name": source_name,
+        "source_tmp_path": str(tmp_path),
+        "ingest_mode": parse_mode,
+        "ingest_ts": _current_timestamp(),
+    }
     try:
-        if req.source_type == "url":
-            docs = load_from_url(req.source)
-        elif req.source_type == "gdrive_folder":
-            loader = GoogleDriveLoader(folder_id=req.source, recursive=True)
+        if parse_mode == "multimodal" and _multimodal_enabled():
+            cfg = _build_mm_config()
+            chunks = list(yield_chunks_from_path(tmp_path, cfg))
+            ids, docs, metas, modalities = _prepare_chunks_for_chroma(chunks, base_metadata)
+            added, skipped = _upsert_into_chroma(ids, docs, metas)
+            LOGGER.info(
+                {
+                    "event": "ingest_multimodal",
+                    "file": file.filename,
+                    "added": added,
+                    "skipped": skipped,
+                    "modalities": modalities,
+                    "bytes": total_bytes,
+                }
+            )
+            response = IngestResponse(status="ok", added=added, skipped=skipped, modalities=modalities)
+            return response.model_dump()
+        chunks = list(_text_chunks_from_path(tmp_path))
+        ids, docs, metas, modalities = _prepare_chunks_for_chroma(chunks, base_metadata)
+        added, skipped = _upsert_into_chroma(ids, docs, metas)
+        LOGGER.info(
+            {
+                "event": "ingest_text",
+                "file": file.filename,
+                "added": added,
+                "skipped": skipped,
+                "modalities": modalities,
+                "bytes": total_bytes,
+            }
+        )
+        response = IngestResponse(status="ok", added=added, skipped=skipped, modalities=modalities)
+        return response.model_dump()
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+@app.post("/ingest/source")
+def ingest_from_descriptor(
+    request: Request,
+    payload: IngestRequest,
+    x_api_token: str | None = Header(default=None, convert_underscores=False),
+) -> Dict[str, object]:
+    _enforce_security(request, x_api_token)
+    try:
+        if payload.source_type == "url":
+            docs = load_from_url(payload.source)
+        elif payload.source_type == "gdrive_folder":
+            loader = GoogleDriveLoader(folder_id=payload.source, recursive=True)
             docs = loader.load()
-        elif req.source_type == "pdf":
-            path = _resolve_local_path(req.source)
+        elif payload.source_type == "pdf":
+            path = _resolve_local_path(payload.source)
             docs = PyPDFLoader(str(path)).load()
-        elif req.source_type == "docx":
-            path = _resolve_local_path(req.source)
+        elif payload.source_type == "docx":
+            path = _resolve_local_path(payload.source)
             docs = load_docx(str(path))
         else:
-            raise HTTPException(status_code=400, detail=f"Unsupported source_type: {req.source_type}")
+            raise HTTPException(status_code=400, detail=f"source_type non géré: {payload.source_type}")
     except HTTPException:
         raise
-    except Exception as e:  # pragma: no cover
-        logger.exception(
-            "Unexpected error while loading source '%s' (%s)",
-            req.source,
-            req.source_type,
-        )
-        raise HTTPException(status_code=500, detail=f"Load error: {e}") from e
-
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur de chargement: {exc}")
     if not docs:
-        return {"status": "ok", "message": "No document loaded."}
-
-    # 2) Split
+        return {"status": "ok", "added": 0, "skipped": 0, "modalities": {}}
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_documents(docs)
-    if not chunks:
-        return {"status": "ok", "message": "No textual chunk after splitting."}
-
-    # 3) Prepare
-    ids, documents, metadatas = [], [], []
-    for ch in chunks:
-        text = (ch.page_content or "").strip()
+    chunk_objs: list[Chunk] = []
+    for doc in splitter.split_documents(docs):
+        text = (doc.page_content or "").strip()
         if not text:
             continue
-        content_hash = get_content_hash(text)
-        merged = {
-            "sha256": content_hash,
-            "source_type": req.source_type,
-            "source": req.source,
+        meta = {**(doc.metadata or {}), **payload.metadata_hints}
+        meta.update({"source": payload.source, "source_type": payload.source_type, "parser": "text"})
+        chunk_objs.append(Chunk(text=text[:8000], modality="text", meta=meta))
+    base = {
+        "ingest_mode": "json",
+        "ingest_ts": _current_timestamp(),
+        "source": payload.source,
+        "source_name": payload.source,
+    }
+    ids, docs_txt, metas, modalities = _prepare_chunks_for_chroma(chunk_objs, base)
+    added, skipped = _upsert_into_chroma(ids, docs_txt, metas)
+    LOGGER.info(
+        {
+            "event": "ingest_descriptor",
+            "source": payload.source,
+            "added": added,
+            "skipped": skipped,
+            "modalities": modalities,
         }
-        merged.update(ch.metadata or {})
-        merged.update(req.metadata_hints or {})
-        ids.append(content_hash)
-        documents.append(text)
-        metadatas.append(normalize_metadata(merged))
-
-    if not ids:
-        return {"status": "ok", "message": "No eligible content to ingest."}
-
-    # 4) Insert (with de-duplication by hash)
-    try:
-        client = get_chroma_client()
-        collection = client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
-
-        existing = collection.get(ids=ids)
-        # already-existing ids
-        existing_ids = set(existing.get("ids", []))
-
-        to_add_idx = [i for i, _id in enumerate(ids) if _id not in existing_ids]
-        if not to_add_idx:
-            return {"status": "ok", "added": 0, "skipped": len(ids)}
-
-        emb = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL)
-        docs_to_add = [documents[i] for i in to_add_idx]
-        ids_to_add = [ids[i] for i in to_add_idx]
-        meta_to_add = [metadatas[i] for i in to_add_idx]
-        embs_to_add = emb.embed_documents(docs_to_add)
-
-        collection.add(
-            documents=docs_to_add,
-            ids=ids_to_add,
-            metadatas=meta_to_add,
-            embeddings=embs_to_add,
-        )
-        added = len(ids_to_add)
-        logger.info(
-            "Ingestion finished: added=%s skipped(existing)=%s source=%s type=%s",
-            added,
-            len(existing_ids),
-            req.source,
-            req.source_type,
-        )
-        return {"status": "ok", "added": added, "skipped": len(existing_ids)}
-    except HTTPException:
-        raise
-    except Exception as exc:  # pragma: no cover - logged for diagnostics
-        logger.exception("embedding/indexing failed: %s", exc)
-        raise HTTPException(status_code=502, detail="Embedding/Indexing failed") from exc
+    )
+    response = IngestResponse(status="ok", added=added, skipped=skipped, modalities=modalities)
+    return response.model_dump()
 
 
 @app.get("/health")
-def health_check():
+def health_check() -> Dict[str, str]:
     return {"status": "healthy"}

@@ -1,4 +1,5 @@
-FROM python:3.11-slim
+ARG PYTHON_IMAGE=python:3.11-slim
+FROM ${PYTHON_IMAGE}
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
   PYTHONUNBUFFERED=1
@@ -21,7 +22,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip && \
+    python -m pip install --no-cache-dir -r requirements.txt
+
+ARG MULTIMODAL_DEPS=0
+RUN if [ "$MULTIMODAL_DEPS" = "1" ]; then \
+      python -m pip install --no-cache-dir raganything Pillow; \
+    else \
+      echo "Skipping multimodal dependencies"; \
+    fi
 
 COPY . ./
 

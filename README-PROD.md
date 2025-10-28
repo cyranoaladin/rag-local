@@ -5,7 +5,7 @@ Ce projet fournit un **RAG 100% local** (LLM & embeddings via **Ollama**) avec *
 ## Prérequis VPS
 - Ubuntu 22.04/24.04, accès sudo, ports 80/443 ouverts, DNS des domaines pointés sur le VPS.
 - Docker + Compose plugin.
-- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN`, les secrets n8n, ainsi qu’un `INGEST_AUTH_TOKEN` fort (ex: `openssl rand -hex 32`).
+- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN`, mots de passe n8n, etc.
 
 ## Démarrage (services internes, non exposés)
 ```bash
@@ -15,29 +15,26 @@ docker compose -f infra/docker-compose.yml ps
 
 ## Exposition HTTPS (Nginx + Certbot)
 
-* Utiliser `infra/nginx/*.template` avec `envsubst` pour générer les vhosts (les templates n’emploient **pas** la syntaxe `${VAR:-def}`).
+* Utiliser `infra/nginx/*.template` avec `envsubst` pour générer les vhosts.
 * `certbot --nginx -d <domaines> --agree-tos -m <email> --redirect -n`
 * Les templates intègrent des headers de sécurité (HSTS, CSP, etc.).
 
-Exemple :
-```bash
-export RAG_EXTERNAL_DOMAIN="rag.example.com"
-export N8N_EXTERNAL_DOMAIN="automations.example.com"
-export NGINX_UI_PORT="18501"
-export NGINX_N8N_PORT="15678"
-export NGINX_CLIENT_MAX_BODY_SIZE="${NGINX_CLIENT_MAX_BODY_SIZE:-16m}"
-
-envsubst < infra/nginx/rag-ui.conf.template  | sudo tee /etc/nginx/sites-available/rag-ui.conf  >/dev/null
-envsubst < infra/nginx/rag-n8n.conf.template | sudo tee /etc/nginx/sites-available/rag-n8n.conf >/dev/null
-sudo ln -sf /etc/nginx/sites-available/rag-ui.conf  /etc/nginx/sites-enabled/rag-ui.conf
-sudo ln -sf /etc/nginx/sites-available/rag-n8n.conf /etc/nginx/sites-enabled/rag-n8n.conf
-sudo nginx -t && sudo systemctl reload nginx
-```
-
 ## Ingestion
 
-* Endpoint `POST /ingest` (service **ingestor**) pour URL/fichiers/Google Drive (via n8n ou via API).
-* Les chunks et métadonnées sont stockés dans **Chroma** (v2).
+| Route | Méthode | Payload | Notes |
+|-------|---------|---------|-------|
+| `/ingest` | `POST` | `multipart/form-data` (`file`), query `mode=text|multimodal` | MIME whitelist (`application/pdf`, `image/png`, `image/jpeg`). Timeout parse (`MM_PARSER_TIMEOUT`) → fallback texte si dépassement. |
+| `/ingest/source` | `POST` | JSON (`source`, `source_type`, `hints`) | Compatibilité n8n / ingestion indirecte (URL, GDrive, DOCX/PPTX montés localement). |
+| `/health` | `GET` | — | Probe compose/Nginx |
+
+* Multimodal → RAG-Anything (PDF/PNG/JPG), chunks typés (`metadata.modality`), cache `/data/cache`.
+* Text mode → fallback rapide (PyPDFLoader, DOCX) ; n8n reste inchangé.
+* `infra/scripts/smoke.sh` : curl PNG + PDF (attendu `modalities.image >= 1`, `modalities.text >= 1`).
+
+```bash
+INGESTOR_API_TOKEN=changeme ./infra/scripts/smoke.sh
+```
+* Variables clés : `MULTIMODAL_ENABLED`, `MM_CACHE_DIR`, `MM_PARSER_TIMEOUT`, `INGEST_MAX_FILE_MB`, `MM_MAX_CHARS_PER_CHUNK`, `MULTIMODAL_DEPS` (`=1` uniquement pour les builds réalisés avec le profil `multimodal`).
 
 ## UI
 

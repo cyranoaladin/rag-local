@@ -10,21 +10,11 @@
 
 ## API Ingestor
 
-`POST /ingest` JSON:
-
-```json
-{
-  "source": "https://example.com/page",
-  "source_type": "url",
-  "hints": {"matiere": "NSI", "niveau": "terminale"}
-}
-```
-
-Réponse:
-
-```json
-{"status": "ok", "added": 1, "skipped": 0}
-```
+| Route | Méthode | Payload | Détails |
+|-------|---------|---------|---------|
+| `/ingest` | `POST` | `multipart/form-data` (`file`), query `mode=text|multimodal` | MIME whitelist (`application/pdf`, `image/png`, `image/jpeg`). Multimodal → RAG-Anything (timeout `MM_PARSER_TIMEOUT`, fallback texte si dépassement). Résultat : `{"status":"ok","added":N,"skipped":M,"modalities":{...}}`. |
+| `/ingest/source` | `POST` | JSON (héritage : `source`, `source_type`, `hints`) | Pipeline historique (URL/GDrive/fichiers locaux, DOCX/PPTX montés). Toujours traité en mode texte. |
+| `/health` | `GET` | — | Liveness/Compose. |
 
 ## Chroma v2
 
@@ -36,6 +26,8 @@ Réponse:
 
 * Nginx + TLS (Let’s Encrypt), headers de sécurité.
 * n8n derrière BasicAuth + clé d’encryption.
+* Ingestor : token `X-API-Token` + allowlist IP (env `INGESTOR_API_TOKEN`, `INGEST_IP_ALLOWLIST`).
+* Upload : MIME whitelist + limite poids (`INGEST_MAX_FILE_MB`), parsing multimodal time-boxed (env `MM_PARSER_TIMEOUT`).
 * Backups volumes (Chroma/Ollama/n8n), rotation.
 
 ## Déploiement VPS — résumé
@@ -44,3 +36,4 @@ Réponse:
 2. `docker compose -f infra/docker-compose.yml --env-file infra/.env up -d`
 3. Générer vhosts Nginx depuis `infra/nginx/*.template`, recharger Nginx.
 4. Lancer `certbot --nginx` pour TLS et redirections 80→443.
+5. Activer le profil `multimodal` uniquement si `MULTIMODAL_DEPS=1` (build) et `MULTIMODAL_ENABLED=true` (runtime).
