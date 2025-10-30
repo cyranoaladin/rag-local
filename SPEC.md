@@ -7,6 +7,7 @@
 * **Ingestor (FastAPI)**: /health, /ingest (URL, fichiers, GDrive en option), écrit dans Chroma.
 * **UI (Streamlit)**: requête sémantique, affiche top-k + sources/métadonnées.
 * **n8n (optionnel)**: planifications (GDrive, URLs) + import/export de workflows.
+* **Prometheus**: exposition `/metrics` (compteurs `ingest_*` et `mm_*`).
 
 ## API Ingestor
 
@@ -25,6 +26,8 @@ Réponse:
 ```json
 {"status": "ok", "added": 1, "skipped": 0}
 ```
+
+Mode `multimodal` (activé via `MULTIMODAL_ENABLED=true`) : fallback texte sécurisé, instrumentation dédiée (`mm_parse_latency_seconds`, `mm_chunks_total`, `mm_parse_failures_total`).
 
 ## Chroma v2
 

@@ -11,6 +11,7 @@ infra/nginx/*.conf
 **/.pytest_cache/
 **/.mypy_cache/
 **/node_modules/
+.venv/
 
 # editor cruft
 .DS_Store

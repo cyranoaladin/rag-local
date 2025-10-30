@@ -24,6 +24,20 @@ docker compose -f infra/docker-compose.yml ps
 * Endpoint `POST /ingest` (service **ingestor**) pour URL/fichiers/Google Drive (via n8n ou via API).
 * Les chunks et métadonnées sont stockés dans **Chroma** (v2).
 
+### Observabilité multimodale (opt-in)
+
+1. Activer le parsing multimodal dans `infra/.env` :
+
+	```dotenv
+	MULTIMODAL_ENABLED=true
+	MM_PARSER_TIMEOUT=60
+	MM_MAX_CHARS_PER_CHUNK=4000
+	MM_CACHE_DIR=/tmp/rag-mm-cache
+	```
+
+2. Redéployer l’ingestor puis valider que `/metrics` expose les compteurs `rag_local_mm_*`.
+3. Ne pas exposer `/metrics` sur Internet : réserver l’accès à Prometheus (profil `obs`) ou via un tunnel SSH.
+
 ## UI
 
 * Streamlit: recherche, top-k, sources, métadonnées.
