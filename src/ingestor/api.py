@@ -6,6 +6,7 @@ import ipaddress
 import os
 import socket
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Literal
 from urllib.parse import urlparse
@@ -15,12 +16,14 @@ import docx
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_core.documents import Document
 from langchain_google_community import GoogleDriveLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, ConfigDict, Field
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 # --- Configuration ---
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
@@ -35,7 +38,39 @@ ALLOW_UNRESTRICTED_LOCAL = os.getenv(
     "ALLOW_UNRESTRICTED_LOCAL", "false").lower() == "true"
 URL_SCHEMES_ALLOWED = {"http", "https"}
 
+REQUEST_COUNT = Counter(
+    "ingestor_requests_total", "Total requests", ["path", "method", "code"]
+)
+REQUEST_LATENCY = Histogram(
+    "ingestor_request_latency_seconds", "Request latency", ["path", "method"]
+)
+INGEST_RESULT = Counter(
+    "ingestor_ingest_events_total", "Ingest events", ["status"]
+)
+
 app = FastAPI(title="RAG Ingestor API")
+
+
+@app.middleware("http")
+async def _metrics_middleware(request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        code = getattr(response, "status_code", 500)
+    except Exception:
+        code = 500
+        raise
+    finally:
+        elapsed = time.perf_counter() - start
+        path = request.url.path
+        method = request.method
+        REQUEST_LATENCY.labels(path=path, method=method).observe(elapsed)
+        REQUEST_COUNT.labels(path=path, method=method, code=str(code)).inc()
+    return response
+
+
+def _record_ingest_metrics(ok: bool) -> None:
+    INGEST_RESULT.labels(status="ok" if ok else "fail").inc()
 
 # --- Modèle de requête ---
 
@@ -209,12 +244,15 @@ def ingest_data(req: IngestRequest):
             raise HTTPException(
                 status_code=400, detail=f"source_type non géré: {req.source_type}")
     except HTTPException:
+        _record_ingest_metrics(False)
         raise
     except Exception as e:
+        _record_ingest_metrics(False)
         raise HTTPException(
             status_code=500, detail=f"Erreur de chargement: {e}")
 
     if not docs:
+        _record_ingest_metrics(True)
         return {"status": "ok", "message": "Aucun document chargé."}
 
     # 2) Découpage
@@ -222,6 +260,7 @@ def ingest_data(req: IngestRequest):
         chunk_size=1000, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
     if not chunks:
+        _record_ingest_metrics(True)
         return {"status": "ok", "message": "Aucun chunk textuel après découpage."}
 
     # 3) Préparation
@@ -240,6 +279,7 @@ def ingest_data(req: IngestRequest):
         metadatas.append(normalize_metadata(merged))
 
     if not ids:
+        _record_ingest_metrics(True)
         return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
 
     # 4) Insertion (avec déduplication par hash)
@@ -255,6 +295,7 @@ def ingest_data(req: IngestRequest):
         to_add_idx = [i for i, _id in enumerate(
             ids) if _id not in existing_ids]
         if not to_add_idx:
+            _record_ingest_metrics(True)
             return {"status": "ok", "added": 0, "skipped": len(ids)}
 
         emb = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL)
@@ -265,8 +306,10 @@ def ingest_data(req: IngestRequest):
 
         collection.add(documents=docs_to_add, ids=ids_to_add,
                        metadatas=meta_to_add, embeddings=embs_to_add)
+        _record_ingest_metrics(True)
         return {"status": "ok", "added": len(ids_to_add), "skipped": len(existing_ids)}
     except Exception as e:
+        _record_ingest_metrics(False)
         raise HTTPException(
             status_code=500, detail=f"Erreur d'ingestion dans ChromaDB: {e}")
 
@@ -274,3 +317,8 @@ def ingest_data(req: IngestRequest):
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
