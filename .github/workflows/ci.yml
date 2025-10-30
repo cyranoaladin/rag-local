@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Ruff (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            src/ingestor/requirements.txt
+            src/ui/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Ruff check
+        run: |
+          set -euo pipefail
+          ruff check . | tee ruff.txt
+      - name: Publish lint artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruff-${{ matrix.python-version }}
+          path: ruff.txt
+
+  typecheck:
+    name: Mypy (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            src/ingestor/requirements.txt
+            src/ui/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run mypy
+        run: mypy src
+
+  unit-tests:
+    name: Pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+    needs: typecheck
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            src/ingestor/requirements.txt
+            src/ui/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Run pytest
+        run: pytest -q --junitxml=pytest.xml
+      - name: Publish pytest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-${{ matrix.python-version }}
+          path: pytest.xml
+
+  smoke-compose:
+    name: Docker smoke (multimodal)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare env file
+        run: cp infra/.env.example infra/.env
+      - name: Compose up (multimodal)
+        env:
+          COMPOSE_PROFILES: multimodal
+        run: make compose-up
+      - name: Run smoke script
+        env:
+          COMPOSE_PROFILES: multimodal
+        run: bash infra/scripts/smoke.sh
+      - name: Compose down
+        if: always()
+        env:
+          COMPOSE_PROFILES: multimodal
+        run: make compose-down

@@ -1,0 +1,137 @@
+# pylint: disable=too-many-locals,line-too-long
+from __future__ import annotations
+
+import types
+from typing import Any
+
+import pytest
+from fastapi.testclient import TestClient
+
+from tests.test_ingestor_security import reload_api
+
+
+class _DummySplitter:
+    def split_documents(self, documents):
+        return documents
+
+
+class _RequestStub:
+    def __init__(self, headers: dict[str, str], host: str = "127.0.0.1") -> None:
+        self.headers = headers
+        self.client = types.SimpleNamespace(host=host)
+
+
+def _setup_success_stubs(api_module, monkeypatch: pytest.MonkeyPatch, documents: list[Any]) -> None:
+    monkeypatch.setattr(api_module, "load_from_url", lambda _: documents)
+
+    class FakeCollection:
+        def __init__(self) -> None:
+            self.add_calls: list[tuple[list[str], list[str], list[dict[str, Any]]]] = []
+
+        def get(self, ids=None, **_kwargs):
+            _ = ids
+            return {"ids": []}
+
+        def add(self, documents=None, ids=None, metadatas=None, embeddings=None):
+            _ = embeddings
+            self.add_calls.append((list(documents or []), list(ids or []), list(metadatas or [])))
+
+    fake_collection = FakeCollection()
+
+    class FakeClient:
+        def get_or_create_collection(self, *_args, **_kwargs):
+            return fake_collection
+
+    class FakeEmbeddings:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def embed_documents(self, docs):
+            return [[0.1] * 3 for _ in docs]
+
+    monkeypatch.setattr(api_module, "get_chroma_client", lambda: FakeClient())
+    monkeypatch.setattr(api_module, "OllamaEmbeddings", FakeEmbeddings)
+    return fake_collection
+
+
+def test_enforce_security_accepts_valid_token_and_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="super-secret", allowlist="127.0.0.0/8")
+    request = _RequestStub(headers={"X-API-Token": "super-secret", "x-forwarded-for": ""})
+
+    api._enforce_security(request, None)
+
+
+def test_enforce_security_rejects_bad_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="super-secret", allowlist="127.0.0.0/8")
+    request = _RequestStub(headers={"X-API-Token": "invalid", "x-forwarded-for": ""})
+
+    with pytest.raises(api.HTTPException) as exc:
+        api._enforce_security(request, None)
+
+    assert exc.value.status_code == 401
+
+
+def test_prepare_chunks_for_chroma_preserves_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token=None)
+    req = api.IngestRequest(source_type="url", source="https://example.com", metadata_hints={"matiere": "NSI"})
+    document = api.Document(page_content="Hello world", metadata={"mime_type": "text/html", "page": 1})
+
+    prepared = api._prepare_chunks_for_chroma(req, [document], splitter=_DummySplitter())
+
+    assert prepared.ids and len(prepared.ids) == 1
+    assert prepared.documents[0] == "Hello world"
+    assert prepared.metadatas[0]["source"] == "https://example.com"
+    assert prepared.metadatas[0]["modality"] == "text"
+    assert prepared.metadatas[0]["matiere"] == "NSI"
+    assert prepared.modality == "text"
+
+
+def test_ingest_text_endpoint_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="super-secret")
+    doc = api.Document(page_content="content", metadata={"mime_type": "text/plain"})
+    fake_collection = _setup_success_stubs(api, monkeypatch, [doc])
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/ingest",
+        headers={"X-API-Token": "super-secret"},
+        json={
+            "source_type": "url",
+            "source": "https://example.com",
+            "hints": {"matiere": "NSI"},
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["added"] == 1
+    assert fake_collection.add_calls and len(fake_collection.add_calls[0][1]) == 1
+
+
+def test_metrics_counter_updates(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("METRICS_ENABLED", "true")
+    api = reload_api(monkeypatch, token="super-secret")
+    doc = api.Document(page_content="metrics doc", metadata={"mime_type": "text/plain"})
+    _ = _setup_success_stubs(api, monkeypatch, [doc])
+
+    client = TestClient(api.app)
+    success_child = api.ingest_requests_total.labels(source="url", modality="text", status="success")
+    failure_child = api.ingest_requests_total.labels(source="url", modality="unknown", status="http_401")
+
+    assert success_child._value.get() == 0
+    assert failure_child._value.get() == 0
+
+    ok_response = client.post(
+        "/ingest",
+        headers={"X-API-Token": "super-secret"},
+        json={"source_type": "url", "source": "https://example.com"},
+    )
+    assert ok_response.status_code == 200
+    assert success_child._value.get() == 1
+
+    ko_response = client.post(
+        "/ingest",
+        json={"source_type": "url", "source": "https://example.com"},
+    )
+    assert ko_response.status_code == 401
+    assert failure_child._value.get() == 1
