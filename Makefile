@@ -11,7 +11,7 @@ endif
 
 .PHONY: help
 help:
-	@echo "Targets: compose-up, compose-down, rebuild, logs, lint, typecheck, pylint, test, smoke"
+	@echo "Targets: compose-up, compose-down, rebuild, logs, lint, typecheck, pylint, test, ci-local, smoke"
 
 .PHONY: compose-up up
 compose-up up:
@@ -31,11 +31,11 @@ logs:
 
 .PHONY: lint
 lint:
-	python -m ruff check .
+	ruff check .
 
 .PHONY: typecheck
 typecheck:
-	python -m mypy src
+	mypy src
 
 .PHONY: pylint
 pylint:
@@ -44,6 +44,9 @@ pylint:
 .PHONY: test
 test:
 	pytest -q
+
+.PHONY: ci-local
+ci-local: lint typecheck test
 
 .PHONY: smoke
 smoke:
