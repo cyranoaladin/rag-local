@@ -1,0 +1,15 @@
+# Compose override to keep Prometheus local-only and persistent
+services:
+  prometheus:
+    ports:
+      - "127.0.0.1:19090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.listen-address=0.0.0.0:9090"
+    volumes:
+      - prom_data:/prometheus
+
+volumes:
+  prom_data:
+    driver: local

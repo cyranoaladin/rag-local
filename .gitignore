@@ -1,6 +1,7 @@
 # secrets & local state
 .env
 .env.*
+!infra/.env.ci
 creds/
 **/database.sqlite
 n8n/db/
