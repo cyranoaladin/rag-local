@@ -47,3 +47,14 @@ docker compose -f infra/docker-compose.yml ps
 * Volume Chroma en snapshot (rsync / restic / rclone) + rotation (daily/weekly).
 
 Voir `SPEC.md` pour l’architecture et le contrat d’API.
+
+## Observabilite (profil `obs`)
+- Demarrer Prometheus en environnement de recette (loopback) :
+
+```bash
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env --profile obs up -d --remove-orphans
+bash infra/scripts/obs_smoke.sh
+```
+
+Par defaut, `/metrics` n'est pas expose publiquement via Nginx. Ne l'ouvrez pas sur Internet ; scrappez en reseau interne Docker.
+
