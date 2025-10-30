@@ -46,6 +46,17 @@ sudo nginx -t && sudo systemctl reload nginx
 * Streamlit: recherche, top-k, sources, métadonnées.
 * Top-k borné à 8 par défaut (`UI_MAX_K`).
 
+## Observabilité
+
+* Ingestor expose `GET /metrics` (Prometheus) lorsque `METRICS_ENABLED=true` dans `infra/.env`.
+* Mettre à jour la configuration Nginx pour restreindre l'accès `/metrics` à l'allowlist IP interne (cf. documentation sécurité).
+* Métriques clés :
+	* `ingestor_ingests_total{status}` pour identifier les échecs (`status=http_4xx/http_5xx`).
+	* `histogram_quantile` sur `ingestor_ingest_duration_seconds` (p99 > 4s ⇒ alerte latence ingestion).
+* Exemple d'alerte PromQL :
+	* `sum(increase(ingestor_ingests_total{status!="success"}[5m])) > 0`
+	* `histogram_quantile(0.99, sum(rate(ingestor_ingest_duration_seconds_bucket[5m])) by (le)) > 4`
+
 ## Sauvegardes (idée)
 
 * Volume Chroma en snapshot (rsync / restic / rclone) + rotation (daily/weekly).

@@ -1,4 +1,5 @@
 # RAG – Export (pour GitHub)
+[![CI](https://github.com/cyranoaladin/rag-local/actions/workflows/ci.yml/badge.svg)](https://github.com/cyranoaladin/rag-local/actions/workflows/ci.yml)
 - `infra/` : docker-compose, .env.example (sanitisé), vhosts Nginx
 - `n8n/`   : workflows JSON, snapshot DB sqlite, webhooks dump
 - `src/ingestor/` : FastAPI (si extrait)
@@ -25,6 +26,13 @@ make compose-down
 ```
 
 Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make smoke`.
+
+## Observability & CI
+- Endpoint Prometheus `GET /metrics` (ingestor) activé via `METRICS_ENABLED=true` (désactivé par défaut). Voir `docs/observability.md`.
+- Métriques : `ingestor_ingests_total{source,modality,status}` et histogramme `ingestor_ingest_duration_seconds` (buckets adaptés VPS).
+- Qualité locale : `make lint`, `make typecheck`, `make test`, ou `make ci-local` pour enchaîner les trois.
+- Pipeline GitHub Actions (`.github/workflows/ci.yml`) déclenche lint, mypy, pytest (Py 3.10 / 3.11) + artefacts `ruff.txt` / `pytest.xml`.
+- Job optionnel `smoke-compose` via `workflow_dispatch` pour bâtir le profil multimodal et exécuter `infra/scripts/smoke.sh`.
 
 ## Nginx (web) service
 - Service profilé: `web` (activé via `COMPOSE_PROFILES`)
