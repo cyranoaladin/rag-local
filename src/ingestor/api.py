@@ -1,4 +1,4 @@
-# pylint: disable=missing-module-docstring,missing-class-docstring,missing-function-docstring
+# pylint: disable=missing-module-docstring,missing-class-docstring,missing-function-docstring,line-too-long,too-many-locals,too-many-branches,too-many-statements,wrong-import-position
 # cspell:ignore chromadb docx bs4 fastapi langchain gdrive nomic sha256 ollama allowlist metadatas CIDR
 # File: /srv/rag/ingestor/api.py
 from __future__ import annotations
@@ -11,11 +11,49 @@ import logging
 import os
 import socket
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Dict, Literal, Optional
+from time import perf_counter
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NamedTuple, Optional, Protocol
 from urllib.parse import urlparse
 
-import requests  # type: ignore[import-untyped]
+import requests
+
+if TYPE_CHECKING:
+    class ChromaCollectionProtocol(Protocol):
+        def get(self, *, ids: Sequence[str]) -> Mapping[str, Sequence[Any]]: ...
+
+        def add(
+            self,
+            *,
+            documents: Sequence[str],
+            ids: Sequence[str],
+            metadatas: Sequence[Mapping[str, Any]],
+            embeddings: Sequence[Sequence[float]],
+        ) -> None: ...
+
+    class ChromaHttpClient(Protocol):
+        def get_or_create_collection(
+            self,
+            name: str,
+            metadata: Mapping[str, Any] | None = None,
+        ) -> ChromaCollectionProtocol: ...
+
+    class DocumentProtocol(Protocol):
+        page_content: str | None
+        metadata: Mapping[str, Any] | None
+else:  # pragma: no cover - runtime fallback for optional deps
+    ChromaCollectionProtocol = Any
+    ChromaHttpClient = Any
+    DocumentProtocol = Any
+
+try:
+    from fastapi import FastAPI, Header, HTTPException, Request, Response, status
+except ImportError as exc:  # pragma: no cover - fail fast with guidance
+    raise RuntimeError(
+        "Required module 'fastapi' is missing for the ingestion service. "
+        "Install dependencies with `pip install -r src/ingestor/requirements.txt`."
+    ) from exc
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -32,29 +70,22 @@ def _require_module(module_path: str, friendly_name: str):
 chromadb = _require_module("chromadb", "chromadb")
 docx = _require_module("docx", "python-docx")
 bs4_module = _require_module("bs4", "beautifulsoup4")
-BeautifulSoup = getattr(bs4_module, "BeautifulSoup")
-
-fastapi_module = _require_module("fastapi", "fastapi")
-FastAPI = getattr(fastapi_module, "FastAPI")
-Header = getattr(fastapi_module, "Header")
-HTTPException = getattr(fastapi_module, "HTTPException")
-Request = getattr(fastapi_module, "Request")
-status = getattr(fastapi_module, "status")
+BeautifulSoup = bs4_module.BeautifulSoup
 
 doc_loaders_module = _require_module("langchain_community.document_loaders", "langchain-community")
-PyPDFLoader = getattr(doc_loaders_module, "PyPDFLoader")
+PyPDFLoader = doc_loaders_module.PyPDFLoader
 
 embeddings_module = _require_module("langchain_community.embeddings", "langchain-community")
-OllamaEmbeddings = getattr(embeddings_module, "OllamaEmbeddings")
+OllamaEmbeddings = embeddings_module.OllamaEmbeddings
 
 documents_module = _require_module("langchain_core.documents", "langchain-core")
-Document = getattr(documents_module, "Document")
+Document = documents_module.Document
 
 google_module = _require_module("langchain_google_community", "langchain-google-community")
-GoogleDriveLoader = getattr(google_module, "GoogleDriveLoader")
+GoogleDriveLoader = google_module.GoogleDriveLoader
 
 splitters_module = _require_module("langchain_text_splitters", "langchain-text-splitters")
-RecursiveCharacterTextSplitter = getattr(splitters_module, "RecursiveCharacterTextSplitter")
+RecursiveCharacterTextSplitter = splitters_module.RecursiveCharacterTextSplitter
 
 
 # --- Configuration ---
@@ -69,6 +100,7 @@ LOCAL_SOURCE_ROOT = Path(os.getenv("LOCAL_SOURCE_ROOT", "/data/uploads")).resolv
 ALLOW_UNRESTRICTED_LOCAL = os.getenv("ALLOW_UNRESTRICTED_LOCAL", "false").lower() == "true"
 URL_SCHEMES_ALLOWED = {"http", "https"}
 API_TOKEN = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
+METRICS_ENABLED = os.getenv("METRICS_ENABLED", "false").lower() == "true"
 API_TOKEN_HEADER = os.getenv(
     "INGESTOR_TOKEN_HEADER",
     os.getenv("INGEST_AUTH_HEADER", "X-API-Token"),
@@ -86,6 +118,16 @@ USER_AGENT = os.getenv(
     ),
 )
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "15"))
+INGEST_CHUNK_SIZE = int(os.getenv("INGEST_CHUNK_SIZE", "800"))
+INGEST_CHUNK_OVERLAP = int(os.getenv("INGEST_CHUNK_OVERLAP", "120"))
+
+DEFAULT_MODALITY = "unknown"
+MODALITY_FALLBACK: dict[str, str] = {
+    "url": "text",
+    "gdrive_folder": "document",
+    "pdf": "pdf",
+    "docx": "docx",
+}
 
 logger = logging.getLogger("ingestor")
 if not logger.handlers:
@@ -99,12 +141,96 @@ for fallback in ("X-API-Token", "X-INGEST-TOKEN"):
     if fallback not in TOKEN_HEADER_CANDIDATES:
         TOKEN_HEADER_CANDIDATES.append(fallback)
 
-IP_ALLOWLIST_NETWORKS: list = []
+IP_ALLOWLIST_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
 for cidr in IP_ALLOWLIST:
     try:
         IP_ALLOWLIST_NETWORKS.append(ipaddress.ip_network(cidr, strict=False))
     except ValueError:
         logger.warning("CIDR ignored in INGESTOR_IP_ALLOWLIST: %s", cidr)
+
+# --- Prometheus Metrics (optional) ---
+PROMETHEUS_AVAILABLE = False
+PROMETHEUS_REGISTRY: Any | None = None
+_generate_latest: Callable[[Any], bytes] | None = None
+_PROMETHEUS_CONTENT_TYPE: str | None = None
+ingest_requests_total = None
+ingest_duration_seconds = None
+
+if METRICS_ENABLED:
+    try:
+        from prometheus_client import (
+            CONTENT_TYPE_LATEST,
+            CollectorRegistry,
+            Counter,
+            Histogram,
+            generate_latest,
+        )
+
+        PROMETHEUS_REGISTRY = CollectorRegistry()
+        ingest_requests_total = Counter(
+            "ingestor_ingests_total",
+            "Total ingestion requests processed",
+            ["source", "modality", "status"],
+            registry=PROMETHEUS_REGISTRY,
+        )
+        ingest_duration_seconds = Histogram(
+            "ingestor_ingest_duration_seconds",
+            "Time spent processing ingestion requests",
+            ["source", "modality"],
+            buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, float("inf")),
+            registry=PROMETHEUS_REGISTRY,
+        )
+        _generate_latest = generate_latest
+        _PROMETHEUS_CONTENT_TYPE = CONTENT_TYPE_LATEST
+        PROMETHEUS_AVAILABLE = True
+        logger.info("Prometheus metrics enabled")
+    except ImportError:  # pragma: no cover
+        logger.warning("prometheus_client not available, metrics disabled")
+
+
+class _NoopMetricsRecorder:
+    __slots__ = ()
+
+    def set_modality(self, modality: str) -> None:  # pragma: no cover - trivial
+        _ = modality
+
+    def observe(self, status: str) -> None:  # pragma: no cover - trivial
+        _ = status
+
+
+class _IngestMetricsRecorder:
+    __slots__ = ("_source", "_modality", "_start")
+
+    def __init__(self, source_label: str):
+        self._source = source_label or DEFAULT_MODALITY
+        self._modality = DEFAULT_MODALITY
+        self._start = perf_counter() if ingest_duration_seconds is not None else None
+
+    def set_modality(self, modality_label: str) -> None:
+        if modality_label:
+            self._modality = modality_label
+
+    def observe(self, status: str) -> None:
+        if ingest_requests_total is not None:
+            ingest_requests_total.labels(
+                source=self._source,
+                modality=self._modality,
+                status=status,
+            ).inc()
+        if self._start is not None and ingest_duration_seconds is not None:
+            duration = perf_counter() - self._start
+            if duration < 0:
+                duration = 0.0
+            ingest_duration_seconds.labels(
+                source=self._source,
+                modality=self._modality,
+            ).observe(duration)
+
+
+def _metrics_recorder(source_label: str) -> _NoopMetricsRecorder | _IngestMetricsRecorder:
+    if not PROMETHEUS_AVAILABLE or ingest_requests_total is None:
+        return _NoopMetricsRecorder()
+    return _IngestMetricsRecorder(source_label)
 
 app = FastAPI(title="RAG Ingestor API")
 
@@ -115,17 +241,87 @@ class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     source_type: Literal["url", "gdrive_folder", "pdf", "docx"]
     source: str
-    metadata_hints: Dict[str, str] = Field(default_factory=dict, alias="hints")
+    metadata_hints: dict[str, str] = Field(default_factory=dict, alias="hints")
 
 # --- Utilities ---
 
 
-def normalize_metadata(d: Dict) -> Dict:
+def normalize_metadata(d: Mapping[str, Any]) -> dict[str, Any]:
     return {
         str(k).strip().lower().replace(" ", "_"): v
         for k, v in d.items()
         if v not in (None, "")
     }
+
+
+class PreparedChunks(NamedTuple):
+    ids: list[str]
+    documents: list[str]
+    metadatas: list[dict[str, Any]]
+    modality: str
+
+
+def _resolve_modality(source_type: str, metadata: Mapping[str, Any] | None = None) -> str:
+    if metadata:
+        candidate = metadata.get("modality")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip().lower()
+        for key in ("mime_type", "content_type", "file_extension"):
+            value = metadata.get(key)
+            if not isinstance(value, str):
+                continue
+            lowered = value.lower()
+            if "pdf" in lowered:
+                return "pdf"
+            if "docx" in lowered or "word" in lowered:
+                return "docx"
+            if "html" in lowered or "text" in lowered:
+                return "text"
+    return MODALITY_FALLBACK.get(source_type, DEFAULT_MODALITY)
+
+
+def _prepare_chunks_for_chroma(
+    req: IngestRequest,
+    documents: Sequence[DocumentProtocol],
+    splitter: Any | None = None,
+) -> PreparedChunks:
+    if not documents:
+        fallback_modality = MODALITY_FALLBACK.get(req.source_type, DEFAULT_MODALITY)
+        return PreparedChunks([], [], [], fallback_modality)
+
+    splitter_obj = splitter or RecursiveCharacterTextSplitter(
+        chunk_size=INGEST_CHUNK_SIZE,
+        chunk_overlap=INGEST_CHUNK_OVERLAP,
+    )
+    chunks = splitter_obj.split_documents(documents)
+
+    ids: list[str] = []
+    contents: list[str] = []
+    metadatas: list[dict[str, Any]] = []
+    aggregate_modality = MODALITY_FALLBACK.get(req.source_type, DEFAULT_MODALITY)
+
+    for chunk in chunks:
+        text = (chunk.page_content or "").strip()
+        if not text:
+            continue
+        chunk_metadata = getattr(chunk, "metadata", {}) or {}
+        chunk_modality = _resolve_modality(req.source_type, chunk_metadata)
+        if aggregate_modality == DEFAULT_MODALITY and chunk_modality != DEFAULT_MODALITY:
+            aggregate_modality = chunk_modality
+        content_hash = get_content_hash(text)
+        merged_metadata: dict[str, Any] = {
+            "sha256": content_hash,
+            "source_type": req.source_type,
+            "source": req.source,
+            "modality": chunk_modality,
+        }
+        merged_metadata.update(chunk_metadata)
+        merged_metadata.update(req.metadata_hints)
+        ids.append(content_hash)
+        contents.append(text)
+        metadatas.append(normalize_metadata(merged_metadata))
+
+    return PreparedChunks(ids, contents, metadatas, aggregate_modality)
 
 
 def get_content_hash(text: str) -> str:
@@ -258,7 +454,7 @@ def load_from_url(url: str):
 # --- Chroma client factory ---
 
 
-def get_chroma_client() -> chromadb.HttpClient:
+def get_chroma_client() -> ChromaHttpClient:
     return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 
 # --- Endpoint helpers ---
@@ -271,7 +467,7 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
-def _enforce_token(request: Request, provided_header: Optional[str]) -> None:
+def _enforce_token(request: Request, provided_header: str | None) -> None:
     if not API_TOKEN:
         return
     candidate = provided_header
@@ -301,19 +497,20 @@ def _enforce_ip_allowlist(request: Request) -> None:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
 
-app = FastAPI(title="RAG Ingestor API")
+def _enforce_security(request: Request, provided_header: str | None) -> None:
+    _enforce_token(request, provided_header)
+    _enforce_ip_allowlist(request)
 
 
 @app.post("/ingest")
 def ingest_data(
     req: IngestRequest,
     request: Request,
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+    x_api_token: Annotated[Optional[str], Header(alias="X-API-Token")] = None,  # noqa: UP007,UP045 - Optional keeps py39 happy
 ):
-    # 1) Load & access controls
-    _enforce_token(request, x_api_token)
-    _enforce_ip_allowlist(request)
+    recorder = _metrics_recorder(req.source_type)
     try:
+        _enforce_security(request, x_api_token)
         if req.source_type == "url":
             docs = load_from_url(req.source)
         elif req.source_type == "gdrive_folder":
@@ -327,7 +524,8 @@ def ingest_data(
             docs = load_docx(str(path))
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported source_type: {req.source_type}")
-    except HTTPException:
+    except HTTPException as exc:
+        recorder.observe(f"http_{exc.status_code}")
         raise
     except Exception as e:  # pragma: no cover
         logger.exception(
@@ -335,36 +533,17 @@ def ingest_data(
             req.source,
             req.source_type,
         )
+        recorder.observe("error")
         raise HTTPException(status_code=500, detail=f"Load error: {e}") from e
 
     if not docs:
+        recorder.observe("success")
         return {"status": "ok", "message": "No document loaded."}
 
-    # 2) Split
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_documents(docs)
-    if not chunks:
-        return {"status": "ok", "message": "No textual chunk after splitting."}
-
-    # 3) Prepare
-    ids, documents, metadatas = [], [], []
-    for ch in chunks:
-        text = (ch.page_content or "").strip()
-        if not text:
-            continue
-        content_hash = get_content_hash(text)
-        merged = {
-            "sha256": content_hash,
-            "source_type": req.source_type,
-            "source": req.source,
-        }
-        merged.update(ch.metadata or {})
-        merged.update(req.metadata_hints or {})
-        ids.append(content_hash)
-        documents.append(text)
-        metadatas.append(normalize_metadata(merged))
-
-    if not ids:
+    prepared = _prepare_chunks_for_chroma(req, docs)
+    recorder.set_modality(prepared.modality)
+    if not prepared.ids:
+        recorder.observe("success")
         return {"status": "ok", "message": "No eligible content to ingest."}
 
     # 4) Insert (with de-duplication by hash)
@@ -372,18 +551,19 @@ def ingest_data(
         client = get_chroma_client()
         collection = client.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
 
-        existing = collection.get(ids=ids)
+        existing = collection.get(ids=prepared.ids)
         # already-existing ids
         existing_ids = set(existing.get("ids", []))
 
-        to_add_idx = [i for i, _id in enumerate(ids) if _id not in existing_ids]
+        to_add_idx = [i for i, chunk_id in enumerate(prepared.ids) if chunk_id not in existing_ids]
         if not to_add_idx:
-            return {"status": "ok", "added": 0, "skipped": len(ids)}
+            recorder.observe("success")
+            return {"status": "ok", "added": 0, "skipped": len(prepared.ids)}
 
         emb = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL)
-        docs_to_add = [documents[i] for i in to_add_idx]
-        ids_to_add = [ids[i] for i in to_add_idx]
-        meta_to_add = [metadatas[i] for i in to_add_idx]
+        docs_to_add = [prepared.documents[i] for i in to_add_idx]
+        ids_to_add = [prepared.ids[i] for i in to_add_idx]
+        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
         embs_to_add = emb.embed_documents(docs_to_add)
 
         collection.add(
@@ -400,14 +580,35 @@ def ingest_data(
             req.source,
             req.source_type,
         )
+        recorder.observe("success")
         return {"status": "ok", "added": added, "skipped": len(existing_ids)}
-    except HTTPException:
+    except HTTPException as exc:
+        recorder.observe(f"http_{exc.status_code}")
         raise
     except Exception as exc:  # pragma: no cover - logged for diagnostics
         logger.exception("embedding/indexing failed: %s", exc)
+        recorder.observe("error")
         raise HTTPException(status_code=502, detail="Embedding/Indexing failed") from exc
 
 
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+@app.get("/metrics")
+def get_metrics():
+    """Prometheus metrics endpoint (requires METRICS_ENABLED=true)"""
+    if (
+        not METRICS_ENABLED
+        or not PROMETHEUS_AVAILABLE
+        or _generate_latest is None
+        or _PROMETHEUS_CONTENT_TYPE is None
+        or PROMETHEUS_REGISTRY is None
+    ):
+        raise HTTPException(status_code=404, detail="Metrics not enabled")
+
+    return Response(
+        content=_generate_latest(PROMETHEUS_REGISTRY),
+        media_type=_PROMETHEUS_CONTENT_TYPE,
+    )

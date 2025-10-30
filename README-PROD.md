@@ -15,9 +15,10 @@ docker compose -f infra/docker-compose.yml ps
 
 ## Exposition HTTPS (Nginx + Certbot)
 
-* Utiliser `infra/nginx/*.template` avec `envsubst` pour générer les vhosts (les templates n’emploient **pas** la syntaxe `${VAR:-def}`).
-* `certbot --nginx -d <domaines> --agree-tos -m <email> --redirect -n`
-* Les templates intègrent des headers de sécurité (HSTS, CSP, etc.).
+* Utiliser `infra/nginx/*.template` avec `envsubst` pour générer les vhosts (les templates n’emploient **pas** `${VAR:-def}`).
+* Activer ensuite TLS via `certbot --nginx -d <domaines> --agree-tos -m <email> --redirect -n`.
+* Les templates intègrent CSP stricte, `Permissions-Policy`, `X-Frame-Options`, et `Referrer-Policy`.
+* Ajouter `add_header Strict-Transport-Security "max-age=63072000" always;` après issuance TLS (HSTS production).
 
 Exemple :
 ```bash
@@ -25,7 +26,7 @@ export RAG_EXTERNAL_DOMAIN="rag.example.com"
 export N8N_EXTERNAL_DOMAIN="automations.example.com"
 export NGINX_UI_PORT="18501"
 export NGINX_N8N_PORT="15678"
-export NGINX_CLIENT_MAX_BODY_SIZE="${NGINX_CLIENT_MAX_BODY_SIZE:-16m}"
+export NGINX_CLIENT_MAX_BODY_SIZE="16m"
 
 envsubst < infra/nginx/rag-ui.conf.template  | sudo tee /etc/nginx/sites-available/rag-ui.conf  >/dev/null
 envsubst < infra/nginx/rag-n8n.conf.template | sudo tee /etc/nginx/sites-available/rag-n8n.conf >/dev/null
@@ -37,11 +38,24 @@ sudo nginx -t && sudo systemctl reload nginx
 ## Ingestion
 
 * Endpoint `POST /ingest` (service **ingestor**) pour URL/fichiers/Google Drive (via n8n ou via API).
+* Chunking par défaut 800/120 (ajustable via `INGEST_CHUNK_SIZE`, `INGEST_CHUNK_OVERLAP`).
 * Les chunks et métadonnées sont stockés dans **Chroma** (v2).
 
 ## UI
 
 * Streamlit: recherche, top-k, sources, métadonnées.
+* Top-k borné à 8 par défaut (`UI_MAX_K`).
+
+## Observabilité
+
+* Ingestor expose `GET /metrics` (Prometheus) lorsque `METRICS_ENABLED=true` dans `infra/.env`.
+* Mettre à jour la configuration Nginx pour restreindre l'accès `/metrics` à l'allowlist IP interne (cf. documentation sécurité).
+* Métriques clés :
+	* `ingestor_ingests_total{status}` pour identifier les échecs (`status=http_4xx/http_5xx`).
+	* `histogram_quantile` sur `ingestor_ingest_duration_seconds` (p99 > 4s ⇒ alerte latence ingestion).
+* Exemple d'alerte PromQL :
+	* `sum(increase(ingestor_ingests_total{status!="success"}[5m])) > 0`
+	* `histogram_quantile(0.99, sum(rate(ingestor_ingest_duration_seconds_bucket[5m])) by (le)) > 4`
 
 ## Sauvegardes (idée)
 
