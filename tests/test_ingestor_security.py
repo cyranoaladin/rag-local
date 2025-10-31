@@ -1,3 +1,4 @@
+# pylint: disable=line-too-long,too-many-statements
 from __future__ import annotations
 
 import importlib
@@ -5,10 +6,17 @@ import importlib.machinery
 import importlib.util
 import sys
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient  # type: ignore
+
+try:
+    from fastapi.testclient import TestClient
+except ImportError as exc:  # pragma: no cover - hard fail when fastapi missing
+    raise RuntimeError(
+        "Required module 'fastapi' is missing for tests. Install dev dependencies with `pip install -r requirements-dev.txt`."
+    ) from exc
 
 
 def ensure_dependency_stubs() -> None:
@@ -99,7 +107,7 @@ def ensure_dependency_stubs() -> None:
             return module
 
         submodule = ensure_module("langchain_community.document_loaders", build_doc_loaders)
-        setattr(parent, "document_loaders", submodule)
+        setattr(parent, "document_loaders", submodule)  # noqa: B010 - test stub wiring
 
     if importlib.util.find_spec("langchain_community.embeddings") is None:
         parent = ensure_module("langchain_community", lambda: make_package("langchain_community"))
@@ -118,7 +126,7 @@ def ensure_dependency_stubs() -> None:
             return module
 
         submodule = ensure_module("langchain_community.embeddings", build_embeddings)
-        setattr(parent, "embeddings", submodule)
+        setattr(parent, "embeddings", submodule)  # noqa: B010 - test stub wiring
 
     if importlib.util.find_spec("langchain_core") is None:
         ensure_module("langchain_core", lambda: make_package("langchain_core"))
@@ -138,7 +146,7 @@ def ensure_dependency_stubs() -> None:
             return module
 
         submodule = ensure_module("langchain_core.documents", build_documents)
-        setattr(parent, "documents", submodule)
+        setattr(parent, "documents", submodule)  # noqa: B010 - test stub wiring
 
     if importlib.util.find_spec("langchain_google_community") is None:
         def build_google():
@@ -176,6 +184,9 @@ def ensure_dependency_stubs() -> None:
 def reload_api(monkeypatch: pytest.MonkeyPatch, token: str | None, allowlist: str | None = None) -> Any:
     """Reload the ingestor module with test-specific configuration."""
     ensure_dependency_stubs()
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     module_name = "src.ingestor.api"
     monkeypatch.setenv("HTTP_TIMEOUT", "0.1")
     monkeypatch.setenv("USER_AGENT", "pytest-agent")
@@ -189,6 +200,9 @@ def reload_api(monkeypatch: pytest.MonkeyPatch, token: str | None, allowlist: st
     else:
         monkeypatch.setenv("INGESTOR_IP_ALLOWLIST", allowlist)
     # Ensure module reload picks up new environment variables.
+    metrics_module = "src.ingestor.metrics"
+    if metrics_module in list(sys.modules):
+        sys.modules.pop(metrics_module)
     if module_name in list(sys.modules):
         sys.modules.pop(module_name)
     return importlib.import_module(module_name)

@@ -1,0 +1,110 @@
+diff --git a/infra/docker-compose.smoke.override.yml b/infra/docker-compose.smoke.override.yml
+new file mode 100644
+--- /dev/null
++++ b/infra/docker-compose.smoke.override.yml
+@@ -0,0 +1,17 @@
++services:
++  ingestor:
++    ports:
++      - "127.0.0.1:18001:8001"
++  ui:
++    ports:
++      - "127.0.0.1:18501:8501"
++
++diff --git a/.github/workflows/ci-smoke-compose.yml b/.github/workflows/ci-smoke-compose.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/ci-smoke-compose.yml
+@@ -0,0 +1,119 @@
++name: CI Smoke (Compose)
++on:
++  push:
++    branches: [ "**" ]
++  pull_request:
++    branches: [ "**" ]
++
++jobs:
++  smoke:
++    runs-on: ubuntu-latest
++    timeout-minutes: 25
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Setup Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++          cache: "pip"
++
++      - name: Install helper deps
++        run: |
++          python -m pip install --upgrade pip
++          if [ -f requirements-dev.txt ]; then
++            python -m pip install -r requirements-dev.txt
++          else
++            python -m pip install pytest
++          fi
++          if [ -f requirements.txt ]; then
++            python -m pip install -r requirements.txt
++          fi
++
++      - name: Docker info
++        run: |
++          docker --version
++          docker compose version
++          docker info
++
++      - name: Ensure CI env file
++        run: |
++          if [ ! -f infra/.env.ci ]; then
++            cat > infra/.env.ci <<'ENV'
++INGESTOR_API_TOKEN=devtoken
++INGEST_BASE_URL=http://ingestor:8001
++METRICS_ENABLED=true
++METRICS_NAMESPACE=rag
++MULTIMODAL_ENABLED=false
++ENV
++          fi
++          sed -n '1,120p' infra/.env.ci || true
++
++      - name: Compose up (db,llm,api) with smoke override
++        run: |
++          COMPOSE_PROFILES=db,llm,api docker compose \
++            -f infra/docker-compose.yml \
++            -f infra/docker-compose.smoke.override.yml \
++            --env-file infra/.env.ci \
++            up -d --build
++
++      - name: Wait for ingestor health
++        run: |
++          for i in $(seq 1 60); do
++            code=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:18001/health || true)
++            if [ "${code}" = "200" ]; then echo "health OK"; break; fi
++            sleep 2
++            if [ "$i" = "60" ]; then echo "health timeout"; exit 1; fi
++          done
++
++      - name: Run smoke script if present else do minimal curls
++        run: |
++          if [ -x infra/scripts/smoke.sh ]; then
++            bash infra/scripts/smoke.sh
++          else
++            echo "GET /health"
++            curl -fsS http://127.0.0.1:18001/health
++            echo
++            echo "POST /ingest (text mode fallback)"
++            curl -fsS -H "X-API-Token: devtoken" \
++              -F "file=@README.md;type=text/markdown" \
++              "http://127.0.0.1:18001/ingest?mode=text"
++            echo
++          fi
++
++      - name: Teardown
++        if: always()
++        run: |
++          COMPOSE_PROFILES=db,llm,api docker compose \
++            -f infra/docker-compose.yml \
++            -f infra/docker-compose.smoke.override.yml \
++            --env-file infra/.env.ci \
++            down --remove-orphans -v

@@ -26,11 +26,28 @@ Réponse:
 {"status": "ok", "added": 1, "skipped": 0}
 ```
 
+`GET /health` → `{"status": "healthy"}` (latence ciblée <100 ms).
+
+### Paramètres et limites
+
+- Authentification par header `X-API-Token` (obligatoire si configuré) + allowlist CIDR.
+- Taille maxi téléchargement distant: `MAX_REMOTE_BYTES` (par défaut 10 MiB).
+- Chunking: `INGEST_CHUNK_SIZE=800`, `INGEST_CHUNK_OVERLAP=120` (
+  compromis rappel/latence sur VPS). Ajustables via variables d’environnement.
+- Embeddings: `OLLAMA_URL` + `OLLAMA_EMBED_TIMEOUT` (20 s) + retries bornés.
+- Insertion Chroma: `CHROMA_HOST`, `CHROMA_PORT`, timeout client 10 s, `CHROMA_MAX_RETRIES=2`.
+
 ## Chroma v2
 
 * Tenant/db par défaut: `default_tenant` / `default_database`
 * Nom de collection: `ressources_pedagogiques_terminale` (par défaut côté ingestor)
 * Interro via client HTTP: `list_collections`, `get_or_create_collection().query(...)`
+
+### Recherche
+
+- `k` par défaut 4 (UI) avec maximum 8.
+- Résultats renvoient `documents`, `metadatas`, `distances`.
+- Ajuster `k` via variable `UI_MAX_K` ou paramètre direct dans client Chroma.
 
 ## Sécurité & Ops
 

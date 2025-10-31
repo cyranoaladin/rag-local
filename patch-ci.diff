@@ -1,0 +1,63 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,78 @@
++name: CI
++on:
++  push:
++    branches: [ "**" ]
++  pull_request:
++    branches: [ "**" ]
++
++jobs:
++  build-test:
++    runs-on: ubuntu-latest
++    timeout-minutes: 15
++    steps:
++      - name: Checkout
++        uses: actions/checkout@v4
++
++      - name: Setup Python
++        uses: actions/setup-python@v5
++        with:
++          python-version: "3.11"
++          cache: "pip"
++
++      - name: Install dev deps
++        run: |
++          python -m pip install --upgrade pip
++          if [ -f requirements-dev.txt ]; then
++            python -m pip install -r requirements-dev.txt
++          else
++            python -m pip install ruff mypy pytest
++          fi
++          if [ -f requirements.txt ]; then
++            python -m pip install -r requirements.txt
++          fi
++
++      - name: Lint
++        run: |
++          if [ -f Makefile ]; then
++            make lint
++          else
++            python -m ruff check .
++          fi
++
++      - name: Typecheck
++        run: |
++          if [ -f Makefile ]; then
++            make typecheck
++          else
++            python -m mypy src || true
++          fi
++
++      - name: Test
++        env:
++          METRICS_ENABLED: "true"
++        run: |
++          if [ -f Makefile ]; then
++            make test
++          else
++            python -m pytest -q
++          fi

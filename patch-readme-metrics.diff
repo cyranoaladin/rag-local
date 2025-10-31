@@ -1,0 +1,28 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,26 @@
+ # RAG Local
+ 
++## Contrat des métriques (Prometheus)
++
++Le service `ingestor` expose des métriques Prometheus **via un registre dédié** (pas le registre global), centralisé dans `src/ingestor/metrics.py`. Points clés :
++
++- **Gating** : `METRICS_ENABLED=true` par défaut. Mettre `METRICS_ENABLED=false` désactive tous les helpers (no-op) **et** force `/metrics` à retourner **404**.
++- **Espace de nommage** : piloté par `METRICS_NAMESPACE` (ex. `rag`). Toutes les familles (compteurs/histogrammes) sont enregistrées sur `REGISTRY`.
++- **Observabilité locale** : utilisez le profil `obs` pour démarrer Prometheus en boucle locale et vérifier l’état du target `ingestor`.
++- **Tests** : `tests/test_metrics_gating.py` vérifie `200/404` selon l’état du gating.
++
++Commandes utiles :
++```bash
++make lint && make typecheck && make test
++COMPOSE_PROFILES=db,llm,api,obs docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env up -d --build
++curl -s http://127.0.0.1:18001/metrics | head -n 20   # enabled
++docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env stop ingestor
++METRICS_ENABLED=false docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env up -d ingestor
++curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18001/metrics  # attendu: 404
++```
++
++---
++
+ # (contenu existant ci-dessous)
