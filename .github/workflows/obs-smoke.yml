@@ -1,6 +1,6 @@
 name: Observability Smoke
 
-on:
+'on':
   workflow_dispatch:
   workflow_run:
     workflows:
@@ -57,17 +57,15 @@ jobs:
           if [ -f infra/.env.ci ]; then
             cp infra/.env.ci infra/.env
           else
-            cat > infra/.env <<'ENV'
-METRICS_ENABLED=true
-METRICS_NAMESPACE=rag_local
-INGESTOR_API_TOKEN=devtoken
-INGEST_BASE_URL=http://ingestor:8001
-INGEST_MAX_FILE_MB=5
-MULTIMODAL_ENABLED=false
-NGINX_CLIENT_MAX_BODY_SIZE=16m
-NGINX_UI_UPSTREAM=ui:8501
-NGINX_N8N_UPSTREAM=n8n:5678
-ENV
+            printf '%s\n' 'METRICS_ENABLED=true' > infra/.env
+            printf '%s\n' 'METRICS_NAMESPACE=rag_local' >> infra/.env
+            printf '%s\n' 'INGESTOR_API_TOKEN=devtoken' >> infra/.env
+            printf '%s\n' 'INGEST_BASE_URL=http://ingestor:8001' >> infra/.env
+            printf '%s\n' 'INGEST_MAX_FILE_MB=5' >> infra/.env
+            printf '%s\n' 'MULTIMODAL_ENABLED=false' >> infra/.env
+            printf '%s\n' 'NGINX_CLIENT_MAX_BODY_SIZE=16m' >> infra/.env
+            printf '%s\n' 'NGINX_UI_UPSTREAM=ui:8501' >> infra/.env
+            printf '%s\n' 'NGINX_N8N_UPSTREAM=n8n:5678' >> infra/.env
           fi
 
       - name: Docker info
