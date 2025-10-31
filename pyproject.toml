@@ -1,0 +1,30 @@
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["build", "dist", ".venv", "infra/creds", "n8n/workflows/examples"]
+fix = false
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]  # longueur de ligne gérée pragmatiquement
+preview = false
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+exclude = "(^\\.venv/|^infra/creds/|^n8n/workflows/)"
+disable_error_code = ["import-untyped"]
+
+[tool.pylint.main]
+py-version = "3.11"
+disable = [
+  "missing-module-docstring",
+  "missing-class-docstring",
+  "missing-function-docstring",
+  "too-few-public-methods"
+]
+good-names = ["e", "i", "k", "v", "ip", "id"]

@@ -1,10 +1,10 @@
 # secrets & local state
-.env
-.env.*
+
 creds/
 **/database.sqlite
 n8n/db/
-infra/nginx/*.conf
+# track base nginx.conf, ignore only rendered vhosts
+infra/nginx/rendered/*.conf
 
 # python/node cruft
 **/__pycache__/
@@ -18,3 +18,21 @@ infra/nginx/*.conf
 
 # local backups
 *.bak*
+# caches & env
+.mypy_cache/
+.pytest_cache/
+infra/.env
+infra/creds/*.json
+# local artifacts
+arborescence.txt
+compose-ps.txt
+# Dev artefacts
+.venv/
+.ruff_cache/
+# Local env & overrides non versionnés
+infra/docker-compose.override.yml
+infra/creds/
+data/
+
+# Nginx rendered configs (dir)
+infra/nginx/rendered/

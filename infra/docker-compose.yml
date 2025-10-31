@@ -18,6 +18,11 @@ services:
       - ANONYMIZED_TELEMETRY=FALSE
     volumes:
       - rag_chroma_data:/chroma/chroma
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
       test: ["CMD","bash","-ec","set -o pipefail; exec 3<>/dev/tcp/127.0.0.1/8000; printf \"GET /api/v2/heartbeat HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; timeout 5 head -n 1 <&3 | grep -q \"200\""]
       start_period: 20s
@@ -34,6 +39,11 @@ services:
       - OLLAMA_HOST=0.0.0.0:11434
     volumes:
       - rag_ollama_data:/root/.ollama
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
       test: ["CMD","bash","-ec","set -o pipefail; exec 3<>/dev/tcp/127.0.0.1/11434; printf \"GET /api/tags HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; timeout 5 head -n 1 <&3 | grep -q \"200\""]
       start_period: 20s
@@ -52,21 +62,45 @@ services:
     restart: unless-stopped
     networks: [rag_net]
     environment:
-      - TZ=${TZ}
-      - CHROMA_HOST=chroma
-      - CHROMA_PORT=${CHROMA_PORT}
-      - OLLAMA_URL=http://ollama:${OLLAMA_PORT}
-      - EMBED_MODEL=${EMBED_MODEL}
-      - SMALL_LLM=${SMALL_LLM}
-      - GOOGLE_APPLICATION_CREDENTIALS=/creds/gdrive-service-account.json
+      TZ: ${TZ}
+      CHROMA_HOST: chroma
+      CHROMA_PORT: ${CHROMA_PORT}
+      OLLAMA_URL: "http://ollama:${OLLAMA_PORT}"
+      EMBED_MODEL: ${EMBED_MODEL}
+      SMALL_LLM: ${SMALL_LLM}
+      GOOGLE_APPLICATION_CREDENTIALS: /creds/gdrive-service-account.json
+      LOCAL_SOURCE_ROOT: /data/uploads
+      INGESTOR_API_TOKEN: ${INGESTOR_API_TOKEN}
+      INGESTOR_IP_ALLOWLIST: ${INGESTOR_IP_ALLOWLIST}
+      USER_AGENT: ${USER_AGENT:-rag-local-ingestor/1.0}
+      HTTP_TIMEOUT: ${HTTP_TIMEOUT:-15}
+      XDG_CACHE_HOME: /tmp
+      MAX_REMOTE_BYTES: ${MAX_REMOTE_BYTES:-26214400}
     volumes:
       - ./creds:/creds:ro
+      - ./data/uploads:/data/uploads:rw
     command: uvicorn api:app --host 0.0.0.0 --port ${INGESTOR_PORT}
     security_opt: ["no-new-privileges:true"]
     read_only: true
     tmpfs: ["/tmp", "/var/tmp"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
-      test: ["CMD-SHELL","curl -fsS http://localhost:${INGESTOR_PORT}/health >/dev/null || exit 1"]
+      test:
+        - CMD-SHELL
+        - |
+          python - <<'PY'
+          import sys
+          import urllib.request
+
+          try:
+              urllib.request.urlopen("http://localhost:${INGESTOR_PORT}/health", timeout=5)
+          except Exception:
+              sys.exit(1)
+          PY
       start_period: 30s
       interval: 10s
       timeout: 5s
@@ -97,10 +131,15 @@ services:
       - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
       - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
       - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - N8N_HIRING_BANNER_ENABLED=false
+      - N8N_PERSONALIZATION_ENABLED=false
+      - N8N_FLAGS_METRICS=false
+      - N8N_PUBLIC_API_DISABLED=true
+      - N8N_TELEMETRY=false
     volumes:
       - rag_n8n_data:/home/node/.n8n
-    ports:
-      - "127.0.0.1:${NGINX_N8N_PORT}:${N8N_PORT}"
     healthcheck:
       test: ["CMD","sh","-ec","wget -q --spider http://127.0.0.1:${N8N_PORT}/healthz"]
       start_period: 30s
@@ -111,6 +150,11 @@ services:
       ingestor:
         condition: service_healthy
     profiles: ["automations"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   ui:
     build: ../src/ui
@@ -120,11 +164,17 @@ services:
       - TZ=${TZ}
       - CHROMA_HOST=chroma
       - CHROMA_PORT=${CHROMA_PORT}
-    ports:
-      - "127.0.0.1:${NGINX_UI_PORT}:${STREAMLIT_PORT}"
+      - XDG_CACHE_HOME=/tmp
+      - STREAMLIT_SERVER_HEADLESS=true
     security_opt: ["no-new-privileges:true"]
     read_only: true
-    tmpfs: ["/tmp", "/var/tmp"]
+    tmpfs:
+      - /tmp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
       test: ["CMD","bash","-ec","set -o pipefail; exec 3<>/dev/tcp/127.0.0.1/${STREAMLIT_PORT}; printf \"GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3; timeout 5 head -n 1 <&3 | grep -q \"200\""]
       start_period: 25s
@@ -142,3 +192,24 @@ services:
         limits:
           cpus: "1.0"
           memory: 2G
+
+  web:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    profiles: ["web"]
+    depends_on:
+      ui:
+        condition: service_started
+      n8n:
+        condition: service_started
+    networks: [rag_net]
+    # No ports here → prod stays internal; expose only via dev override or a reverse proxy
+    volumes:
+      - ./nginx/rendered:/etc/nginx/conf.d:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "nginx -t && wget -qO- http://127.0.0.1/ >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
