@@ -34,6 +34,26 @@ Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make
 - Pipeline GitHub Actions (`.github/workflows/ci.yml`) déclenche lint, mypy, pytest (Py 3.10 / 3.11) + artefacts `ruff.txt` / `pytest.xml`.
 - Job optionnel `smoke-compose` via `workflow_dispatch` pour bâtir le profil multimodal et exécuter `infra/scripts/smoke.sh`.
 
+## Contrat des métriques (Prometheus)
+
+Le service `ingestor` expose ses métriques via un registre unique défini dans `src/ingestor/metrics.py` :
+
+- **Gating** : `METRICS_ENABLED=true` tant que la variable n'est pas forcée à `false`. Quand c'est désactivé, les helpers deviennent no-op et `GET /metrics` renvoie `404`.
+- **Namespace** : piloté par `METRICS_NAMESPACE` (ex. `rag`). Chaque compteur/histogramme doit être déclaré avec `registry=REGISTRY`.
+- **Tests** : `tests/test_metrics_gating.py` couvre les scénarios `200/404`.
+- **Ops local** : profil Compose `obs` (`make obs-up`) pour démarrer Prometheus + exporter, puis `make obs-quickcheck` pour vérifier readiness Prometheus et `/metrics`.
+
+Commandes utiles :
+
+```bash
+make lint && make typecheck && make test
+COMPOSE_PROFILES=db,llm,api,obs docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env up -d --build
+curl -s http://127.0.0.1:18001/metrics | head -n 20   # enabled
+docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env stop ingestor
+METRICS_ENABLED=false docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env up -d ingestor
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18001/metrics  # attendu: 404
+```
+
 ## Nginx (web) service
 - Service profilé: `web` (activé via `COMPOSE_PROFILES`)
 - Prod: pas d'exposition de ports (interne au réseau Docker), à exposer via reverse proxy amont

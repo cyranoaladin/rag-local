@@ -200,6 +200,9 @@ def reload_api(monkeypatch: pytest.MonkeyPatch, token: str | None, allowlist: st
     else:
         monkeypatch.setenv("INGESTOR_IP_ALLOWLIST", allowlist)
     # Ensure module reload picks up new environment variables.
+    metrics_module = "src.ingestor.metrics"
+    if metrics_module in list(sys.modules):
+        sys.modules.pop(metrics_module)
     if module_name in list(sys.modules):
         sys.modules.pop(module_name)
     return importlib.import_module(module_name)

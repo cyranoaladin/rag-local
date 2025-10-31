@@ -2,28 +2,56 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import ipaddress
+import mimetypes
 import os
 import socket
+import sys
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Literal
+from types import ModuleType
+from typing import Any, Literal, cast
 from urllib.parse import urlparse
 
 import chromadb
 import docx
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_core.documents import Document
 from langchain_google_community import GoogleDriveLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel, ConfigDict, Field
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+
+from .mm_adapter import Chunk, parse_multimodal
+
+
+def _load_metrics_module() -> ModuleType:
+    module_name = "src.ingestor.metrics"
+    existing = sys.modules.get(module_name)
+    if isinstance(existing, ModuleType):
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path(__file__).with_name("metrics.py"),
+    )
+    if spec and spec.loader:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError("Unable to load metrics module")
+
+
+ingest_metrics: ModuleType = _load_metrics_module()
 
 # --- Configuration ---
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
@@ -38,15 +66,28 @@ ALLOW_UNRESTRICTED_LOCAL = os.getenv(
     "ALLOW_UNRESTRICTED_LOCAL", "false").lower() == "true"
 URL_SCHEMES_ALLOWED = {"http", "https"}
 
-REQUEST_COUNT = Counter(
-    "ingestor_requests_total", "Total requests", ["path", "method", "code"]
-)
-REQUEST_LATENCY = Histogram(
-    "ingestor_request_latency_seconds", "Request latency", ["path", "method"]
-)
-INGEST_RESULT = Counter(
-    "ingestor_ingest_events_total", "Ingest events", ["status"]
-)
+INGEST_CHUNK_SIZE = int(os.getenv("INGEST_CHUNK_SIZE", "1000"))
+INGEST_CHUNK_OVERLAP = int(os.getenv("INGEST_CHUNK_OVERLAP", "150"))
+METRICS_ENABLED = ingest_metrics.METRICS_ENABLED
+MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "false").lower() == "true"
+MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
+MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
+MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
+
+# Keep metrics isolated per module import to avoid duplicate registration in tests.
+METRIC_REGISTRY = ingest_metrics.REGISTRY
+REQUEST_COUNT = ingest_metrics.REQUEST_COUNT
+REQUEST_LATENCY = ingest_metrics.REQUEST_LATENCY
+INGEST_RESULT = ingest_metrics.INGEST_RESULT
+ingest_requests_total = ingest_metrics.ingest_requests_total
+
+
+@dataclass
+class PreparedBatch:
+    ids: list[str]
+    documents: list[str]
+    metadatas: list[dict[str, str]]
+    modality: str
 
 app = FastAPI(title="RAG Ingestor API")
 
@@ -61,16 +102,29 @@ async def _metrics_middleware(request, call_next):
         code = 500
         raise
     finally:
-        elapsed = time.perf_counter() - start
-        path = request.url.path
-        method = request.method
-        REQUEST_LATENCY.labels(path=path, method=method).observe(elapsed)
-        REQUEST_COUNT.labels(path=path, method=method, code=str(code)).inc()
+        if ingest_metrics.METRICS_ENABLED:
+            elapsed = time.perf_counter() - start
+            path = request.url.path
+            method = request.method
+            REQUEST_LATENCY.labels(path=path, method=method).observe(elapsed)
+            REQUEST_COUNT.labels(path=path, method=method, code=str(code)).inc()
     return response
 
 
 def _record_ingest_metrics(ok: bool) -> None:
-    INGEST_RESULT.labels(status="ok" if ok else "fail").inc()
+    if ingest_metrics.METRICS_ENABLED:
+        INGEST_RESULT.labels(status="ok" if ok else "fail").inc()
+
+
+def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
+    if not METRICS_ENABLED:
+        return
+    safe_source = (source or "unknown").strip().lower() or "unknown"
+    safe_modality = (modality or "unknown").strip().lower() or "unknown"
+    safe_status = (status or "unknown").strip().lower() or "unknown"
+    ingest_requests_total.labels(
+        source=safe_source, modality=safe_modality, status=safe_status
+    ).inc()
 
 # --- Modèle de requête ---
 
@@ -79,13 +133,18 @@ class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     source_type: Literal["url", "gdrive_folder", "pdf", "docx"]
     source: str
-    metadata_hints: Dict[str, str] = Field(default_factory=dict, alias="hints")
+    metadata_hints: dict[str, str] = Field(default_factory=dict, alias="hints")
 
 # --- Utilitaires ---
 
 
-def normalize_metadata(d: Dict) -> Dict:
-    return {str(k).strip().lower().replace(" ", "_"): v for k, v in d.items() if v not in (None, "")}
+def normalize_metadata(d: dict) -> dict[str, str]:
+    normalized: dict[str, str] = {}
+    for key, value in d.items():
+        if value in (None, ""):
+            continue
+        normalized[str(key).strip().lower().replace(" ", "_")] = str(value)
+    return normalized
 
 
 def get_content_hash(text: str) -> str:
@@ -109,12 +168,62 @@ def _resolve_local_path(raw_path: str) -> Path:
     return candidate
 
 
+def _get_client_ip(request: Any) -> str:
+    headers = getattr(request, "headers", {}) or {}
+    forwarded = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+    if isinstance(forwarded, str) and forwarded.strip():
+        primary = forwarded.split(",")[0].strip()
+        if primary:
+            return primary
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    if isinstance(host, str) and host:
+        return host
+    return "127.0.0.1"
+
+
+def _ip_allowed(ip_str: str, allowlist: str | None) -> bool:
+    if not allowlist:
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    for cidr in allowlist.split(","):
+        network = cidr.strip()
+        if not network:
+            continue
+        try:
+            if ip_obj in ipaddress.ip_network(network, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _enforce_security(request: Any, _req: Any) -> None:
+    headers = getattr(request, "headers", {}) or {}
+    token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
+    if token_env:
+        header_token = headers.get("X-API-Token") or headers.get("x-api-token")
+        if header_token != token_env:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    allowlist = os.getenv("INGESTOR_IP_ALLOWLIST")
+    if allowlist and not _ip_allowed(_get_client_ip(request), allowlist):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def get_chroma_client() -> Any:
+    return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+
+
 def load_docx(file_path: str):
     try:
         d = docx.Document(file_path)
     except Exception as e:
         raise HTTPException(
-            status_code=400, detail=f"Impossible de lire le DOCX: {e}")
+            status_code=400, detail=f"Impossible de lire le DOCX: {e}") from e
     texts = []
     for p in d.paragraphs:
         if p.text and p.text.strip():
@@ -138,7 +247,7 @@ def _validate_remote_url(url: str) -> None:
             443 if parsed.scheme == "https" else 80))
     except socket.gaierror as exc:
         raise HTTPException(
-            status_code=400, detail=f"Résolution DNS impossible: {exc}")
+            status_code=400, detail=f"Résolution DNS impossible: {exc}") from exc
     for entry in addr_info:
         ip = ipaddress.ip_address(entry[4][0])
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
@@ -166,7 +275,7 @@ def _download_to_temp(url: str, suffix: str) -> Path:
         raise
     except requests.RequestException as exc:
         raise HTTPException(
-            status_code=400, detail=f"Téléchargement impossible: {exc}")
+            status_code=400, detail=f"Téléchargement impossible: {exc}") from exc
 
 
 def _fetch_remote_text(url: str) -> tuple[str, str]:
@@ -201,7 +310,7 @@ def _fetch_remote_text(url: str) -> tuple[str, str]:
         raise
     except requests.RequestException as exc:
         raise HTTPException(
-            status_code=400, detail=f"Téléchargement impossible: {exc}")
+            status_code=400, detail=f"Téléchargement impossible: {exc}") from exc
 
 
 def load_from_url(url: str):
@@ -222,96 +331,208 @@ def load_from_url(url: str):
             status_code=400, detail="Aucun contenu exploitable sur la page")
     return [Document(page_content=text, metadata={"source": final_url})]
 
+
+def _load_source_documents(req: IngestRequest) -> list[Document]:
+    if req.source_type == "url":
+        return load_from_url(req.source)
+    if req.source_type == "gdrive_folder":
+        loader = GoogleDriveLoader(folder_id=req.source, recursive=True)
+        return loader.load()
+    if req.source_type == "pdf":
+        path = _resolve_local_path(req.source)
+        return PyPDFLoader(str(path)).load()
+    if req.source_type == "docx":
+        path = _resolve_local_path(req.source)
+        return load_docx(str(path))
+    raise HTTPException(status_code=400, detail=f"source_type non géré: {req.source_type}")
+
+
+def _prepare_chunks_for_chroma(
+    req: IngestRequest,
+    docs: list[Document],
+    splitter: RecursiveCharacterTextSplitter | None = None,
+) -> PreparedBatch:
+    splitter = splitter or RecursiveCharacterTextSplitter(
+        chunk_size=INGEST_CHUNK_SIZE, chunk_overlap=INGEST_CHUNK_OVERLAP
+    )
+    chunks = splitter.split_documents(docs)
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[dict[str, str]] = []
+    modality = "text"
+
+    for chunk in chunks:
+        text = (chunk.page_content or "").strip()
+        if not text:
+            continue
+        content_hash = get_content_hash(text)
+        chunk_modality = (chunk.metadata or {}).get("modality", "text")
+        metadata = {
+            "sha256": content_hash,
+            "source_type": req.source_type,
+            "source": req.source,
+            "modality": chunk_modality,
+        }
+        metadata.update(chunk.metadata or {})
+        metadata.update(req.metadata_hints or {})
+        normalized = normalize_metadata(metadata)
+
+        ids.append(content_hash)
+        documents.append(text)
+        metadatas.append(normalized)
+        modality = normalized.get("modality", modality)
+
+    if not ids:
+        modality = "text"
+    return PreparedBatch(ids=ids, documents=documents, metadatas=metadatas, modality=modality)
+
+
+def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> PreparedBatch:
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[dict[str, str]] = []
+    modality_counts: dict[str, int] = {}
+
+    for chunk in chunks:
+        text = chunk.as_text() if hasattr(chunk, "as_text") else (chunk.text or "")
+        text = (text or "").strip()
+        if not text:
+            continue
+        content_hash = get_content_hash(text)
+        chunk_modality = (chunk.modality or "unknown").strip().lower() or "unknown"
+        metadata: dict[str, Any] = {
+            "sha256": content_hash,
+            "source": req.source,
+            "source_type": req.source_type,
+            "modality": chunk_modality,
+        }
+        metadata.update(getattr(chunk, "metadata", {}) or {})
+        metadata.update(req.metadata_hints or {})
+        normalized = normalize_metadata(metadata)
+
+        ids.append(content_hash)
+        documents.append(text)
+        metadatas.append(normalized)
+
+        key = normalized.get("modality", chunk_modality)
+        modality_counts[key] = modality_counts.get(key, 0) + 1
+
+    if modality_counts:
+        dominant = max(modality_counts.items(), key=lambda item: item[1])[0]
+    else:
+        dominant = "unknown"
+    return PreparedBatch(ids=ids, documents=documents, metadatas=metadatas, modality=dominant)
+
+
+def _prepare_multimodal_ingest(req: IngestRequest) -> PreparedBatch:
+    if not MULTIMODAL_ENABLED:
+        raise HTTPException(status_code=400, detail="Multimodal ingest disabled")
+    path = _resolve_local_path(req.source)
+    mime, _ = mimetypes.guess_type(path.name)
+    with path.open("rb") as handle:
+        chunk_iter = parse_multimodal(
+            handle,
+            filename=path.name,
+            mime=mime or "application/octet-stream",
+            timeout_s=MM_PARSER_TIMEOUT,
+            max_chars_per_chunk=MM_MAX_CHARS_PER_CHUNK,
+            cache_dir=MM_CACHE_DIR,
+        )
+        chunk_list = list(chunk_iter)
+    return _prepare_multimodal_chunks(req, chunk_list)
+
 # --- Endpoint ---
 
 
 @app.post("/ingest")
-def ingest_data(req: IngestRequest):
-    # 1) Chargement
+def ingest_data(
+    req: IngestRequest,
+    request: Request,
+    mode: str = Query(default="text"),
+):
+    modality_label = "unknown"
+    mode_normalized = (mode or "text").strip().lower() or "text"
+
     try:
-        if req.source_type == "url":
-            docs = load_from_url(req.source)
-        elif req.source_type == "gdrive_folder":
-            loader = GoogleDriveLoader(folder_id=req.source, recursive=True)
-            docs = loader.load()
-        elif req.source_type == "pdf":
-            path = _resolve_local_path(req.source)
-            docs = PyPDFLoader(str(path)).load()
-        elif req.source_type == "docx":
-            path = _resolve_local_path(req.source)
-            docs = load_docx(str(path))
-        else:
-            raise HTTPException(
-                status_code=400, detail=f"source_type non géré: {req.source_type}")
-    except HTTPException:
-        _record_ingest_metrics(False)
+        _enforce_security(request, req)
+    except HTTPException as exc:
+        _record_ingest_outcome(req.source_type, modality_label, f"http_{exc.status_code}")
         raise
-    except Exception as e:
+
+    try:
+        if mode_normalized == "multimodal":
+            prepared = _prepare_multimodal_ingest(req)
+        elif mode_normalized in {"", "text"}:
+            docs = _load_source_documents(req)
+            if not docs:
+                _record_ingest_metrics(True)
+                modality_label = "text"
+                _record_ingest_outcome(req.source_type, modality_label, "empty")
+                return {"status": "ok", "message": "Aucun document chargé."}
+            prepared = _prepare_chunks_for_chroma(req, docs)
+        else:
+            raise HTTPException(status_code=400, detail="Mode d'ingestion non supporté")
+        modality_label = prepared.modality or "unknown"
+    except HTTPException as exc:
         _record_ingest_metrics(False)
-        raise HTTPException(
-            status_code=500, detail=f"Erreur de chargement: {e}")
+        _record_ingest_outcome(req.source_type, modality_label, f"http_{exc.status_code}")
+        raise
+    except Exception as exc:
+        _record_ingest_metrics(False)
+        _record_ingest_outcome(req.source_type, modality_label, "error")
+        raise HTTPException(status_code=500, detail=f"Erreur de chargement: {exc}") from exc
 
-    if not docs:
+    if not prepared.ids:
         _record_ingest_metrics(True)
-        return {"status": "ok", "message": "Aucun document chargé."}
-
-    # 2) Découpage
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, chunk_overlap=150)
-    chunks = splitter.split_documents(docs)
-    if not chunks:
-        _record_ingest_metrics(True)
-        return {"status": "ok", "message": "Aucun chunk textuel après découpage."}
-
-    # 3) Préparation
-    ids, documents, metadatas = [], [], []
-    for ch in chunks:
-        text = (ch.page_content or "").strip()
-        if not text:
-            continue
-        content_hash = get_content_hash(text)
-        merged = {"sha256": content_hash,
-                  "source_type": req.source_type, "source": req.source}
-        merged.update(ch.metadata or {})
-        merged.update(req.metadata_hints or {})
-        ids.append(content_hash)
-        documents.append(text)
-        metadatas.append(normalize_metadata(merged))
-
-    if not ids:
-        _record_ingest_metrics(True)
+        _record_ingest_outcome(req.source_type, modality_label, "empty")
         return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
 
-    # 4) Insertion (avec déduplication par hash)
     try:
-        client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+        client = get_chroma_client()
         collection = client.get_or_create_collection(
-            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+        )
 
-        existing = collection.get(ids=ids)
-        # ids effectivement trouvés
+        existing = collection.get(ids=prepared.ids) or {}
         existing_ids = set(existing.get("ids", []))
 
-        to_add_idx = [i for i, _id in enumerate(
-            ids) if _id not in existing_ids]
+        to_add_idx = [i for i, chunk_id in enumerate(prepared.ids) if chunk_id not in existing_ids]
         if not to_add_idx:
             _record_ingest_metrics(True)
-            return {"status": "ok", "added": 0, "skipped": len(ids)}
+            _record_ingest_outcome(req.source_type, modality_label, "skipped")
+            return {"status": "ok", "added": 0, "skipped": len(prepared.ids)}
 
         emb = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL)
-        docs_to_add = [documents[i] for i in to_add_idx]
-        ids_to_add = [ids[i] for i in to_add_idx]
-        meta_to_add = [metadatas[i] for i in to_add_idx]
+        docs_to_add = [prepared.documents[i] for i in to_add_idx]
+        ids_to_add = [prepared.ids[i] for i in to_add_idx]
+        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
         embs_to_add = emb.embed_documents(docs_to_add)
 
-        collection.add(documents=docs_to_add, ids=ids_to_add,
-                       metadatas=meta_to_add, embeddings=embs_to_add)
+        meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
+        embeddings_seq = cast(list[Sequence[float]], embs_to_add)
+        collection.add(
+            documents=docs_to_add,
+            ids=ids_to_add,
+            metadatas=meta_mappings,
+            embeddings=embeddings_seq,
+        )
         _record_ingest_metrics(True)
-        return {"status": "ok", "added": len(ids_to_add), "skipped": len(existing_ids)}
-    except Exception as e:
+        _record_ingest_outcome(req.source_type, modality_label, "success")
+        return {
+            "status": "ok",
+            "added": len(ids_to_add),
+            "skipped": len(existing_ids),
+        }
+    except HTTPException as exc:
         _record_ingest_metrics(False)
+        _record_ingest_outcome(req.source_type, modality_label, f"http_{exc.status_code}")
+        raise
+    except Exception as exc:
+        _record_ingest_metrics(False)
+        _record_ingest_outcome(req.source_type, modality_label, "error")
         raise HTTPException(
-            status_code=500, detail=f"Erreur d'ingestion dans ChromaDB: {e}")
+            status_code=500, detail=f"Erreur d'ingestion dans ChromaDB: {exc}"
+        ) from exc
 
 
 @app.get("/health")
@@ -321,4 +542,7 @@ def health_check():
 
 @app.get("/metrics")
 def metrics() -> Response:
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+    if not ingest_metrics.METRICS_ENABLED:
+        raise HTTPException(status_code=404, detail="Metrics disabled")
+    body = ingest_metrics.generate_latest(METRIC_REGISTRY)
+    return Response(body, media_type=CONTENT_TYPE_LATEST)

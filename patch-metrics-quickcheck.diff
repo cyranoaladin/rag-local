@@ -1,0 +1,39 @@
+diff --git a/infra/scripts/metrics_quickcheck.sh b/infra/scripts/metrics_quickcheck.sh
+new file mode 100755
+--- /dev/null
++++ b/infra/scripts/metrics_quickcheck.sh
+@@ -0,0 +1,38 @@
++#!/usr/bin/env bash
++set -Eeuo pipefail
++
++PROM_URL="${PROM_URL:-http://127.0.0.1:19090}"
++TARGET_URL="${TARGET_URL:-http://127.0.0.1:18001/metrics}"
++
++echo "== Quickcheck Prometheus =="
++curl -fsS "${PROM_URL}/-/ready" && echo "PROM: ready OK" || { echo "PROM: ready FAIL"; exit 1; }
++curl -fsS "${PROM_URL}/-/healthy" && echo "PROM: healthy OK" || { echo "PROM: healthy FAIL"; exit 1; }
++
++echo -e "\n== Exemple de label (dump limité) =="
++curl -fsS "${PROM_URL}/api/v1/labels" | head -c 800 || true
++echo
++
++echo -e "\n== Sanity /metrics exposé par ingestor =="
++curl -fsS "${TARGET_URL}" | head -n 20 || { echo "Ingestor /metrics indisponible"; exit 1; }
++
++echo -e "\n== Requête simple sur ingest_success_total (peut retourner vide si stack idle) =="
++curl -fsS --data-urlencode 'query=ingest_success_total' "${PROM_URL}/api/v1/query" | head -c 400 || true
++echo
++diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -1,3 +1,15 @@
++# Observability quickcheck helper (optionnel)
++.PHONY: obs-quickcheck
++obs-quickcheck:
++@if [ -x infra/scripts/metrics_quickcheck.sh ]; then \
++PROM_URL=$${PROM_URL:-http://127.0.0.1:19090} \
++TARGET_URL=$${TARGET_URL:-http://127.0.0.1:18001/metrics} \
++bash infra/scripts/metrics_quickcheck.sh ; \
++else \
++echo "infra/scripts/metrics_quickcheck.sh manquant (non bloquant)"; \
++fi

@@ -1,117 +1,98 @@
+# Makefile venv-aware pour lint/type/tests/obs
+
 SHELL := /bin/bash
+VENVDIR ?= .venv
 
-BASE := infra/docker-compose.yml
-DEV  := infra/docker-compose.dev.yml
-ENVF := $(shell if [ -f infra/.env.ci ]; then echo infra/.env.ci; else echo infra/.env; fi)
-
-compose := docker compose -f $(BASE)
-ifneq ("$(wildcard $(DEV))","")
-  compose := docker compose -f $(BASE) -f $(DEV)
+# Detecte un Python de venv si disponible, sinon retombe sur python3
+PY_SYS := $(shell command -v python3 2>/dev/null || echo python3)
+PY_VENV := $(VENVDIR)/bin/python
+ifeq ($(wildcard $(PY_VENV)),)
+  PY := $(PY_SYS)
+else
+  PY := $(PY_VENV)
 endif
 
--include mk/qa.mk
+RUFF   := $(PY) -m ruff
+MYPY   := $(PY) -m mypy
+PYTEST := $(PY) -m pytest
 
-.PHONY: help
+.PHONY: help venv install-dev lint typecheck test smoke \
+	obs-up obs-down obs-smoke obs-quickcheck obs-restart obs-status print-tools
+
 help:
-	@echo "Targets: compose-up, compose-down, rebuild, logs, lint, typecheck, pylint, test, ci-local, smoke, obs-*"
+	@echo "Targets : venv | install-dev | lint | typecheck | test | smoke | obs-up | obs-smoke | obs-down | obs-restart | obs-status | print-tools"
 
-.PHONY: compose-up up
-compose-up up:
-	$(compose) --env-file $(ENVF) up -d --remove-orphans
+# Cree le venv si absent et met pip a jour
+venv:
+	@if [ ! -x "$(PY_VENV)" ]; then \
+	  echo "-> create venv in $(VENVDIR)"; \
+	  $(PY_SYS) -m venv "$(VENVDIR)"; \
+	  "$(PY_VENV)" -m pip install -U pip; \
+	fi
 
-.PHONY: compose-down down
-compose-down down:
-	$(compose) --env-file $(ENVF) down --remove-orphans || true
+# Installe dependances runtime + dev si dispo
+install-dev: venv
+	@if [ -f requirements.txt ]; then "$(PY)" -m pip install -r requirements.txt; fi
+	@if [ -f requirements-dev.txt ]; then "$(PY)" -m pip install -r requirements-dev.txt; fi
+	# Fallback minimal si requirements-dev.txt est absent/incomplet
+	@for mod in ruff mypy pytest; do \
+	  $(PY) -c "import importlib; importlib.import_module('$$mod')" >/dev/null 2>&1 || $(PY) -m pip install $$mod; \
+	done
 
-.PHONY: rebuild
-rebuild:
-	$(compose) --env-file $(ENVF) build --pull
+lint: install-dev
+	$(RUFF) check .
 
-.PHONY: logs
-logs:
-	$(compose) --env-file $(ENVF) logs -n 200 --no-color
+typecheck: install-dev
+	$(MYPY) src
 
-.PHONY: lint
-lint:
-	ruff check .
+test: install-dev
+	$(PYTEST) -q
 
-.PHONY: typecheck
-typecheck:
-	mypy src
-
-.PHONY: pylint
-pylint:
-	python -m pylint src || true
-
-.PHONY: test
-test:
-	pytest -q
-
-.PHONY: ci-local
-ci-local: lint typecheck test
-
-.PHONY: smoke
+# Smoke RAG deja present (si votre repo inclut infra/scripts/smoke.sh)
 smoke:
-	bash scripts/smoke.sh
+	@if [ -x infra/scripts/smoke.sh ]; then bash infra/scripts/smoke.sh; else echo "No infra/scripts/smoke.sh"; fi
 
-.PHONY: nginx-render nginx-up nginx-reload nginx-down nginx-smoke
-
-nginx-render:
-	@mkdir -p infra/nginx/rendered
-	@bash -lc 'set -a; source $(ENVF); set +a; envsubst < infra/nginx/rag-ui.conf.template  > infra/nginx/rendered/rag-ui.conf'
-	@bash -lc 'set -a; source $(ENVF); set +a; envsubst < infra/nginx/rag-n8n.conf.template > infra/nginx/rendered/rag-n8n.conf'
-	@grep -E "server_name|client_max_body_size|proxy_pass" -n infra/nginx/rendered/*.conf || true
-
-nginx-up: nginx-render
-	$(compose) --env-file $(ENVF) up -d web
-
-nginx-reload:
-	$(compose) --env-file $(ENVF) exec -T web nginx -t
-	$(compose) --env-file $(ENVF) exec -T web nginx -s reload || $(compose) --env-file $(ENVF) restart web
-
-nginx-down:
-	$(compose) --env-file $(ENVF) rm -sf web
-
-nginx-smoke:
-	@echo "== docker-network upstreams =="
-	docker run --rm --network infra_rag_net curlimages/curl:8.9.1 -fsS "http://$$(grep -E '^NGINX_UI_UPSTREAM=' $(ENVF) | cut -d= -f2)/"  -o /dev/null && echo "ui(upstream): OK" || echo "ui(upstream): KO"
-	docker run --rm --network infra_rag_net curlimages/curl:8.9.1 -fsS "http://$$(grep -E '^NGINX_N8N_UPSTREAM=' $(ENVF) | cut -d= -f2)/" -o /dev/null && echo "n8n(upstream): OK" || echo "n8n(upstream): KO"
-	@echo "== host via Nginx (dev ports) =="
-	@host="$$((grep -E '^N8N_EXTERNAL_DOMAIN=' $(ENVF) || echo N8N_EXTERNAL_DOMAIN=localhost) | cut -d= -f2)"; \
-	 curl -fsSI -H "Host: $$host" http://127.0.0.1:18080/ | head -n1 && echo "web(localhost): OK" || echo "web(localhost): KO"
-
-.PHONY: obs-build obs-up obs-smoke obs-down obs-restart obs-status
-
-## ---------- Observabilité / Prometheus ----------
-obs-build:
-	COMPOSE_PROFILES=db,llm,api,obs docker compose -f infra/docker-compose.yml \
-	       -f infra/docker-compose.obs.yml \
-	       -f infra/docker-compose.obs.override.yml \
-	       --env-file $(ENVF) \
-	       --profile db --profile llm --profile api --profile obs build
-
+# Observabilite (nomenclature compatible avec vos derniers commits)
+# Utilise les profils Compose db,llm,api,obs + env file s'il existe
 obs-up:
-	COMPOSE_PROFILES=db,llm,api,obs docker compose -f infra/docker-compose.yml \
-	       -f infra/docker-compose.obs.yml \
-	       -f infra/docker-compose.obs.override.yml \
-	       --env-file $(ENVF) \
-	       --profile db --profile llm --profile api --profile obs up -d --remove-orphans
-	@sleep 5
-	@echo "→ Stack up. Lancement du smoke obs…"
-	@if [ -f infra/scripts/obs_smoke.sh ]; then bash infra/scripts/obs_smoke.sh; else echo "⚠️ Pas de obs_smoke.sh, fallback vérifs"; curl -fsS http://127.0.0.1:19090/api/v1/status/runtimeinfo >/dev/null; curl -fsS http://127.0.0.1:19090/api/v1/targets | jq -e '.data.activeTargets | length >= 1' >/dev/null; fi
-
-obs-smoke:
-	@if [ -f infra/scripts/obs_smoke.sh ]; then bash infra/scripts/obs_smoke.sh; else echo "⚠️ Pas de obs_smoke.sh, fallback vérifs"; curl -fsS http://127.0.0.1:19090/api/v1/status/runtimeinfo >/dev/null; curl -fsS http://127.0.0.1:19090/api/v1/targets | jq -e '.data.activeTargets | length >= 1' >/dev/null; fi
-	@if [ -f infra/scripts/metrics_quickcheck.sh ]; then bash infra/scripts/metrics_quickcheck.sh; else echo "ℹ️ Ajoutez infra/scripts/metrics_quickcheck.sh pour des checks plus poussés."; fi
+	@ENV_FILE="infra/.env"; [ -f infra/.env.ci ] && ENV_FILE="infra/.env.ci"; \
+	echo "-> env: $$ENV_FILE"; \
+	COMPOSE_PROFILES=db,llm,api,obs docker compose \
+	  -f infra/docker-compose.yml \
+	  -f infra/docker-compose.obs.yml \
+	  -f infra/docker-compose.obs.override.yml \
+	  --env-file "$$ENV_FILE" \
+	  up -d --remove-orphans
 
 obs-down:
-	docker compose -f infra/docker-compose.yml \
-	              -f infra/docker-compose.obs.yml \
-	              -f infra/docker-compose.obs.override.yml \
-	              --env-file $(ENVF) \
-	              --profile db --profile llm --profile api --profile obs down -v
+	@ENV_FILE="infra/.env"; [ -f infra/.env.ci ] && ENV_FILE="infra/.env.ci"; \
+	COMPOSE_PROFILES=db,llm,api,obs docker compose \
+	  -f infra/docker-compose.yml \
+	  -f infra/docker-compose.obs.yml \
+	  -f infra/docker-compose.obs.override.yml \
+	  --env-file "$$ENV_FILE" \
+	  down --remove-orphans
 
 obs-restart: obs-down obs-up
 
 obs-status:
-	@curl -fsS http://127.0.0.1:19090/api/v1/targets | jq '.data.activeTargets[] | {labels:.labels, health:.health, lastScrape:.lastScrape}'
+	@docker compose -f infra/docker-compose.yml ps || true
+
+obs-smoke:
+	@if [ -x infra/scripts/obs_smoke.sh ]; then bash infra/scripts/obs_smoke.sh; \
+	else echo "No infra/scripts/obs_smoke.sh"; fi
+
+obs-quickcheck:
+	@if [ -x infra/scripts/metrics_quickcheck.sh ]; then \
+		PROM_URL=$${PROM_URL:-http://127.0.0.1:19090} \
+		TARGET_URL=$${TARGET_URL:-http://127.0.0.1:18001/metrics} \
+		bash infra/scripts/metrics_quickcheck.sh; \
+	else \
+		echo "infra/scripts/metrics_quickcheck.sh manquant (non bloquant)"; \
+	fi
+
+print-tools:
+	@echo "PY         = $(PY)"
+	@$(PY) -c "import shutil; print('RUFF path  = ' + (shutil.which('ruff') or '(module)'))"
+	@$(PY) -c "import shutil; print('MYPY path  = ' + (shutil.which('mypy') or '(module)'))"
+	@$(PY) -c "import shutil; print('PYTEST path= ' + (shutil.which('pytest') or '(module)'))"
