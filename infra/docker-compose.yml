@@ -62,16 +62,16 @@ services:
     restart: unless-stopped
     networks: [rag_net]
     environment:
-      TZ: ${TZ}
+      TZ: ${TZ:-UTC}
       CHROMA_HOST: chroma
-      CHROMA_PORT: ${CHROMA_PORT}
-      OLLAMA_URL: "http://ollama:${OLLAMA_PORT}"
-      EMBED_MODEL: ${EMBED_MODEL}
-      SMALL_LLM: ${SMALL_LLM}
+      CHROMA_PORT: ${CHROMA_PORT:-8000}
+      OLLAMA_URL: "http://ollama:${OLLAMA_PORT:-11434}"
+      EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
+      SMALL_LLM: ${SMALL_LLM:-llama3.2:latest}
       GOOGLE_APPLICATION_CREDENTIALS: /creds/gdrive-service-account.json
       LOCAL_SOURCE_ROOT: /data/uploads
       INGESTOR_API_TOKEN: ${INGESTOR_API_TOKEN}
-      INGESTOR_IP_ALLOWLIST: ${INGESTOR_IP_ALLOWLIST}
+      INGESTOR_IP_ALLOWLIST: ${INGESTOR_IP_ALLOWLIST:-}
       USER_AGENT: ${USER_AGENT:-rag-local-ingestor/1.0}
       HTTP_TIMEOUT: ${HTTP_TIMEOUT:-15}
       XDG_CACHE_HOME: /tmp
@@ -79,7 +79,7 @@ services:
     volumes:
       - ./creds:/creds:ro
       - ./data/uploads:/data/uploads:rw
-    command: uvicorn api:app --host 0.0.0.0 --port ${INGESTOR_PORT}
+    command: uvicorn api:app --host 0.0.0.0 --port ${INGESTOR_PORT:-8001}
     security_opt: ["no-new-privileges:true"]
     read_only: true
     tmpfs: ["/tmp", "/var/tmp"]
@@ -97,7 +97,7 @@ services:
           import urllib.request
 
           try:
-              urllib.request.urlopen("http://localhost:${INGESTOR_PORT}/health", timeout=5)
+              urllib.request.urlopen("http://localhost:${INGESTOR_PORT:-8001}/health", timeout=5)
           except Exception:
               sys.exit(1)
           PY
