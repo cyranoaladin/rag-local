@@ -31,7 +31,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel, ConfigDict, Field
 
-from .mm_adapter import Chunk, parse_multimodal
+try:
+    from .mm_adapter import Chunk, parse_multimodal
+except ImportError:
+    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
+    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
 
 
 def _load_metrics_module() -> ModuleType:
