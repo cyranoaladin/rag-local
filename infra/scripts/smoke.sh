@@ -2,6 +2,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+# Ensure an env file exists; copy the CI template if the local file is missing.
+if [ ! -f infra/.env ]; then
+  if [ -f infra/.env.ci ]; then
+    cp infra/.env.ci infra/.env
+  else
+    touch infra/.env
+  fi
+fi
+
 # ENV minimaux
 grep -q '^INGESTOR_API_TOKEN=' infra/.env || printf '\nINGESTOR_API_TOKEN=devtoken\n' >> infra/.env
 grep -q '^INGESTOR_IP_ALLOWLIST=' infra/.env || printf '\nINGESTOR_IP_ALLOWLIST=\n' >> infra/.env
