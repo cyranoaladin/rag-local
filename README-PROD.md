@@ -4,8 +4,20 @@ Ce projet fournit un **RAG 100% local** (LLM & embeddings via **Ollama**) avec *
 
 ## Prérequis VPS
 - Ubuntu 22.04/24.04, accès sudo, ports 80/443 ouverts, DNS des domaines pointés sur le VPS.
-- Docker + Compose plugin.
+- Docker Engine ≥ 24.0 + plugin Compose ≥ 2.24 (`docker compose version`).
 - Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN`, les secrets n8n, ainsi qu’un `INGEST_AUTH_TOKEN` fort (ex: `openssl rand -hex 32`).
+
+## Secrets à générer
+| Nom | Longueur conseillée | Usage | Où le renseigner |
+|-----|---------------------|-------|------------------|
+| `INGEST_AUTH_TOKEN` | 64 hex (`openssl rand -hex 32`) | Authentifier les appels `/ingest` (UI / n8n) | `infra/.env` (`INGEST_AUTH_TOKEN`) + header UI (`INGEST_AUTH_HEADER`) |
+| `INGESTOR_API_TOKEN` | 64 hex | Jeton partagé entre UI et API ingestor | `infra/.env` (`INGESTOR_API_TOKEN`, `INGEST_API_TOKEN`) |
+| `N8N_ENCRYPTION_KEY` | 64 hex | Chiffrer les crédentials n8n | `infra/.env` (`N8N_ENCRYPTION_KEY`) |
+| `N8N_BASIC_AUTH_PASSWORD` | 32 alphanum | Protège l'UI n8n | `infra/.env` (`N8N_BASIC_AUTH_PASSWORD`) |
+| `UI_BASIC_AUTH_USER_FILE_DIRECTIVE` | fichier htpasswd | Optionnel : restreindre Streamlit | `infra/.env` (`UI_BASIC_AUTH_*`) + templates Nginx |
+| `PROMETHEUS_SCRAPE_PASSWORD` | 32 alphanum | Restreindre l'accès aux métriques | `infra/.env` (`PROMETHEUS_SCRAPE_*`) |
+
+> Astuce : conserver les secrets hors dépôt (ex: `pass`, `1Password`) et régénérer à chaque rotation.
 
 ## Démarrage (services internes, non exposés)
 ```bash
