@@ -53,7 +53,8 @@ for profile in "${compose_profiles[@]}"; do
 done
 
 # Restrict compose actions to the services we actually need for the smoke.
-target_services=(chroma ollama ingestor)
+mandatory_services=(chroma ollama ingestor)
+optional_services=(ui)
 
 # Validate that the requested services are available after profile filtering to avoid
 # cryptic "no service selected" errors on CI runners.
@@ -63,11 +64,10 @@ if [ "${#compose_services[@]}" -eq 0 ]; then
   exit 1
 fi
 
-smoke_services=()
 missing_services=()
-for svc in "${target_services[@]}"; do
+for svc in "${mandatory_services[@]}"; do
   if printf '%s\n' "${compose_services[@]}" | grep -qx "${svc}"; then
-    smoke_services+=("${svc}")
+    :
   else
     missing_services+=("${svc}")
   fi
@@ -78,6 +78,13 @@ if [ "${#missing_services[@]}" -ne 0 ]; then
   echo "Available services: ${compose_services[*]}" >&2
   exit 1
 fi
+
+present_optional_services=()
+for svc in "${optional_services[@]}"; do
+  if printf '%s\n' "${compose_services[@]}" | grep -qx "${svc}"; then
+    present_optional_services+=("${svc}")
+  fi
+done
 
 echo "== stack up command: ${compose_cmd[*]} up -d --remove-orphans (profiles: ${profiles_csv}) =="
 
@@ -94,14 +101,38 @@ grep -q '^INGESTOR_IP_ALLOWLIST=' "${env_file}" || printf '\nINGESTOR_IP_ALLOWLI
 echo "== wait: health =="
 for attempt in $(seq 1 30); do
   ok=1
-  ps_output=$("${compose_cmd[@]}" ps "${smoke_services[@]}") || ps_output=""
-  printf '%s' "${ps_output}" | grep -q "chroma.*(healthy)"   || ok=0
-  printf '%s' "${ps_output}" | grep -q "ollama.*(healthy)"   || ok=0
-  printf '%s' "${ps_output}" | grep -q "ingestor.*(healthy)" || ok=0 || true
-  "${compose_cmd[@]}" ps | grep -q "ui.*(healthy)"            || ok=0 || true
+  ps_json=$("${compose_cmd[@]}" ps --format json 2>/dev/null || true)
+  status_snapshot=""
+  if [ -n "${ps_json}" ]; then
+    declare -A service_health=()
+    status_lines=$(printf '%s\n' "${ps_json}" | jq -r '.[] | select(.Service != null) | "\(.Service)=\(.Health // .State // \"\")"')
+    while IFS='=' read -r svc status; do
+      [ -z "${svc}" ] && continue
+      service_health["${svc}"]="${status}"
+    done <<< "${status_lines}"
+    for svc in "${mandatory_services[@]}"; do
+      health="${service_health[$svc]:-}"
+      [ "${health}" = "healthy" ] || ok=0
+    done
+    for svc in "${present_optional_services[@]}"; do
+      health="${service_health[$svc]:-}"
+      [ "${health}" = "healthy" ] || ok=0
+    done
+    status_snapshot=$(printf '%s\n' "${ps_json}" | jq -r '.[] | select(.Service != null) | "\(.Service)\t\(.Health // .State // \"\")"')
+  else
+    ps_output=$("${compose_cmd[@]}" ps) || ps_output=""
+    for svc in "${mandatory_services[@]}"; do
+      printf '%s' "${ps_output}" | grep -q "${svc}.*(healthy)" || ok=0
+    done
+    for svc in "${present_optional_services[@]}"; do
+      printf '%s' "${ps_output}" | grep -q "${svc}.*(healthy)" || ok=0
+    done
+    status_snapshot="${ps_output}"
+  fi
   if [ "$ok" = "1" ]; then
     break
   fi
+  printf 'compose services snapshot (attempt %s):\n%s\n' "${attempt}" "${status_snapshot}"
   echo "waiting for healthy services (attempt ${attempt}/30)..."
   sleep 2
 done
