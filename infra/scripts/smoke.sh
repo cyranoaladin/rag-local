@@ -103,23 +103,28 @@ for attempt in $(seq 1 30); do
   ok=1
   ps_json=$("${compose_cmd[@]}" ps --format json 2>/dev/null || true)
   status_snapshot=""
+  parsed_json=0
   if [ -n "${ps_json}" ]; then
-    declare -A service_health=()
-    status_lines=$(printf '%s\n' "${ps_json}" | jq -r '.[] | select(.Service != null) | "\(.Service)=\(.Health // .State // "")"')
-    while IFS='=' read -r svc status; do
-      [ -z "${svc}" ] && continue
-      service_health["${svc}"]="${status}"
-    done <<< "${status_lines}"
-    for svc in "${mandatory_services[@]}"; do
-      health="${service_health[$svc]:-}"
-      [ "${health}" = "healthy" ] || ok=0
-    done
-    for svc in "${present_optional_services[@]}"; do
-      health="${service_health[$svc]:-}"
-      [ "${health}" = "healthy" ] || ok=0
-    done
-    status_snapshot=$(printf '%s\n' "${ps_json}" | jq -r '.[] | select(.Service != null) | "\(.Service)\t\(.Health // .State // "")"')
-  else
+    if status_lines=$(printf '%s\n' "${ps_json}" | jq -r '.[] | select(.Service != null) | "\(.Service)=\(.Health // .State // "")"' 2>/dev/null); then
+      declare -A service_health=()
+      while IFS='=' read -r svc status; do
+        [ -z "${svc}" ] && continue
+        service_health["${svc}"]="${status}"
+      done <<< "${status_lines}"
+      for svc in "${mandatory_services[@]}"; do
+        health="${service_health[$svc]:-}"
+        [ "${health}" = "healthy" ] || ok=0
+      done
+      for svc in "${present_optional_services[@]}"; do
+        health="${service_health[$svc]:-}"
+        [ "${health}" = "healthy" ] || ok=0
+      done
+      if status_snapshot=$(printf '%s\n' "${ps_json}" | jq -r '.[] | select(.Service != null) | "\(.Service)\t\(.Health // .State // "")"' 2>/dev/null); then
+        parsed_json=1
+      fi
+    fi
+  fi
+  if [ "${parsed_json}" -ne 1 ]; then
     ps_output=$("${compose_cmd[@]}" ps) || ps_output=""
     for svc in "${mandatory_services[@]}"; do
       printf '%s' "${ps_output}" | grep -q "${svc}.*(healthy)" || ok=0
