@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import hashlib
-import logging
 import importlib.util
 import ipaddress
+import logging
 import mimetypes
 import os
 import socket
@@ -138,7 +138,7 @@ def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
 
 class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
-    source_type: Literal["url", "gdrive_folder", "pdf", "docx"]
+    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video"]
     source: str
     metadata_hints: dict[str, str] = Field(default_factory=dict, alias="hints")
 
@@ -240,6 +240,22 @@ def load_docx(file_path: str):
     if not content:
         return []
     return [Document(page_content=content, metadata={"source": os.path.basename(file_path)})]
+
+
+def load_markdown(file_path: Path) -> list[Document]:
+    try:
+        raw_text = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raw_text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Impossible de lire le fichier Markdown: {exc}") from exc
+
+    text = raw_text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Fichier Markdown vide")
+
+    metadata = {"source": str(file_path), "mime_type": "text/markdown"}
+    return [Document(page_content=text, metadata=metadata)]
 
 
 def _validate_remote_url(url: str) -> None:
@@ -351,6 +367,14 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
     if req.source_type == "docx":
         path = _resolve_local_path(req.source)
         return load_docx(str(path))
+    if req.source_type in {"markdown", "md"}:
+        path = _resolve_local_path(req.source)
+        return load_markdown(path)
+    if req.source_type == "video":
+        raise HTTPException(
+            status_code=400,
+            detail="Ingestion vidéo disponible uniquement en mode multimodal (mode=multimodal).",
+        )
     raise HTTPException(status_code=400, detail=f"source_type non géré: {req.source_type}")
 
 

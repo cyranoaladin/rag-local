@@ -76,6 +76,10 @@ services:
       HTTP_TIMEOUT: ${HTTP_TIMEOUT:-15}
       XDG_CACHE_HOME: /tmp
       MAX_REMOTE_BYTES: ${MAX_REMOTE_BYTES:-26214400}
+      MULTIMODAL_ENABLED: ${MULTIMODAL_ENABLED:-false}
+      MM_PARSER_TIMEOUT: ${MM_PARSER_TIMEOUT:-30}
+      MM_MAX_CHARS_PER_CHUNK: ${MM_MAX_CHARS_PER_CHUNK:-1200}
+      MM_CACHE_DIR: ${MM_CACHE_DIR:-/data/mm-cache}
     volumes:
       - ./creds:/creds:ro
       - ./data/uploads:/data/uploads:rw
@@ -166,6 +170,9 @@ services:
       - CHROMA_PORT=${CHROMA_PORT}
       - XDG_CACHE_HOME=/tmp
       - STREAMLIT_SERVER_HEADLESS=true
+      - INGEST_BASE_URL=${INGEST_BASE_URL}
+      - INGEST_API_TOKEN=${INGEST_API_TOKEN}
+      - UI_WEBHOOK_TIMEOUT=${UI_WEBHOOK_TIMEOUT:-10}
     security_opt: ["no-new-privileges:true"]
     read_only: true
     tmpfs:
