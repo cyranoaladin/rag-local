@@ -86,6 +86,17 @@ for svc in "${optional_services[@]}"; do
   fi
 done
 
+dump_service_logs() {
+  set +e
+  printf '== compose logs tail ==\n'
+  if [ "${#present_optional_services[@]}" -gt 0 ]; then
+    "${compose_cmd[@]}" logs --no-color --tail 200 "${mandatory_services[@]}" "${present_optional_services[@]}"
+  else
+    "${compose_cmd[@]}" logs --no-color --tail 200 "${mandatory_services[@]}"
+  fi
+}
+trap dump_service_logs ERR
+
 echo "== stack up command: ${compose_cmd[*]} up -d --remove-orphans (profiles: ${profiles_csv}) =="
 
 # ENV minimaux (ensure target env file has the essentials)
