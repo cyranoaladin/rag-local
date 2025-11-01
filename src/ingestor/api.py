@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import importlib.util
 import ipaddress
 import mimetypes
@@ -84,6 +85,8 @@ REQUEST_COUNT = ingest_metrics.REQUEST_COUNT
 REQUEST_LATENCY = ingest_metrics.REQUEST_LATENCY
 INGEST_RESULT = ingest_metrics.INGEST_RESULT
 ingest_requests_total = ingest_metrics.ingest_requests_total
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -510,7 +513,26 @@ def ingest_data(
         docs_to_add = [prepared.documents[i] for i in to_add_idx]
         ids_to_add = [prepared.ids[i] for i in to_add_idx]
         meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
-        embs_to_add = emb.embed_documents(docs_to_add)
+        try:
+            embs_to_add = emb.embed_documents(docs_to_add)
+        except ValueError as exc:
+            message = str(exc)
+            if "HTTP code: 404" in message:
+                logger.warning(
+                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                        "Pull the model or adjust EMBED_MODEL before retrying."
+                    ),
+                ) from exc
+            logger.exception("Embedding provider raised ValueError")
+            raise
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Unexpected failure while requesting embeddings")
+            raise
 
         meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
         embeddings_seq = cast(list[Sequence[float]], embs_to_add)

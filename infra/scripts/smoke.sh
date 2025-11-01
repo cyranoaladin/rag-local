@@ -87,6 +87,7 @@ for svc in "${optional_services[@]}"; do
 done
 
 dump_service_logs() {
+  local err=${1:-$?}
   set +e
   printf '== compose logs tail ==\n'
   if [ "${#present_optional_services[@]}" -gt 0 ]; then
@@ -94,6 +95,8 @@ dump_service_logs() {
   else
     "${compose_cmd[@]}" logs --no-color --tail 200 "${mandatory_services[@]}"
   fi
+  set -e
+  exit "${err}"
 }
 trap dump_service_logs ERR
 
@@ -161,11 +164,35 @@ fi
 # Checks côté hôte
 curl -fsS http://127.0.0.1:18001/health -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" -o /dev/null && echo "ingestor: OK"
 
+embed_model=${EMBED_MODEL:-nomic-embed-text}
+echo "== ensure embedding model: ${embed_model} =="
+if ! "${compose_cmd[@]}" exec -T ollama ollama show "${embed_model}" >/dev/null 2>&1; then
+  echo "embedding model ${embed_model} not present, pulling..."
+  "${compose_cmd[@]}" exec -T ollama ollama pull "${embed_model}"
+else
+  echo "embedding model ${embed_model} already available"
+fi
+
 # Ingestion smoke
-curl -fsS -X POST "http://127.0.0.1:18001/ingest" \
+ingest_raw=$(curl -sS -X POST "http://127.0.0.1:18001/ingest" \
   -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" \
   -H "Content-Type: application/json" \
   -d '{"source_type":"url","source":"https://example.com","hints":{"env":"smoke"}}' \
-  | jq -c .
+  -w '\n%{http_code}' 2>&1) || dump_service_logs $?
+
+ingest_status=${ingest_raw##*$'\n'}
+ingest_body=${ingest_raw%$'\n'$ingest_status}
+
+if [ "${ingest_status}" = "200" ]; then
+  printf '%s\n' "${ingest_body}" | jq -c .
+elif [ "${ingest_status}" = "503" ]; then
+  printf 'ingest smoke failed with status %s\n' "${ingest_status}" >&2
+  printf '%s\n' "${ingest_body}" >&2
+  dump_service_logs 1
+else
+  printf 'ingest smoke failed with status %s\n' "${ingest_status}" >&2
+  printf '%s\n' "${ingest_body}" >&2
+  dump_service_logs 1
+fi
 
 echo "== done =="
