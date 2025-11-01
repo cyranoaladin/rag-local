@@ -13,7 +13,20 @@ curl -fsS "${PROM_URL}/api/v1/labels" | head -c 800 || true
 echo
 
 echo -e "\n== Sanity /metrics exposé par ingestor =="
-curl -fsS "${TARGET_URL}" | head -n 20 || { echo "Ingestor /metrics indisponible"; exit 1; }
+for attempt in $(seq 1 10); do
+  if response=$(curl -fsS "${TARGET_URL}" 2>/dev/null); then
+    printf '%s' "${response}" | head -n 20
+    break
+  fi
+
+  if [ "${attempt}" -eq 10 ]; then
+    echo "Ingestor /metrics indisponible"
+    exit 1
+  fi
+
+  echo "Ingestor metrics indisponible, nouvelle tentative dans 3s (${attempt}/10)"
+  sleep 3
+done
 
 echo -e "\n== Requête simple sur ingest_success_total (peut retourner vide si stack idle) =="
 curl -fsS --data-urlencode 'query=ingest_success_total' "${PROM_URL}/api/v1/query" | head -c 400 || true

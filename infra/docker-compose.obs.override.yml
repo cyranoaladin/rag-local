@@ -1,0 +1,13 @@
+services:
+  ollama:
+    deploy:
+      resources:
+        limits:
+          cpus: "3.5"  # Keep under the 4 vCPU limit on GitHub runners
+          memory: 12G
+  prometheus:
+    ports:
+      - "127.0.0.1:19090:9090"
+  ingestor:
+    ports:
+      - "127.0.0.1:18001:${INGESTOR_PORT:-8001}"

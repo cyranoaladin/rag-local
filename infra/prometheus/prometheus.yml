@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: ingestor
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["ingestor:8001"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: ingestor

@@ -1,6 +1,6 @@
 name: CI Smoke (Compose)
 
-on:
+'on':
   push:
     branches: [ "**" ]
   pull_request:
@@ -41,13 +41,12 @@ jobs:
       - name: Ensure CI env file
         run: |
           if [ ! -f infra/.env.ci ]; then
-            cat > infra/.env.ci <<'ENV'
-INGESTOR_API_TOKEN=devtoken
-INGEST_BASE_URL=http://ingestor:8001
-METRICS_ENABLED=true
-METRICS_NAMESPACE=rag
-MULTIMODAL_ENABLED=false
-ENV
+            mkdir -p infra
+            printf '%s\n' 'INGESTOR_API_TOKEN=devtoken' > infra/.env.ci
+            printf '%s\n' 'INGEST_BASE_URL=http://ingestor:8001' >> infra/.env.ci
+            printf '%s\n' 'METRICS_ENABLED=true' >> infra/.env.ci
+            printf '%s\n' 'METRICS_NAMESPACE=rag' >> infra/.env.ci
+            printf '%s\n' 'MULTIMODAL_ENABLED=false' >> infra/.env.ci
           fi
           sed -n '1,120p' infra/.env.ci || true
 

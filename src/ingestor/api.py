@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import ipaddress
+import logging
 import mimetypes
 import os
 import socket
@@ -31,7 +32,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel, ConfigDict, Field
 
-from .mm_adapter import Chunk, parse_multimodal
+try:
+    from .mm_adapter import Chunk, parse_multimodal
+except ImportError:
+    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
+    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
 
 
 def _load_metrics_module() -> ModuleType:
@@ -80,6 +85,8 @@ REQUEST_COUNT = ingest_metrics.REQUEST_COUNT
 REQUEST_LATENCY = ingest_metrics.REQUEST_LATENCY
 INGEST_RESULT = ingest_metrics.INGEST_RESULT
 ingest_requests_total = ingest_metrics.ingest_requests_total
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -131,7 +138,7 @@ def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
 
 class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
-    source_type: Literal["url", "gdrive_folder", "pdf", "docx"]
+    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video"]
     source: str
     metadata_hints: dict[str, str] = Field(default_factory=dict, alias="hints")
 
@@ -233,6 +240,22 @@ def load_docx(file_path: str):
     if not content:
         return []
     return [Document(page_content=content, metadata={"source": os.path.basename(file_path)})]
+
+
+def load_markdown(file_path: Path) -> list[Document]:
+    try:
+        raw_text = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raw_text = file_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Impossible de lire le fichier Markdown: {exc}") from exc
+
+    text = raw_text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Fichier Markdown vide")
+
+    metadata = {"source": str(file_path), "mime_type": "text/markdown"}
+    return [Document(page_content=text, metadata=metadata)]
 
 
 def _validate_remote_url(url: str) -> None:
@@ -344,6 +367,14 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
     if req.source_type == "docx":
         path = _resolve_local_path(req.source)
         return load_docx(str(path))
+    if req.source_type in {"markdown", "md"}:
+        path = _resolve_local_path(req.source)
+        return load_markdown(path)
+    if req.source_type == "video":
+        raise HTTPException(
+            status_code=400,
+            detail="Ingestion vidéo disponible uniquement en mode multimodal (mode=multimodal).",
+        )
     raise HTTPException(status_code=400, detail=f"source_type non géré: {req.source_type}")
 
 
@@ -506,7 +537,26 @@ def ingest_data(
         docs_to_add = [prepared.documents[i] for i in to_add_idx]
         ids_to_add = [prepared.ids[i] for i in to_add_idx]
         meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
-        embs_to_add = emb.embed_documents(docs_to_add)
+        try:
+            embs_to_add = emb.embed_documents(docs_to_add)
+        except ValueError as exc:
+            message = str(exc)
+            if "HTTP code: 404" in message:
+                logger.warning(
+                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                        "Pull the model or adjust EMBED_MODEL before retrying."
+                    ),
+                ) from exc
+            logger.exception("Embedding provider raised ValueError")
+            raise
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Unexpected failure while requesting embeddings")
+            raise
 
         meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
         embeddings_seq = cast(list[Sequence[float]], embs_to_add)
