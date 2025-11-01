@@ -37,7 +37,6 @@
 ## Supervision
 - Activer `METRICS_ENABLED=true` pour l'ingestor.
 - Démarrer le profil observabilité : `COMPOSE_PROFILES=db,llm,api,obs docker compose ... up -d`.
-- Configurer Prometheus/Grafana selon `docs/observability.md` et créer les alertes :
 - Configurer Prometheus/Grafana selon `docs/observability.md` (section « Déploiement rapide ») et créer les alertes :
   - `ingestor_ingests_total` (statuts ≠ success)
   - `histogram_quantile(0.99, rate(ingestor_ingest_duration_seconds_bucket[5m]))`
