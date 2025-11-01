@@ -1,5 +1,15 @@
 # Checklist d'exploitation VPS
 
+## Prérequis infra
+- VPS Linux 64 bits (Ubuntu 22.04/24.04 recommandé) avec accès `sudo` et ports 80/443 ouverts.
+- Docker Engine ≥ 24.0 et plugin Docker Compose ≥ 2.24 (`docker compose version`).
+- Espace disque libre :
+  - 5 Go pour `rag_ollama_data` (modèles `nomic-embed-text`, `llama3.2:latest`).
+  - 2 Go pour `rag_chroma_data` (index vectoriel initial).
+  - 1 Go pour `rag_n8n_data` + marge pour journaux.
+  - 2 Go supplémentaires pour sauvegardes (`infra/backups`).
+- DNS pointant `RAG_EXTERNAL_DOMAIN` et `N8N_EXTERNAL_DOMAIN` vers le VPS.
+
 ## Pré-déploiement
 - Copier `infra/.env.production.sample` vers `infra/.env` et ajuster domaines, secrets et allowlists.
 - Lancer `infra/scripts/ollama-preload.sh` pour télécharger les modèles nécessaires avant la mise en service.
@@ -28,6 +38,7 @@
 - Activer `METRICS_ENABLED=true` pour l'ingestor.
 - Démarrer le profil observabilité : `COMPOSE_PROFILES=db,llm,api,obs docker compose ... up -d`.
 - Configurer Prometheus/Grafana selon `docs/observability.md` et créer les alertes :
+- Configurer Prometheus/Grafana selon `docs/observability.md` (section « Déploiement rapide ») et créer les alertes :
   - `ingestor_ingests_total` (statuts ≠ success)
   - `histogram_quantile(0.99, rate(ingestor_ingest_duration_seconds_bucket[5m]))`
 - Mettre en place la rotation des logs Docker (`max-size`, `max-file` déjà configurés) et du reverse proxy.
