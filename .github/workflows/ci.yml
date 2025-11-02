@@ -44,6 +44,9 @@ jobs:
       - name: Test
         run: make test
 
+      - name: Integration Tests
+        run: make test-integration
+
       - name: Upload pytest results (always)
         if: always()
         uses: actions/upload-artifact@v4

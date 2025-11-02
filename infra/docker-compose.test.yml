@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  chroma:
+    image: chromadb/chroma:1.1.1
+    environment:
+      - IS_PERSISTENT=FALSE
+      - ANONYMIZED_TELEMETRY=FALSE
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8000/api/v2/heartbeat"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [rag_test_net]
+
+  ollama:
+    image: ghcr.io/tiangolo/uvicorn-gunicorn-fastapi:python3.11-slim
+    environment:
+      MODULE_NAME: tests.integration.mocks.ollama_app
+      VARIABLE_NAME: app
+      PORT: "11434"
+      LOG_LEVEL: warning
+    volumes:
+      - ..:/code:ro
+    networks: [rag_test_net]
+    healthcheck:
+      test:
+        ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:11434/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  ingestor:
+    build: ../src/ingestor
+    environment:
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      OLLAMA_URL: http://ollama:11434
+      INGESTOR_API_TOKEN: integration-token
+      LOCAL_SOURCE_ROOT: /data/uploads
+      CHROMA_REQUEST_TIMEOUT: "5"
+      OLLAMA_REQUEST_TIMEOUT: "5"
+      METRICS_ENABLED: "0"
+    depends_on:
+      chroma:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    ports:
+      - "8001:8001"
+    command: uvicorn api:app --host 0.0.0.0 --port 8001
+    networks: [rag_test_net]
+
+networks:
+  rag_test_net:
+    driver: bridge

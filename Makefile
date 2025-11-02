@@ -16,11 +16,12 @@ RUFF   := $(PY) -m ruff
 MYPY   := $(PY) -m mypy
 PYTEST := $(PY) -m pytest
 
-.PHONY: help venv install-dev lint typecheck test smoke \
-	obs-up obs-down obs-smoke obs-quickcheck obs-restart obs-status print-tools
+.PHONY: help venv install-dev lint typecheck test test-integration smoke \
+	obs-up obs-down obs-smoke obs-quickcheck obs-restart obs-status \
+	compose-test-up compose-test-down print-tools
 
 help:
-	@echo "Targets : venv | install-dev | lint | typecheck | test | smoke | obs-up | obs-smoke | obs-down | obs-restart | obs-status | print-tools"
+	@echo "Targets : venv | install-dev | lint | typecheck | test | test-integration | smoke | obs-up | obs-smoke | obs-down | obs-restart | obs-status | compose-test-up | compose-test-down | print-tools"
 
 # Cree le venv si absent et met pip a jour
 venv:
@@ -47,6 +48,9 @@ typecheck: install-dev
 
 test: install-dev
 	$(PYTEST) -q
+
+test-integration: install-dev
+	$(PYTEST) tests/integration -q
 
 # Smoke RAG deja present (si votre repo inclut infra/scripts/smoke.sh)
 smoke:
@@ -90,6 +94,12 @@ obs-quickcheck:
 	else \
 		echo "infra/scripts/metrics_quickcheck.sh manquant (non bloquant)"; \
 	fi
+
+compose-test-up:
+	@docker compose -f infra/docker-compose.test.yml up -d --remove-orphans
+
+compose-test-down:
+	@docker compose -f infra/docker-compose.test.yml down --remove-orphans
 
 print-tools:
 	@echo "PY         = $(PY)"

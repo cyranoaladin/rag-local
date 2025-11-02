@@ -25,13 +25,13 @@ bash infra/scripts/smoke.sh  # health + ingestion factice
 make compose-down
 ```
 
-Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make smoke`.
+Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make test-integration`, `make smoke`.
 
 ## Observability & CI
 - Endpoint Prometheus `GET /metrics` (ingestor) activé via `METRICS_ENABLED=true` (désactivé par défaut). Voir `docs/observability.md`.
 - Métriques : `ingestor_ingests_total{source,modality,status}` et histogramme `ingestor_ingest_duration_seconds` (buckets adaptés VPS).
 - Qualité locale : `make lint`, `make typecheck`, `make test`, ou `make ci-local` pour enchaîner les trois.
-- Pipeline GitHub Actions (`.github/workflows/ci.yml`) déclenche lint, mypy, pytest (Py 3.10 / 3.11) + artefacts `ruff.txt` / `pytest.xml`.
+- Pipeline GitHub Actions (`.github/workflows/ci.yml`) enchaîne lint, mypy, tests unitaires et `make test-integration` (Python 3.11) puis archive les journaux pytest.
 - Job optionnel `smoke-compose` via `workflow_dispatch` pour bâtir le profil multimodal et exécuter `infra/scripts/smoke.sh`.
 
 ## Contrat des métriques (Prometheus)
