@@ -1,6 +1,7 @@
 # pylint: disable=too-many-locals,line-too-long
 from __future__ import annotations
 
+import sys
 import types
 from typing import Any
 
@@ -50,6 +51,7 @@ def _setup_success_stubs(api_module, monkeypatch: pytest.MonkeyPatch, documents:
             return [[0.1] * 3 for _ in docs]
 
     monkeypatch.setattr(api_module, "get_chroma_client", lambda: FakeClient())
+    monkeypatch.setattr(api_module, "TimedOllamaEmbeddings", FakeEmbeddings)
     monkeypatch.setattr(api_module, "OllamaEmbeddings", FakeEmbeddings)
     return fake_collection
 
@@ -135,3 +137,42 @@ def test_metrics_counter_updates(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     assert ko_response.status_code == 401
     assert failure_child._value.get() == 1
+
+
+def test_load_docx_prefers_unstructured(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    api = reload_api(monkeypatch, token=None)
+    target = tmp_path / "sample.docx"
+    target.write_bytes(b"")
+
+    class FakeMeta:
+        def to_dict(self) -> dict[str, Any]:
+            return {"page_number": 2, "section": "table"}
+
+    class FakeElement:
+        def __init__(self) -> None:
+            self.text = "Table cell"
+            self.metadata = FakeMeta()
+
+    def fake_partition_docx(filename: str, include_metadata: bool = True):
+        assert filename == str(target)
+        assert include_metadata is True
+        return [FakeElement()]
+
+    package = types.ModuleType("unstructured")
+    package.__path__ = []
+    subpackage = types.ModuleType("unstructured.partition")
+    subpackage.__path__ = []
+    docx_module = types.ModuleType("unstructured.partition.docx")
+    docx_module.partition_docx = fake_partition_docx
+
+    monkeypatch.setitem(sys.modules, "unstructured", package)
+    monkeypatch.setitem(sys.modules, "unstructured.partition", subpackage)
+    monkeypatch.setitem(sys.modules, "unstructured.partition.docx", docx_module)
+
+    documents = api.load_docx(str(target))
+    assert len(documents) == 1
+    doc = documents[0]
+    assert doc.page_content == "Table cell"
+    assert doc.metadata["page_number"] == "2"
+    assert doc.metadata["source"] == target.name
+    assert doc.metadata["mime_type"] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"

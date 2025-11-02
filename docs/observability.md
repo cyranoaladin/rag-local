@@ -37,4 +37,4 @@
    ) > 4
    ```
 
-Couple alerts with PagerDuty/Alertmanager routes as appropriate for VPS operations. Document any new SLOs in `AUDIT.md` when extending the stack.
+Couple alerts with PagerDuty/Alertmanager routes as appropriate for VPS operations. Document any new SLOs in `AUDIT_CHECKLIST.md` when extending the stack.

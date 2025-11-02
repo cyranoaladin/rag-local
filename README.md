@@ -36,12 +36,12 @@ Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make
 
 ## Contrat des métriques (Prometheus)
 
-Le service `ingestor` expose ses métriques via un registre unique défini dans `src/ingestor/metrics.py` :
+Le service `ingestor` expose ses métriques via `src/ingestor/metrics.py`. Points clés :
 
-- **Gating** : `METRICS_ENABLED=true` tant que la variable n'est pas forcée à `false`. Quand c'est désactivé, les helpers deviennent no-op et `GET /metrics` renvoie `404`.
-- **Namespace** : piloté par `METRICS_NAMESPACE` (ex. `rag`). Chaque compteur/histogramme doit être déclaré avec `registry=REGISTRY`.
-- **Tests** : `tests/test_metrics_gating.py` couvre les scénarios `200/404`.
-- **Ops local** : profil Compose `obs` (`make obs-up`) pour démarrer Prometheus + exporter, puis `make obs-quickcheck` pour vérifier readiness Prometheus et `/metrics`.
+- `METRICS_ENABLED=true` active l'exposition. Hors production, passez à `false` pour désactiver totalement `GET /metrics` (retourne `404`).
+- `METRICS_NAMESPACE` permet de préfixer les compteurs (`ingestor_ingests_total`, histogramme `ingestor_ingest_duration_seconds`).
+- La batterie de tests (`tests/test_metrics_gating.py`, `tests/test_metrics.py`, `tests/test_metrics_registry_singleton.py`) garantit le contrat 200/404 et l'unicité du registre.
+- Pour l'observabilité locale : profil Compose `obs` (`make obs-up`) qui démarre Prometheus + exporter, puis `make obs-quickcheck` pour valider `GET /metrics`.
 
 Commandes utiles :
 

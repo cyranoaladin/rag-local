@@ -34,8 +34,8 @@ Réponse:
 - Taille maxi téléchargement distant: `MAX_REMOTE_BYTES` (par défaut 10 MiB).
 - Chunking: `INGEST_CHUNK_SIZE=800`, `INGEST_CHUNK_OVERLAP=120` (
   compromis rappel/latence sur VPS). Ajustables via variables d’environnement.
-- Embeddings: `OLLAMA_URL` + `OLLAMA_EMBED_TIMEOUT` (20 s) + retries bornés.
-- Insertion Chroma: `CHROMA_HOST`, `CHROMA_PORT`, timeout client 10 s, `CHROMA_MAX_RETRIES=2`.
+- Embeddings: `OLLAMA_URL` + `OLLAMA_REQUEST_TIMEOUT` (par défaut 60 s) + gestion d'erreurs explicite.
+- Insertion Chroma: `CHROMA_HOST`, `CHROMA_PORT`, `CHROMA_REQUEST_TIMEOUT` (30 s par défaut).
 
 ## Chroma v2
 

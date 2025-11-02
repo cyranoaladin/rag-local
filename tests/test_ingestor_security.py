@@ -257,6 +257,8 @@ def test_ingest_accepts_token_and_stores_documents(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(api, "get_chroma_client", fake_client_factory)
     monkeypatch.setattr(api, "OllamaEmbeddings", FakeEmbeddings)
+    if hasattr(api, "TimedOllamaEmbeddings"):
+        monkeypatch.setattr(api, "TimedOllamaEmbeddings", FakeEmbeddings)
 
     client = TestClient(api.app)
     response = client.post(

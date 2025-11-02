@@ -22,6 +22,7 @@ import chromadb
 import docx
 import requests
 from bs4 import BeautifulSoup
+from chromadb.config import Settings
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from langchain_community.document_loaders import PyPDFLoader
@@ -64,6 +65,8 @@ CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 COLLECTION_NAME = "ressources_pedagogiques_terminale"
+CHROMA_REQUEST_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", "30"))
+OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "30"))
 MAX_REMOTE_BYTES = int(os.getenv("MAX_REMOTE_BYTES", str(10 * 1024 * 1024)))
 LOCAL_SOURCE_ROOT = Path(
     os.getenv("LOCAL_SOURCE_ROOT", "/data/uploads")).resolve()
@@ -222,10 +225,19 @@ def _enforce_security(request: Any, _req: Any) -> None:
 
 
 def get_chroma_client() -> Any:
-    return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+    timeout_seconds = max(1, int(CHROMA_REQUEST_TIMEOUT))
+    settings = Settings(
+        chroma_server_host=CHROMA_HOST,
+        chroma_server_http_port=CHROMA_PORT,
+        anonymized_telemetry=False,
+        chroma_logservice_request_timeout_seconds=timeout_seconds,
+        chroma_sysdb_request_timeout_seconds=timeout_seconds,
+        chroma_query_request_timeout_seconds=timeout_seconds,
+    )
+    return chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT, settings=settings)
 
 
-def load_docx(file_path: str):
+def _load_docx_basic(file_path: str) -> list[Document]:
     try:
         d = docx.Document(file_path)
     except Exception as e:
@@ -240,6 +252,81 @@ def load_docx(file_path: str):
     if not content:
         return []
     return [Document(page_content=content, metadata={"source": os.path.basename(file_path)})]
+
+
+def load_docx(file_path: str) -> list[Document]:
+    try:
+        from unstructured.partition.docx import partition_docx
+    except ImportError:  # pragma: no cover - fallback when optional deps missing
+        return _load_docx_basic(file_path)
+
+    try:
+        elements = partition_docx(filename=file_path, include_metadata=True)
+    except Exception:
+        logger.warning("partition_docx failed, falling back to basic DOCX loader", exc_info=True)
+        return _load_docx_basic(file_path)
+
+    documents: list[Document] = []
+    for element in elements:
+        text = getattr(element, "text", "") or ""
+        text = text.strip()
+        if not text:
+            continue
+        metadata_dict: dict[str, Any] = {}
+        metadata_obj = getattr(element, "metadata", None)
+        if metadata_obj is not None:
+            try:
+                raw_meta = metadata_obj.to_dict()
+            except AttributeError:
+                raw_meta = dict(metadata_obj) if isinstance(metadata_obj, dict) else {}
+            for key, value in (raw_meta or {}).items():
+                if value in (None, "", [], {}):
+                    continue
+                metadata_dict[str(key)] = str(value)
+        metadata_dict.setdefault("source", os.path.basename(file_path))
+        metadata_dict.setdefault(
+            "mime_type",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        documents.append(Document(page_content=text, metadata=metadata_dict))
+
+    if not documents:
+        return _load_docx_basic(file_path)
+    return documents
+
+
+class TimedOllamaEmbeddings(OllamaEmbeddings):
+    """Ollama embeddings client with explicit network timeout."""
+
+    request_timeout: float = OLLAMA_REQUEST_TIMEOUT
+
+    def _process_emb_response(self, input: str) -> list[float]:
+        headers = {
+            "Content-Type": "application/json",
+            **(self.headers or {}),
+        }
+
+        try:
+            res = requests.post(
+                f"{self.base_url}/api/embeddings",
+                headers=headers,
+                json={"model": self.model, "prompt": input, **self._default_params},
+                timeout=self.request_timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Error raised by inference endpoint: {e}") from e
+
+        if res.status_code != 200:
+            raise ValueError(
+                f"Error raised by inference API HTTP code: {res.status_code}, {res.text}"
+            )
+        try:
+            t = res.json()
+            return t["embedding"]
+        except requests.exceptions.JSONDecodeError as e:
+            raise ValueError(
+                f"Error raised by inference API: {e}.\nResponse: {res.text}"
+            ) from e
 
 
 def load_markdown(file_path: Path) -> list[Document]:
@@ -533,7 +620,7 @@ def ingest_data(
             _record_ingest_outcome(req.source_type, modality_label, "skipped")
             return {"status": "ok", "added": 0, "skipped": len(prepared.ids)}
 
-        emb = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL)
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
         docs_to_add = [prepared.documents[i] for i in to_add_idx]
         ids_to_add = [prepared.ids[i] for i in to_add_idx]
         meta_to_add = [prepared.metadatas[i] for i in to_add_idx]

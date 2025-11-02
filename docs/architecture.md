@@ -19,9 +19,9 @@ Flux principal (texte → réponse) :
 ```
 
 Risques de latence/mémoire par étape :
-- Téléchargement : contrôlé par `HTTP_TIMEOUT`, streaming et plafond `MAX_REMOTE_BYTES`.
+- Téléchargement : streaming HTTP avec plafond `MAX_REMOTE_BYTES` et timeout 30 s (requests).
 - Extraction : loaders PDF/DOCX peuvent monter en RAM (~50 MiB) si fichiers volumineux.
 - Chunking : taille 800 + overlap 120 limite la duplication ; garder <1500 tokens/chunk.
-- Embeddings : Ollama CPU ~150 ms/chunk à chaud ; retrys bornés (`OLLAMA_MAX_RETRIES`).
-- Chroma : appels REST avec timeout 10 s ; utilisation en lot réduit la pression mémoire.
+- Embeddings : Ollama CPU ~150 ms/chunk à chaud ; timeouts bornés par `OLLAMA_REQUEST_TIMEOUT`.
+- Chroma : appels REST bornés via `CHROMA_REQUEST_TIMEOUT`; utilisation en lot réduit la pression mémoire.
 - UI : cache Streamlit sur client/collection pour éviter reconnections ; top-k ≤ 8.

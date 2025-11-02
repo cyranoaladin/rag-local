@@ -91,11 +91,13 @@
 | `INGESTOR_API_TOKEN`          | Jeton obligatoire (`INGEST_AUTH_HEADER` personnalisé possible). |
 | `INGESTOR_IP_ALLOWLIST`       | Liste CIDR autorisées (ex: `127.0.0.1/32,10.0.0.0/8`). |
 | `MULTIMODAL_ENABLED`, `MM_*`  | Activation et réglages parseur multimodal (timeout, chunk size, cache). |
+| `CHROMA_REQUEST_TIMEOUT` / `OLLAMA_REQUEST_TIMEOUT` | Timeouts réseau (s) pour Chroma et Ollama côté ingestor. |
+| `UI_CHROMA_TIMEOUT` / `UI_INGEST_TIMEOUT` | Timeouts utilisés par l'interface Streamlit (Chroma et API). |
 | `METRICS_ENABLED`, `METRICS_NAMESPACE` | Pilotage export Prometheus. |
 
 ## 6. Adapter multimodal (`src/ingestor/mm_adapter.py`)
 - Lit fichiers binaires (vidéo, JSON, etc.) en streaming contrôlé, calcule hash+mtime pour clé de cache.
-- Cache JSON persistant sous `MM_CACHE_DIR` (par défaut `/tmp/mm-cache`, exposé en volume `tmpfs`).
+- Cache JSON persistant sous `MM_CACHE_DIR` (par défaut `/data/mm-cache`, volume Docker nommé `rag_mm_cache`).
 - Émet des `Chunk` avec `modality`, texte ou blob, métadonnées (index, filename, mime, cached, parse_timeout).
 - Instrumentation métrique : latence parsing (`rag_local_mm_parse_latency_seconds`), compte chunks/bytes, erreurs (timeout, payload vide).
 - Fallback : si parseur dépasse `MM_PARSER_TIMEOUT`, enregistre échec et retourne texte brut ou blob.
@@ -121,13 +123,14 @@
 - Ressources limites : `cpus: 6`, `memory: 24G` (prod), overrides CI réduisent à 3.5 vCPU / 12G.
 
 ## 10. UI Streamlit (`src/ui/app.py`)
-- Pages : formulaire webhook n8n, ingestion directe (API), recherche Chroma.
-- `st.cache_resource` pour client Chroma, `st.cache_data` pour compteur documents (TTL 30s).
+- Pages : onglets "Via n8n" (flux standard) et "Administration API" (ingestion directe) + explorateur Chroma.
+- Lancement contrôlé : `STREAMLIT_IMPORT_ONLY=1` pour import sans rendu (tests). `render_app()` appelé sinon.
+- `st.cache_resource` pour client Chroma (avec `Settings` + timeout), `st.cache_data` pour compteur documents (TTL 30s).
 - Paramètres ingestion : hints (matière, voie, niveau, type, année) fusionnés côté API.
-- Support multimodal : source `video` affiche avertissement et force `mode=multimodal`.
-- Appels API : `requests.post` avec `INGEST_AUTH_HEADER` configurable, timeouts (`UI_INGEST_TIMEOUT`).
+- Support multimodal : source `video` affiche avertissement et impose `mode=multimodal`.
+- Appels API : `requests.post` avec `INGEST_AUTH_HEADER` configurable, timeouts (`UI_INGEST_TIMEOUT`, `UI_CHROMA_TIMEOUT`).
 - Recherche : slider `k` (borne `UI_MAX_K`, par défaut 8). Résultats affichent texte + dataframe métadonnées.
-- Variables env UI : `INGEST_BASE_URL`, `INGEST_API_TOKEN`, `N8N_DEFAULT_WEBHOOK`, `UI_*` (timeouts, default k), `CHROMA_HOST/PORT`.
+- Sécurité : onglet "Administration" rappelle d'activer le Basic Auth Nginx.
 
 ## 11. Automatisations n8n (`n8n/`)
 - Image `docker.n8n.io/n8nio/n8n:stable` avec BasicAuth et clé d'encryption.
@@ -145,7 +148,7 @@
 
 ## 13. Déploiement et environnements (`infra/.env*.sample`)
 - `infra/.env.example` : base dev/preprod (tokens placeholders, allowlist vide par défaut, `METRICS_ENABLED=false`).
-- `infra/.env.production.sample` : valeurs réalistes (allowlist RFC1918, `METRICS_ENABLED=true`, `MM_CACHE_DIR=/tmp/mm-cache`).
+- `infra/.env.production.sample` : valeurs réalistes (allowlist RFC1918, `METRICS_ENABLED=true`, `MM_CACHE_DIR=/data/mm-cache`).
 - `COMPOSE_PROFILES` par défaut `db,llm,api,ui,automations,web`; personnalisation possible selon contexte.
 - Scripts de gestion :
   - `make compose-up` / `make compose-down` (via wrappers Makefile si présents).
