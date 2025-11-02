@@ -20,7 +20,7 @@
   - `docker compose -f infra/docker-compose.yml --env-file infra/.env up -d`
   - Ou `COMPOSE_PROFILES=db,llm,api,ui,automations,web docker compose ... up -d`
 - Exécuter `infra/scripts/smoke.sh` pour valider la santé du cluster.
-- Inspecter les journaux : `make logs` ou `docker compose logs --tail 200`.
+- Inspecter les journaux : `docker compose logs --tail 200` (ajouter `-f` pour suivre en continu).
 
 ## Frontend HTTPS
 - Rendre les fichiers `infra/nginx/rag-ui.conf.template` et `infra/nginx/rag-n8n.conf.template` avec `envsubst`.

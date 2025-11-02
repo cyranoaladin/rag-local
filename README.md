@@ -16,13 +16,13 @@ python -m pip install -r requirements-dev.txt
 cp infra/.env.example infra/.env
 # Adapter au besoin : INGESTOR_API_TOKEN, ports loopback, modèles Ollama…
 
-make compose-up        # démarre docker-compose (base + dev override)
-make logs              # optionnel, suivi des journaux
+docker compose -f infra/docker-compose.yml --env-file infra/.env up -d --remove-orphans
+docker compose logs --tail 200   # optionnel, suivi des journaux
 
 bash infra/scripts/smoke.sh  # health + ingestion factice
 
 # Arrêter la stack
-make compose-down
+docker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
 ```
 
 Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make test-integration`, `make smoke`.
@@ -30,7 +30,7 @@ Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make
 ## Observability & CI
 - Endpoint Prometheus `GET /metrics` (ingestor) activé via `METRICS_ENABLED=true` (désactivé par défaut). Voir `docs/observability.md`.
 - Métriques : `ingestor_ingests_total{source,modality,status}` et histogramme `ingestor_ingest_duration_seconds` (buckets adaptés VPS).
-- Qualité locale : `make lint`, `make typecheck`, `make test`, ou `make ci-local` pour enchaîner les trois.
+- Qualité locale : `make lint`, `make typecheck`, `make test`, `make test-integration` (chaque commande indépendante).
 - Pipeline GitHub Actions (`.github/workflows/ci.yml`) enchaîne lint, mypy, tests unitaires et `make test-integration` (Python 3.11) puis archive les journaux pytest.
 - Job optionnel `smoke-compose` via `workflow_dispatch` pour bâtir le profil multimodal et exécuter `infra/scripts/smoke.sh`.
 
