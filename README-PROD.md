@@ -1,11 +1,13 @@
 # rag-local — Déploiement Production (VPS)
 
-Ce projet fournit un **RAG 100% local** (LLM & embeddings via **Ollama**) avec **ingestion multi-sources**, **UI de recherche**, et **automatisations n8n**, prêt à exposer en **HTTPS** via **Nginx + Let's Encrypt**, sans clés API externes.
+Ce projet fournit un **RAG 100% local** (LLM & embeddings via **Ollama**) avec **ingestion multi-sources**, **UI de recherche**, et **automatisations n8n** (optionnelles). L’architecture est prête à être exposée en **HTTPS** via **Nginx + Let's Encrypt**, sans dépendance à des API externes.
+
+> ℹ️ **Roadmap** — La licence n8n devenant payante, la solution va progressivement converger vers un mode d’ingestion 100 % interne. Ce guide décrit l’état actuel (n8n actif). Un encadré “Transition sans n8n” indique les points d’attention pour préparer sa suppression.
 
 ## Prérequis VPS
 - Ubuntu 22.04/24.04, accès sudo, ports 80/443 ouverts, DNS des domaines pointés sur le VPS.
 - Docker Engine ≥ 24.0 + plugin Compose ≥ 2.24 (`docker compose version`).
-- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN`, les secrets n8n, ainsi qu’un `INGEST_AUTH_TOKEN` fort (ex: `openssl rand -hex 32`).
+- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN` (laisser vide si n8n inactif), les secrets associés, ainsi qu’un `INGEST_AUTH_TOKEN` fort (ex: `openssl rand -hex 32`).
 
 ## Secrets à générer
 | Nom | Longueur conseillée | Usage | Où le renseigner |
@@ -49,7 +51,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ## Ingestion
 
-* Endpoint `POST /ingest` (service **ingestor**) pour URL/fichiers/Google Drive (via n8n ou via API).
+* Endpoint `POST /ingest` (service **ingestor**) pour URL/fichiers/Google Drive (via n8n ou via l’onglet “Administration API”).
 * Chunking par défaut 800/120 (ajustable via `INGEST_CHUNK_SIZE`, `INGEST_CHUNK_OVERLAP`).
 * Les chunks et métadonnées sont stockés dans **Chroma** (v2).
 
@@ -57,6 +59,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 * Streamlit: recherche, top-k, sources, métadonnées.
 * Top-k borné à 8 par défaut (`UI_MAX_K`).
+* L’onglet “Via n8n” pré-remplit l’URL du webhook avec la variable `N8N_DEFAULT_WEBHOOK`. En laissant la variable vide, le champ restera à renseigner manuellement (ou pourra être masqué lors de la migration sans n8n).
 
 ## Observabilité
 
@@ -74,3 +77,15 @@ sudo nginx -t && sudo systemctl reload nginx
 * Volume Chroma en snapshot (rsync / restic / rclone) + rotation (daily/weekly).
 
 Voir `SPEC.md` pour l’architecture et le contrat d’API.
+
+---
+### Transition sans n8n (à préparer)
+
+- Supprimer les profils Compose `automations` et la section `n8n` de `infra/docker-compose.yml` une fois le workflow remplacé.
+- Ajuster l’UI Streamlit pour masquer l’onglet “Via n8n” (variables d’environnement à définir : `STREAMLIT_HIDE_N8N_TAB` par exemple).
+- Mettre à jour `README`, `SPEC.md` et la documentation d’ingestion pour pointer vers la nouvelle chaîne (ex: script Python ou worker interne).
+- Archiver les workflows actuels (`n8n/workflows/examples/`) afin de les traduire dans la solution de remplacement.
+
+## Observability profile (internal-only)
+- Set \`METRICS_ENABLED=true\`, bring up Prometheus with \`--profile obs\`
+- /metrics is **not** exposed publicly; Prometheus scrapes the ingestor over the bridge network.
