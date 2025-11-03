@@ -1,0 +1,113 @@
+version: "3.9"
+
+networks:
+  rag_net:
+    driver: bridge
+
+volumes:
+  rag_chroma_data:
+  rag_ollama_data:
+  rag_n8n_data:
+
+services:
+  chroma:
+    image: chromadb/chroma:1.1.1
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=FALSE
+    volumes:
+      - rag_chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:8000/api/v2/heartbeat || curl -fsS http://localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:0.3.13
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - rag_ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:11434/api/tags >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 24G
+
+  ingestor:
+    build: ./ingestor
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - TZ=${TZ}
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=${CHROMA_PORT}
+      - OLLAMA_URL=http://ollama:${OLLAMA_PORT}
+      - EMBED_MODEL=${EMBED_MODEL}
+      - SMALL_LLM=${SMALL_LLM}
+      - GOOGLE_APPLICATION_CREDENTIALS=/creds/gdrive-service-account.json
+    volumes:
+      - ./creds:/creds:ro
+    command: uvicorn api:app --host 0.0.0.0 --port ${INGESTOR_PORT}
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp", "/var/tmp"]
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:${INGESTOR_PORT}/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 8G
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:stable
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - GENERIC_TIMEZONE=${TZ}
+      - N8N_PROTOCOL=https
+      - N8N_HOST=${N8N_EXTERNAL_DOMAIN}
+      - WEBHOOK_URL=https://${N8N_EXTERNAL_DOMAIN}/
+      - N8N_PROXY_HOPS=1
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+    volumes:
+      - rag_n8n_data:/home/node/.n8n
+    ports:
+      - "127.0.0.1:${NGINX_N8N_PORT}:${N8N_PORT}"
+
+  ui:
+    build: ./ui
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - TZ=${TZ}
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=${CHROMA_PORT}
+    ports:
+      - "127.0.0.1:${NGINX_UI_PORT}:${STREAMLIT_PORT}"
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp", "/var/tmp"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
