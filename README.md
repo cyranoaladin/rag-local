@@ -27,6 +27,26 @@ docker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-o
 
 Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make test-integration`, `make smoke`.
 
+### Déploiement sur un VPS (production)
+
+Script d'automatisation : `scripts/deploy-prod.sh`.
+
+Prérequis avant exécution :
+- Cloner le dépôt sur le serveur dans `/srv/rag-local` (ou définir `PROJECT_ROOT`).
+- Préparer `/srv/rag/.env` à partir de `infra/.env.prod.example` et renseigner toutes les valeurs.
+- Copier la clé Google Drive dans `/srv/rag/creds/gdrive-service-account.json` (droits `600`).
+- S'assurer que `/etc/nginx/.htpasswd-n8n` contient l'empreinte BasicAuth correspondant aux valeurs de `.env`.
+- Disposer des droits root (le script vérifie `EUID=0`).
+
+Déploiement :
+
+```bash
+cd /srv/rag-local
+sudo scripts/deploy-prod.sh
+```
+
+Variables optionnelles : `TARGET_DIR` (par défaut `/srv/rag`), `BACKUP_ROOT` (`/srv/rag-backups`), `HTPASSWD_SOURCE` (copie automatique vers `/etc/nginx/.htpasswd-n8n`).
+
 ## Observability & CI
 - Endpoint Prometheus `GET /metrics` (ingestor) activé via `METRICS_ENABLED=true` (désactivé par défaut). Voir `docs/observability.md`.
 - Métriques : `ingestor_ingests_total{source,modality,status}` et histogramme `ingestor_ingest_duration_seconds` (buckets adaptés VPS).
