@@ -1,5 +1,3 @@
-version: "3.9"
-
 networks:
   rag_net:
     driver: bridge

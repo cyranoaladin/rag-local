@@ -19,6 +19,12 @@ Ce projet fournit un **RAG 100% local** (LLM & embeddings via **Ollama**) avec *
 
 > Astuce : conserver les secrets hors dépôt (ex: `pass`, `1Password`) et régénérer à chaque rotation.
 
+## Modèles Ollama conseillés
+- `EMBED_MODEL=nomic-embed-text` (cohérent avec la collection Chroma)
+- `SMALL_LLM=llama3.2:3b` (modèle instruct compact, compatible Ollama 0.3.13)
+
+> Vérifiez les modèles disponibles sur le VPS avec `docker exec "$(docker compose -f /srv/rag/docker-compose.yml ps -q ollama)" ollama list` avant de les déclarer dans `.env`, afin d’éviter un préchargement en échec.
+
 ## Démarrage (services internes, non exposés)
 ```bash
 docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
