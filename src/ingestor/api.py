@@ -31,7 +31,7 @@ from langchain_core.documents import Document
 from langchain_google_community import GoogleDriveLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 try:
     from .mm_adapter import Chunk, parse_multimodal
@@ -140,10 +140,20 @@ def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
 
 
 class IngestRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video"]
-    source: str
-    metadata_hints: dict[str, str] = Field(default_factory=dict, alias="hints")
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video"] = Field(
+        alias="sourceType",
+        validation_alias=AliasChoices("source_type", "sourceType"),
+    )
+    source: str = Field(
+        alias="sourceUrl",
+        validation_alias=AliasChoices("source", "sourceUrl"),
+    )
+    metadata_hints: dict[str, str] = Field(
+        default_factory=dict,
+        alias="metadata",
+        validation_alias=AliasChoices("hints", "metadata"),
+    )
 
 # --- Utilitaires ---
 

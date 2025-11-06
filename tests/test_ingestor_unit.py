@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 from typing import Any
 
@@ -108,6 +109,30 @@ def test_ingest_text_endpoint_success(monkeypatch: pytest.MonkeyPatch) -> None:
     payload = response.json()
     assert payload["added"] == 1
     assert fake_collection.add_calls and len(fake_collection.add_calls[0][1]) == 1
+
+
+def test_ingest_accepts_camel_case_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    tmp_upload_dir = tempfile.mkdtemp(prefix="admin-uploads-")
+    monkeypatch.setenv("ADMIN_UPLOAD_DIR", tmp_upload_dir)
+    monkeypatch.setenv("LOCAL_SOURCE_ROOT", tmp_upload_dir)
+    api = reload_api(monkeypatch, token="token")
+    doc = api.Document(page_content="alias", metadata={"mime_type": "text/plain"})
+    _ = _setup_success_stubs(api, monkeypatch, [doc])
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/ingest",
+        headers={"X-API-Token": "token"},
+        json={
+            "sourceType": "url",
+            "sourceUrl": "https://example.com",
+            "metadata": {"matiere": "Maths"},
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["added"] == 1
 
 
 def test_metrics_counter_updates(monkeypatch: pytest.MonkeyPatch) -> None:
