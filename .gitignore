@@ -40,3 +40,4 @@ infra/nginx/rendered/
 # admin persistence (external secrets + sqlite db)
 /srv/rag-admin/
 **/api_keys.json
+src/ui/.env

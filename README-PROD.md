@@ -72,6 +72,12 @@ sudo nginx -t && sudo systemctl reload nginx
 	* `sum(increase(ingestor_ingests_total{status!="success"}[5m])) > 0`
 	* `histogram_quantile(0.99, sum(rate(ingestor_ingest_duration_seconds_bucket[5m])) by (le)) > 4`
 
+## Scripts d'exploitation
+
+* `rag_auto_fix.sh` : régénère les vhosts, recharge Nginx et redéploie les services critiques (`web`, `ui`, `ingestor`, `n8n`).
+* `rag_diag_vps.sh` : diagnostic complet (Nginx, Compose, endpoints locaux) à lancer en cas d'incident ou après une mise à jour système.
+* `rag_fix_stack.sh` : remédiation guidée qui sauvegarde `infra/.env`, rerend les templates et relance la stack avec les overrides de dev.
+
 ## Sauvegardes (idée)
 
 * Volume Chroma en snapshot (rsync / restic / rclone) + rotation (daily/weekly).
