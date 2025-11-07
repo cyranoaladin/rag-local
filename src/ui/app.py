@@ -1,11 +1,13 @@
 import os
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
+from urllib.parse import quote_plus
 
 import chromadb
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from chromadb import errors as chroma_errors
 from chromadb.config import Settings
 
@@ -22,6 +24,14 @@ CHROMA_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", os.getenv("UI_CHROMA_
 UI_MAX_K = max(1, int(os.getenv("UI_MAX_K", "8")))
 UI_DEFAULT_K = min(max(int(os.getenv("UI_DEFAULT_K", "4")), 1), UI_MAX_K)
 STREAMLIT_IMPORT_ONLY = os.getenv("STREAMLIT_IMPORT_ONLY", "0") == "1"
+ADMIN_BASE_URL = os.getenv("ADMIN_API_BASE") or INGEST_BASE_URL
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", INGEST_API_TOKEN)
+ADMIN_AUTH_HEADER = os.getenv("ADMIN_AUTH_HEADER", "X-API-Key")
+ADMIN_TIMEOUT = float(os.getenv("ADMIN_REQUEST_TIMEOUT", "10"))
+ADMIN_SSE_TOKEN_PARAM = os.getenv("ADMIN_SSE_TOKEN_PARAM")
+TENANT_OPTIONS = [slug.strip() for slug in os.getenv("TENANTS", "edu,web3").split(",") if slug.strip()]
+if not TENANT_OPTIONS:
+    TENANT_OPTIONS = ["edu", "web3"]
 
 SOURCE_TYPE_LABELS: dict[str, str] = {
     "url": "URL / Page web",
@@ -44,7 +54,7 @@ MULTIMODAL_ONLY_TYPES = {"video"}
 
 def _build_metadata_inputs(prefix: str) -> tuple[str, str, dict[str, Any]]:
     options = list(SOURCE_TYPE_LABELS.keys())
-    source_type = st.selectbox(
+    source_type: str = st.selectbox(
         "Type de source",
         options,
         format_func=lambda key: SOURCE_TYPE_LABELS.get(key, key),
@@ -71,15 +81,15 @@ def _build_metadata_inputs(prefix: str) -> tuple[str, str, dict[str, Any]]:
             key=f"{prefix}doctype",
         )
     with c3:
-        annee = st.number_input(
+        annee_raw = st.number_input(
             "Année", min_value=2010, max_value=2035, value=2024, key=f"{prefix}annee"
         )
-    hints = {
+    hints: dict[str, Any] = {
         "matiere": matiere,
         "voie": voie,
         "niveau": niveau,
         "document_type": doc_type,
-        "annee_programme": annee,
+        "annee_programme": int(annee_raw),
     }
     return source, source_type, hints
 
@@ -132,6 +142,61 @@ def _call_ingest_api(
     return response.json()
 
 
+def _admin_headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if ADMIN_API_KEY:
+        headers[ADMIN_AUTH_HEADER] = ADMIN_API_KEY
+        if ADMIN_AUTH_HEADER.lower() != "x-api-key":
+            headers.setdefault("X-API-Key", ADMIN_API_KEY)
+    return headers
+
+
+def _call_admin_api(
+    method: str,
+    path: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not ADMIN_BASE_URL:
+        raise ValueError("ADMIN_API_BASE absent")
+    url = f"{ADMIN_BASE_URL.rstrip('/')}{path}"
+    response = requests.request(
+        method,
+        url,
+        headers=_admin_headers(),
+        json=payload,
+        params=params,
+        timeout=ADMIN_TIMEOUT,
+    )
+    response.raise_for_status()
+    return cast(dict[str, Any], response.json())
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _admin_list_folders(tenant: str) -> list[dict[str, Any]]:
+    body = _call_admin_api("GET", "/admin/folders", params={"tenant": tenant})
+    return cast(list[dict[str, Any]], body.get("folders", []))
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _admin_taxonomy(tenant: str) -> dict[str, list[str]]:
+    body = _call_admin_api("GET", "/admin/taxonomy", params={"tenant": tenant})
+    return cast(dict[str, list[str]], body.get("facets", {}))
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def _admin_jobs(tenant: str) -> list[dict[str, Any]]:
+    body = _call_admin_api("GET", "/admin/jobs", params={"tenant": tenant, "limit": 50})
+    return cast(list[dict[str, Any]], body.get("jobs", []))
+
+
+def _clear_cached(fn: Any) -> None:
+    clear_fn = getattr(fn, "clear", None)
+    if callable(clear_fn):
+        clear_fn()
+
+
 def _render_ingestion_form() -> None:
     st.subheader("Ingestion orchestrée via n8n")
     webhook_default = N8N_DEFAULT_WEBHOOK or "https://EXEMPLE.webhook.url/ingestion"
@@ -156,7 +221,7 @@ def _render_ingestion_form() -> None:
                     st.error(f"Erreur réseau webhook: {exc}")
 
 
-def _render_admin_form() -> None:
+def _render_direct_ingest_form() -> None:
     st.subheader("Administration – Appels directs API")
     st.warning(
         "Protègez impérativement cette section derrière l'authentification Basic Auth configurée dans Nginx.",
@@ -197,6 +262,63 @@ def _render_admin_form() -> None:
                 st.error(str(exc))
 
 
+def _render_oneclick_form() -> None:
+    st.subheader("Ingestion 1-clic (multi-tenant)")
+    tenant = st.selectbox("Tenant", TENANT_OPTIONS, key="oneclick_tenant")
+    folder_path = st.text_input("Dossier cible", "guides/nouveau", key="oneclick_folder")
+    source_type = st.selectbox(
+        "Type de source",
+        [
+            "url",
+            "gdrive",
+            "gdrive_folder",
+            "file",
+            "html",
+            "markdown",
+            "pdf",
+            "docx",
+            "md",
+            "video",
+        ],
+        key="oneclick_source_type",
+    )
+    source_value = st.text_input("Valeur source", "https://exemple.com", key="oneclick_source_value")
+    mode = st.selectbox("Mode", ["text", "multimodal"], key="oneclick_mode")
+    taxonomy_values = _admin_taxonomy(tenant)
+
+    with st.form("oneclick_form"):
+        selected_taxonomy: dict[str, str] = {}
+        for facet, values in sorted(taxonomy_values.items()):
+            default_value = values[0] if values else ""
+            selected_taxonomy[facet] = st.text_input(
+                f"Taxonomie – {facet}",
+                value=default_value,
+                key=f"oneclick_tax_{facet}",
+            )
+        idempotency = st.text_input("Idempotency key (optionnel)", "", key="oneclick_idempotency")
+        submit = st.form_submit_button("Lancer l'ingestion 1-clic")
+        if submit:
+            payload = {
+                "tenant": tenant,
+                "folder_path": folder_path,
+                "source_type": source_type,
+                "source_value": source_value,
+                "taxonomy": {k: v for k, v in selected_taxonomy.items() if v},
+                "mode": mode,
+                "idempotency_key": idempotency or None,
+            }
+            try:
+                response = _call_admin_api("POST", "/admin/ingest/oneclick", payload=payload)
+                st.success(f"Job {response['jobId']} terminé")
+                st.json(response)
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response else "n/a"
+                detail = exc.response.text if exc.response else str(exc)
+                st.error(f"Erreur {status_code} lors de l'ingestion 1-clic: {detail}")
+            except requests.RequestException as exc:
+                st.error(f"Erreur réseau ingestion 1-clic: {exc}")
+
+
 def _render_collection_explorer() -> None:
     st.header("2) Explorer Chroma")
     try:
@@ -222,24 +344,154 @@ def _render_collection_explorer() -> None:
                     metadata = first_metas[i] if i < len(first_metas) else {}
                     with st.expander(f"Résultat #{i+1}  — distance {distance:.4f}"):
                         st.text_area("Extrait", doc, height=200)
-                        st.dataframe(pd.DataFrame(list(metadata.items()), columns=["Champ", "Valeur"]))
+                        df_metadata = pd.DataFrame(
+                            list(metadata.items()),
+                            columns=pd.Index(["Champ", "Valeur"]),
+                        )
+                        st.dataframe(df_metadata)
     except (chroma_errors.ChromaError, requests.RequestException, ValueError) as exc:
         st.error(f"Chroma indisponible: {exc}")
+
+
+def _sse_url(job_id: str, tenant: str) -> str:
+    base = ADMIN_BASE_URL.rstrip("/") if ADMIN_BASE_URL else ""
+    url = f"{base}/admin/jobs/{job_id}/events?tenant={tenant}"
+    if ADMIN_SSE_TOKEN_PARAM and ADMIN_API_KEY:
+        token_param = ADMIN_SSE_TOKEN_PARAM.strip()
+        if token_param:
+            url = f"{url}&{token_param}={quote_plus(ADMIN_API_KEY)}"
+    return url
+
+
+def _render_jobs_dashboard() -> None:
+        st.subheader("Jobs & suivi en direct")
+        tenant = st.selectbox("Tenant", TENANT_OPTIONS, key="jobs_tenant")
+        if st.button("Rafraîchir les jobs", key="jobs_refresh"):
+            _clear_cached(_admin_jobs)
+
+        jobs = _admin_jobs(tenant)
+        job_table = pd.DataFrame(jobs) if jobs else pd.DataFrame(columns=pd.Index(["id", "status", "collection"]))
+        st.dataframe(job_table)
+
+        selected_job = st.selectbox(
+                "Job à suivre",
+                [job.get("id") for job in jobs] if jobs else [""],
+                index=0,
+                key="jobs_selected",
+        )
+        if selected_job:
+                st.markdown("**📡 Suivi SSE**")
+                url = _sse_url(selected_job, tenant)
+                html = f"""
+<div id=\"sse-container\" style=\"height:240px; overflow:auto; border:1px solid #ddd; padding:8px; font-family:monospace; background:#0f172a; color:#f8fafc;\"></div>
+<script>
+const target = document.getElementById("sse-container");
+const source = new EventSource("{url}");
+const append = (text) => {{
+    const line = document.createElement("div");
+    line.textContent = text;
+    target.appendChild(line);
+    target.scrollTop = target.scrollHeight;
+}};
+source.addEventListener("message", (event) => {{
+    try {{
+        const data = JSON.parse(event.data);
+        append(`[${{data.timestamp || ""}}] [${{data.level}}] ${{data.message}}`);
+    }} catch (err) {{
+        append(`(parse error) ${{event.data}}`);
+    }}
+}});
+source.addEventListener("keepalive", () => {{
+    append("⋯ keepalive");
+}});
+source.onerror = () => {{
+    append("❌ connexion SSE interrompue");
+}};
+</script>
+"""
+                components.html(html, height=260)
+
+
+def _render_folder_taxonomy_manager() -> None:
+    st.subheader("Dossiers & Taxonomie")
+    tenant = st.selectbox("Tenant", TENANT_OPTIONS, key="manager_tenant")
+    if st.button("Rafraîchir les données", key="refresh_manager"):
+        _clear_cached(_admin_list_folders)
+        _clear_cached(_admin_taxonomy)
+
+    folders = _admin_list_folders(tenant)
+    if folders:
+        df_folders = pd.DataFrame(folders)
+        st.dataframe(df_folders)
+    else:
+        st.info("Aucun dossier enregistré pour ce tenant")
+
+    with st.form("create_folder_form"):
+        st.markdown("**Créer un dossier**")
+        folder_path = st.text_input("Chemin complet", "guides/exemple", key="create_folder_path")
+        folder_slug = st.text_input("Slug (optionnel)", "", key="create_folder_slug")
+        create = st.form_submit_button("Créer le dossier")
+        if create:
+            payload = {"tenant": tenant, "path": folder_path, "slug": folder_slug or None}
+            try:
+                response = _call_admin_api("POST", "/admin/folders", payload=payload)
+                st.success(f"Dossier '{response['folder']['path']}' créé")
+                _clear_cached(_admin_list_folders)
+            except requests.HTTPError as exc:
+                detail = exc.response.text if exc.response else str(exc)
+                st.error(f"Erreur de création de dossier: {detail}")
+            except requests.RequestException as exc:
+                st.error(f"Erreur réseau dossier: {exc}")
+
+    taxonomy = _admin_taxonomy(tenant)
+    if taxonomy:
+        st.markdown("**Taxonomie actuelle**")
+        st.json(taxonomy)
+
+    with st.form("add_taxonomy_form"):
+        st.markdown("**Ajouter une valeur de taxonomie**")
+        facet = st.text_input("Facet", "doc_type", key="taxonomy_facet")
+        value = st.text_input("Valeur", "cours", key="taxonomy_value")
+        submit = st.form_submit_button("Ajouter la valeur")
+        if submit:
+            payload = {"tenant": tenant, "facet": facet, "value": value}
+            try:
+                response = _call_admin_api("POST", "/admin/taxonomy", payload=payload)
+                st.success(f"Valeur '{response['value']}' ajoutée à '{response['facet']}'")
+                _clear_cached(_admin_taxonomy)
+            except requests.HTTPError as exc:
+                detail = exc.response.text if exc.response else str(exc)
+                st.error(f"Erreur taxonomie: {detail}")
+            except requests.RequestException as exc:
+                st.error(f"Erreur réseau taxonomie: {exc}")
 
 
 def render_app() -> None:
     st.set_page_config(layout="wide", page_title="Admin RAG Pédagogique")
     st.title("Tableau de bord RAG")
     st.caption("L'interface doit rester derrière un proxy authentifié (Nginx Basic Auth recommandé).")
+    tabs = st.tabs([
+        "Ingestion",
+        "Dossiers & Taxonomie",
+        "Jobs",
+        "Collections & Recherche",
+    ])
 
-    st.header("1) Lancer une ingestion")
-    tab_n8n, tab_admin = st.tabs(["Via n8n", "Administration API"])
-    with tab_n8n:
+    with tabs[0]:
         _render_ingestion_form()
-    with tab_admin:
-        _render_admin_form()
+        st.divider()
+        _render_direct_ingest_form()
+        st.divider()
+        _render_oneclick_form()
 
-    _render_collection_explorer()
+    with tabs[1]:
+        _render_folder_taxonomy_manager()
+
+    with tabs[2]:
+        _render_jobs_dashboard()
+
+    with tabs[3]:
+        _render_collection_explorer()
 
 
 if not STREAMLIT_IMPORT_ONLY:

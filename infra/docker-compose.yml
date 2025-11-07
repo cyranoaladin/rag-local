@@ -7,6 +7,7 @@ volumes:
   rag_ollama_data:
   rag_n8n_data:
   rag_mm_cache:
+  rag_admin_data:
 
 services:
   chroma:
@@ -83,10 +84,17 @@ services:
       MM_CACHE_DIR: ${MM_CACHE_DIR:-/data/mm-cache}
       CHROMA_REQUEST_TIMEOUT: ${CHROMA_REQUEST_TIMEOUT:-30}
       OLLAMA_REQUEST_TIMEOUT: ${OLLAMA_REQUEST_TIMEOUT:-60}
+      ADMIN_DB_PATH: ${ADMIN_DB_PATH:-/srv/rag-admin/admin.db}
+      API_KEYS_PATH: ${API_KEYS_PATH:-/srv/rag-admin/api_keys.json}
+      TENANTS: ${TENANTS:-edu,web3}
+      DEFAULT_TENANT: ${DEFAULT_TENANT:-edu}
+      RATE_LIMIT_RPM: ${RATE_LIMIT_RPM:-240}
+      RERANKER_ENABLED: ${RERANKER_ENABLED:-false}
     volumes:
       - ./creds:/creds:ro
       - ./data/uploads:/data/uploads:rw
       - rag_mm_cache:/data/mm-cache
+      - rag_admin_data:/srv/rag-admin
     command: uvicorn api:app --host 0.0.0.0 --port ${INGESTOR_PORT:-8001}
     security_opt: ["no-new-privileges:true"]
     read_only: true
@@ -220,7 +228,10 @@ services:
       - ./nginx/rendered:/etc/nginx/conf.d:ro
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "nginx -t && wget -qO- http://127.0.0.1/ >/dev/null"]
+      test:
+        - CMD-SHELL
+        - >-
+          nginx -t && wget -qO- --header="Host: ${RAG_EXTERNAL_DOMAIN}" http://127.0.0.1/ >/dev/null
       interval: 10s
       timeout: 3s
       retries: 5

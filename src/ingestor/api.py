@@ -33,11 +33,15 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from src.admin.router import router as admin_router
+from src.common.auth import DynamicCORSMiddleware
+from src.ingestor.search_api import router as kb_router
+
 try:
-    from .mm_adapter import Chunk, parse_multimodal
+    from src.ingestor.mm_adapter import Chunk, parse_multimodal
 except ImportError:
     # Allow running when the module is executed as a top-level script (e.g. inside Docker).
-    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
+    from .mm_adapter import Chunk, parse_multimodal
 
 
 def _load_metrics_module() -> ModuleType:
@@ -100,11 +104,16 @@ class PreparedBatch:
     modality: str
 
 app = FastAPI(title="RAG Ingestor API")
+app.add_middleware(DynamicCORSMiddleware)
+app.include_router(admin_router)
+app.include_router(kb_router)
 
 
 @app.middleware("http")
 async def _metrics_middleware(request, call_next):
     start = time.perf_counter()
+    response: Response | None = None
+    code = 500
     try:
         response = await call_next(request)
         code = getattr(response, "status_code", 500)
@@ -118,6 +127,7 @@ async def _metrics_middleware(request, call_next):
             method = request.method
             REQUEST_LATENCY.labels(path=path, method=method).observe(elapsed)
             REQUEST_COUNT.labels(path=path, method=method, code=str(code)).inc()
+    assert response is not None  # call_next succeeded if we reach this point
     return response
 
 
@@ -142,17 +152,17 @@ def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
 class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
     source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video"] = Field(
-        alias="sourceType",
+        serialization_alias="sourceType",
         validation_alias=AliasChoices("source_type", "sourceType"),
     )
     source: str = Field(
-        alias="sourceUrl",
+        serialization_alias="sourceUrl",
         validation_alias=AliasChoices("source", "sourceUrl"),
     )
     metadata_hints: dict[str, str] = Field(
         default_factory=dict,
-        alias="metadata",
-        validation_alias=AliasChoices("hints", "metadata"),
+        serialization_alias="metadata",
+        validation_alias=AliasChoices("metadata", "hints"),
     )
 
 # --- Utilitaires ---

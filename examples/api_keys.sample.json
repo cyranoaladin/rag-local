@@ -1,0 +1,27 @@
+{
+  "edu_demo_reader": {
+    "tenant": "edu",
+    "scopes": ["kb:read"],
+    "origins": ["https://edu.example.com"],
+    "note": "Demo read-only key"
+  },
+  "edu_demo_operator": {
+    "tenant": "edu",
+    "scopes": ["folders:write", "ingest:write", "jobs:read", "kb:read"],
+    "origins": ["https://ops.example.com"],
+    "note": "Operator key for ingestion trials"
+  },
+  "edu_super_admin": {
+    "tenant": "edu",
+    "scopes": ["folders:write", "ingest:write", "jobs:read", "kb:read", "keys:issue"],
+    "origins": ["https://admin.example.com"],
+    "expires_at": 1924992000,
+    "note": "Backoffice automation user with key issuance rights"
+  },
+  "web3_demo_full": {
+    "tenant": "web3",
+    "scopes": ["folders:write", "ingest:write", "kb:read", "jobs:read"],
+    "origins": ["https://web3.example"],
+    "note": "Web3 automation agent"
+  }
+}

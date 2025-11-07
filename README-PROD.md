@@ -7,7 +7,7 @@ Ce projet fournit un **RAG 100% local** (LLM & embeddings via **Ollama**) avec *
 ## Prérequis VPS
 - Ubuntu 22.04/24.04, accès sudo, ports 80/443 ouverts, DNS des domaines pointés sur le VPS.
 - Docker Engine ≥ 24.0 + plugin Compose ≥ 2.24 (`docker compose version`).
-- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN` (laisser vide si n8n inactif), les secrets associés, ainsi qu’un `INGEST_AUTH_TOKEN` fort (ex: `openssl rand -hex 32`).
+- Cloner le repo et copier `infra/.env.example` vers `infra/.env`, puis éditer `RAG_EXTERNAL_DOMAIN`, `API_EXTERNAL_DOMAIN`, `N8N_EXTERNAL_DOMAIN` (laisser vide si n8n inactif), les secrets associés, ainsi qu’un `INGEST_AUTH_TOKEN` fort (ex: `openssl rand -hex 32`).
 
 ## Secrets à générer
 | Nom | Longueur conseillée | Usage | Où le renseigner |

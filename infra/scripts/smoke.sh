@@ -41,6 +41,13 @@ fi
 
 [ -f "${env_file}" ] || touch "${env_file}"
 
+if [ -f "${env_file}" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${env_file}"
+  set +a
+fi
+
 # Compose helper (order-sensitive flags), reused throughout the script.
 # Compose CLI already reads COMPOSE_PROFILES from env; keeping flags minimal avoids "no service selected" edge cases in CI.
 compose_cmd=(docker compose)
@@ -162,7 +169,9 @@ if [ "$ok" != "1" ]; then
 fi
 
 # Checks côté hôte
-curl -fsS http://127.0.0.1:18001/health -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" -o /dev/null && echo "ingestor: OK"
+auth_header=${INGEST_AUTH_HEADER:-X-API-Token}
+auth_token=${INGEST_API_TOKEN:-${INGESTOR_API_TOKEN:-devtoken}}
+curl -fsS http://127.0.0.1:18001/health -H "${auth_header}: ${auth_token}" -o /dev/null && echo "ingestor: OK"
 
 embed_model=${EMBED_MODEL:-nomic-embed-text}
 echo "== ensure embedding model: ${embed_model} =="
@@ -175,7 +184,7 @@ fi
 
 # Ingestion smoke
 ingest_raw=$(curl -sS -X POST "http://127.0.0.1:18001/ingest" \
-  -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" \
+  -H "${auth_header}: ${auth_token}" \
   -H "Content-Type: application/json" \
   -d '{"source_type":"url","source":"https://example.com","hints":{"env":"smoke"}}' \
   -w '\n%{http_code}' 2>&1) || dump_service_logs $?

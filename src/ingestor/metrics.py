@@ -51,6 +51,10 @@ __all__ = [
     "track_mm_parse_latency",
     "record_mm_chunk",
     "record_mm_failure",
+    "get_admin_metrics",
+    "get_kb_metrics",
+    "get_job_event_metrics",
+    "record_job_event",
 ]
 
 METRICS_ENABLED = os.getenv("METRICS_ENABLED", "true").lower() == "true"
@@ -119,6 +123,81 @@ _MM_FAILURES = Counter(
     ("reason",),
     registry=REGISTRY,
 )
+
+_admin_metric_cache: dict[int, tuple[Counter, Counter, Histogram]] = {}
+_kb_metric_cache: dict[int, tuple[Counter, Counter, Histogram]] = {}
+_job_event_cache: dict[int, Counter] = {}
+
+
+def get_admin_metrics() -> tuple[Counter, Counter, Histogram]:
+    registry_id = id(REGISTRY)
+    cached = _admin_metric_cache.get(registry_id)
+    if cached is not None:
+        return cached
+    requests = Counter(
+        "admin_requests_total",
+        "Admin API requests",
+        ("route", "method", "code", "tenant"),
+        registry=REGISTRY,
+    )
+    failures = Counter(
+        "admin_failures_total",
+        "Admin API failures",
+        ("route", "tenant", "reason"),
+        registry=REGISTRY,
+    )
+    latency = Histogram(
+        "admin_latency_seconds",
+        "Latency for admin API operations",
+        ("route",),
+        registry=REGISTRY,
+    )
+    bundle = (requests, failures, latency)
+    _admin_metric_cache[registry_id] = bundle
+    return bundle
+
+
+def get_kb_metrics() -> tuple[Counter, Counter, Histogram]:
+    registry_id = id(REGISTRY)
+    cached = _kb_metric_cache.get(registry_id)
+    if cached is not None:
+        return cached
+    requests = Counter(
+        "kb_search_requests_total",
+        "Knowledge base search requests",
+        ("route", "method", "code", "tenant"),
+        registry=REGISTRY,
+    )
+    failures = Counter(
+        "kb_search_failures_total",
+        "Knowledge base search failures",
+        ("route", "tenant", "reason"),
+        registry=REGISTRY,
+    )
+    latency = Histogram(
+        "kb_search_latency_seconds",
+        "Latency for KB endpoints",
+        ("route",),
+        registry=REGISTRY,
+    )
+    bundle = (requests, failures, latency)
+    _kb_metric_cache[registry_id] = bundle
+    return bundle
+
+
+def get_job_event_metrics() -> Counter:
+    registry_id = id(REGISTRY)
+    cached = _job_event_cache.get(registry_id)
+    if cached is not None:
+        return cached
+    events = Counter(
+        "jobs_events_total",
+        "Total job events streamed via SSE",
+        ("tenant", "level"),
+        registry=REGISTRY,
+    )
+    _job_event_cache[registry_id] = events
+    return events
 
 if "REQUEST_COUNT" not in globals():
     REQUEST_COUNT = Counter(
@@ -236,3 +315,10 @@ def record_mm_failure(reason: str) -> None:
     if not safe_reason:
         safe_reason = "unknown"
     _MM_FAILURES.labels(reason=safe_reason).inc()
+
+
+@_guarded
+def record_job_event(tenant: str, level: str) -> None:
+    safe_tenant = (tenant or "unknown").strip().lower() or "unknown"
+    safe_level = (level or "info").strip().lower() or "info"
+    get_job_event_metrics().labels(tenant=safe_tenant, level=safe_level).inc()

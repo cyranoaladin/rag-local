@@ -36,3 +36,7 @@ data/
 
 # Nginx rendered configs (dir)
 infra/nginx/rendered/
+
+# admin persistence (external secrets + sqlite db)
+/srv/rag-admin/
+**/api_keys.json

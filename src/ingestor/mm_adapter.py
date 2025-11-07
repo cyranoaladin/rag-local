@@ -18,6 +18,7 @@ from typing import Any, BinaryIO
 __all__ = [
     "Chunk",
     "parse_multimodal",
+    "iter_chunks",
 ]
 
 
@@ -166,6 +167,27 @@ def parse_multimodal(
         _persist_cache(cache_root, raw_bytes, metadata["source_mtime"], emitted)
 
 
+def iter_chunks(
+    handle: BinaryIO,
+    *,
+    filename: str,
+    mime: str,
+    timeout_s: float,
+    max_chars_per_chunk: int,
+    cache_dir: str | Path,
+) -> Iterator[Chunk]:
+    """Convenience wrapper kept for backwards compatibility with older callers."""
+
+    return parse_multimodal(
+        handle,
+        filename=filename,
+        mime=mime,
+        timeout_s=timeout_s,
+        max_chars_per_chunk=max_chars_per_chunk,
+        cache_dir=cache_dir,
+    )
+
+
 def _read_payload(stream: BinaryIO, timeout_s: float) -> tuple[bytes, bool]:
     if timeout_s is not None and timeout_s <= 0:
         _rewind(stream)
@@ -196,13 +218,18 @@ def _rewind(stream: BinaryIO) -> None:
 
 def _base_metadata(stream: BinaryIO, filename: str, mime: str) -> dict[str, Any]:
     mtime: str = "unknown"
-    fileno = getattr(stream, "fileno", None)
-    if callable(fileno):
+    fileno_candidate = getattr(stream, "fileno", None)
+    if callable(fileno_candidate):
         try:
-            stat = os.fstat(fileno())
-            mtime = str(int(stat.st_mtime))
+            fd = fileno_candidate()
         except (OSError, io.UnsupportedOperation):
-            mtime = "unknown"
+            fd = None
+        if isinstance(fd, int):
+            try:
+                stat = os.fstat(fd)
+                mtime = str(int(stat.st_mtime))
+            except (OSError, io.UnsupportedOperation):
+                mtime = "unknown"
     return {
         "filename": filename or "unknown",
         "mime_type": mime or "application/octet-stream",
