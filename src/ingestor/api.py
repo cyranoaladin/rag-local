@@ -9,44 +9,8 @@ import ipaddress
 import logging
 import mimetypes
 import os
-import socket
-import sys
-import tempfile
-import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
-from types import ModuleType
-from typing import Any, Literal, cast
-from urllib.parse import urlparse
-
-import chromadb
-import docx
 import requests
-from bs4 import BeautifulSoup
-from chromadb.config import Settings
-from fastapi import FastAPI, HTTPException, Query, Request, Response
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_core.documents import Document
-from langchain_google_community import GoogleDriveLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from prometheus_client import CONTENT_TYPE_LATEST
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
-
-
-def test_placeholder_multimodal_present():
-    m = importlib.import_module("src.ingestor.mm_adapter")
-    assert hasattr(m, "iter_chunks")
 try:
-    from .mm_adapter import Chunk, parse_multimodal
-except ImportError:
-    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
-    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
-
-try:
-    from . import admin_api as _admin_api_module
-except ImportError:  # pragma: no cover - Docker execution path
     _admin_api_module = importlib.import_module("admin_api")
 
 admin_api = _admin_api_module
