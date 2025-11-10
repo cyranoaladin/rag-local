@@ -12,18 +12,12 @@ from chromadb.utils import embedding_functions
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
-
 class AdminDbProtocol(Protocol):
     def normalize_tenant(self, candidate: str | None) -> str: ...
-
     def api_key_get_by_token(self, token: str, tenant: str) -> dict[str, Any] | None: ...
-
     def strip_collection_tenant_prefix(self, name: str, tenant: str) -> str: ...
-
     def canonical_collection_name(self, name: str) -> str: ...
-
     def collection_name_for_tenant(self, tenant: str, collection: str) -> str: ...
-
 
 class _FallbackAdminDb:
     _DEFAULT_TENANT = os.getenv("DEFAULT_TENANT", "default") or "default"
@@ -53,7 +47,7 @@ class _FallbackAdminDb:
     @classmethod
     def strip_collection_tenant_prefix(cls, name: str, tenant: str) -> str:
         prefix = f"{cls.normalize_tenant(tenant)}__"
-        return name[len(prefix) :] if name.startswith(prefix) else name
+        return name[len(prefix):] if name.startswith(prefix) else name
 
     @classmethod
     def canonical_collection_name(cls, name: str) -> str:
@@ -65,9 +59,7 @@ class _FallbackAdminDb:
     def collection_name_for_tenant(cls, tenant: str, collection: str) -> str:
         return f"{cls.normalize_tenant(tenant)}__{cls.canonical_collection_name(collection)}"
 
-
 logger = logging.getLogger(__name__)
-
 
 def _load_admin_backend() -> AdminDbProtocol:
     for module_name in ("src.admin.db", "admin.db"):
@@ -78,7 +70,6 @@ def _load_admin_backend() -> AdminDbProtocol:
             continue
     logger.warning("admin db module not found; falling back to static token checks")
     return cast(AdminDbProtocol, _FallbackAdminDb)
-
 
 admindb = _load_admin_backend()
 
@@ -103,7 +94,6 @@ _client: _ClientProtocol | None = None
 _embedder = None
 _reranker = None
 
-
 def _client_lazy() -> _ClientProtocol:
     global _client
     if _client is not None:
@@ -114,17 +104,14 @@ def _client_lazy() -> _ClientProtocol:
         _client = chromadb.PersistentClient(path=CHROMA_DIR)
     return _client
 
-
 def _embedder_lazy() -> Any:
     global _embedder
     if _embedder is None:
         _embedder = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=SEARCH_EMBED_MODEL)
     return _embedder
 
-
 def _collection(name: str) -> Any:
     return _client_lazy().get_or_create_collection(name=name, embedding_function=_embedder_lazy())
-
 
 def _resolve_tenant(request: Request) -> str:
     candidate = (
@@ -133,7 +120,6 @@ def _resolve_tenant(request: Request) -> str:
         or request.headers.get("x-tenant")
     )
     return admindb.normalize_tenant(candidate)
-
 
 def _check_key(token: str | None, origin: str | None, tenant: str) -> dict[str, Any]:
     if not token:
@@ -152,14 +138,12 @@ def _check_key(token: str | None, origin: str | None, tenant: str) -> dict[str, 
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Origin '{origin}' not allowed for this key")
     return record
 
-
 class SearchQuery(BaseModel):
     q: str
     collection: str
     k: int = 6
     include_documents: bool = True
     rerank: bool | None = None
-
 
 @router.get("/collections")
 def list_collections(request: Request, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
@@ -183,7 +167,6 @@ def list_collections(request: Request, x_api_key: str | None = Header(default=No
         base = admindb.strip_collection_tenant_prefix(name, tenant)
         names.append({"name": base, "fullName": name})
     return {"collections": names}
-
 
 @router.post("/search")
 def search(
@@ -216,7 +199,6 @@ def search(
             global _reranker
             if _reranker is None:
                 from sentence_transformers import CrossEncoder
-
                 _reranker = CrossEncoder(RERANKER_MODEL)
             pairs = [(payload.q, doc) for doc in documents]
             raw_scores_any = _reranker.predict(pairs)
