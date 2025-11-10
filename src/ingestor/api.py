@@ -1,4 +1,5 @@
 # Fichier: /srv/rag/ingestor/api.py
+# Fichier: /srv/rag/ingestor/api.py
 from __future__ import annotations
 
 import hashlib
@@ -6,7 +7,6 @@ import importlib
 import importlib.util
 import ipaddress
 import logging
-import importlib
 import mimetypes
 import os
 import socket
@@ -24,9 +24,8 @@ import chromadb
 import docx
 import requests
 from bs4 import BeautifulSoup
-def test_placeholder_multimodal_present():
-    m = importlib.import_module("src.ingestor.mm_adapter")
-    assert hasattr(m, "iter_chunks")
+from chromadb.config import Settings
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_core.documents import Document
@@ -34,6 +33,82 @@ from langchain_google_community import GoogleDriveLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+
+def test_placeholder_multimodal_present():
+    m = importlib.import_module("src.ingestor.mm_adapter")
+    assert hasattr(m, "iter_chunks")
+try:
+    from .mm_adapter import Chunk, parse_multimodal
+except ImportError:
+    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
+    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
+
+try:
+    from . import admin_api as _admin_api_module
+except ImportError:  # pragma: no cover - Docker execution path
+    _admin_api_module = importlib.import_module("admin_api")
+
+admin_api = _admin_api_module
+
+def _load_metrics_module() -> ModuleType:
+    module_name = "src.ingestor.metrics"
+    existing = sys.modules.get(module_name)
+    if isinstance(existing, ModuleType):
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        Path(__file__).with_name("metrics.py"),
+    )
+    if spec and spec.loader:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    raise ImportError("Unable to load metrics module")
+
+ingest_metrics: ModuleType = _load_metrics_module()
+
+# --- Configuration ---
+CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+COLLECTION_NAME = "ressources_pedagogiques_terminale"
+CHROMA_REQUEST_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", "30"))
+OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "30"))
+MAX_REMOTE_BYTES = int(os.getenv("MAX_REMOTE_BYTES", str(10 * 1024 * 1024)))
+LOCAL_SOURCE_ROOT = Path(
+    os.getenv("LOCAL_SOURCE_ROOT", "/data/uploads")).resolve()
+ALLOW_UNRESTRICTED_LOCAL = os.getenv(
+    "ALLOW_UNRESTRICTED_LOCAL", "false").lower() == "true"
+URL_SCHEMES_ALLOWED = {"http", "https"}
+
+INGEST_CHUNK_SIZE = int(os.getenv("INGEST_CHUNK_SIZE", "1000"))
+INGEST_CHUNK_OVERLAP = int(os.getenv("INGEST_CHUNK_OVERLAP", "150"))
+METRICS_ENABLED = ingest_metrics.METRICS_ENABLED
+MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "false").lower() == "true"
+MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
+MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
+MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
+GOOGLE_DRIVE_TOKEN_PATH = os.getenv("GOOGLE_DRIVE_TOKEN_PATH", "/tmp/google-drive-token.json")
+
+# Keep metrics isolated per module import to avoid duplicate registration in tests.
+METRIC_REGISTRY = ingest_metrics.REGISTRY
+REQUEST_COUNT = ingest_metrics.REQUEST_COUNT
+REQUEST_LATENCY = ingest_metrics.REQUEST_LATENCY
+INGEST_RESULT = ingest_metrics.INGEST_RESULT
+ingest_requests_total = ingest_metrics.ingest_requests_total
+
+logger = logging.getLogger(__name__)
+
+
+
+
+app = FastAPI(title="RAG Ingestor API")
+app.include_router(admin_api.router)
+
+...
 
 try:
     from .mm_adapter import Chunk, parse_multimodal
