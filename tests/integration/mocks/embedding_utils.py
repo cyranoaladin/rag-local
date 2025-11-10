@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 def generate_fake_embedding(text: str, dimension: int = 8) -> list[float]:
     """Return a deterministic pseudo-embedding for the given text."""
     if not text:

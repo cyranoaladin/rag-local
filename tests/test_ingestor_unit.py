@@ -164,6 +164,12 @@ def test_metrics_counter_updates(monkeypatch: pytest.MonkeyPatch) -> None:
     assert failure_child._value.get() == 1
 
 
+def test_admin_router_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="admin-token")
+    registered_paths = {route.path for route in api.app.routes}
+    assert any(path.startswith("/admin") for path in registered_paths)
+
+
 def test_load_docx_prefers_unstructured(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     api = reload_api(monkeypatch, token=None)
     target = tmp_path / "sample.docx"

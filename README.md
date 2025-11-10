@@ -79,3 +79,12 @@ make nginx-reload
 # Arrêt du seul service Nginx
 make nginx-down
 ```
+
+## CI/CD robustesse & auto-diagnostic
+
+Voir le fichier `CI_ROBUSTESSE.md` pour la logique complète de robustesse, d'auto-diagnostic et de debug automatique en cas d'échec CI (logs, état réseau, inspect, etc.).
+
+Pour reproduire localement :
+```bash
+bash infra/scripts/smoke.sh
+```

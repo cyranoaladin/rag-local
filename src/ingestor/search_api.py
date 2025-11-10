@@ -1,22 +1,86 @@
 """Read-only knowledge base API guarded by per-token scopes."""
 from __future__ import annotations
 
+import importlib
+import logging
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import chromadb
 from chromadb.utils import embedding_functions
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
-if TYPE_CHECKING:
-    from ..admin import db as admindb
-else:  # pragma: no cover - fallback when executed as a script
-    try:
-        from ..admin import db as admindb
-    except ImportError:  # pragma: no cover - direct execution fallback
-        from admin import db as admindb
+
+class AdminDbProtocol(Protocol):
+    def normalize_tenant(self, candidate: str | None) -> str: ...
+
+    def api_key_get_by_token(self, token: str, tenant: str) -> dict[str, Any] | None: ...
+
+    def strip_collection_tenant_prefix(self, name: str, tenant: str) -> str: ...
+
+    def canonical_collection_name(self, name: str) -> str: ...
+
+    def collection_name_for_tenant(self, tenant: str, collection: str) -> str: ...
+
+
+class _FallbackAdminDb:
+    _DEFAULT_TENANT = os.getenv("DEFAULT_TENANT", "default") or "default"
+    _STATIC_TOKEN = os.getenv("SEARCH_API_TOKEN")
+
+    @classmethod
+    def normalize_tenant(cls, candidate: str | None) -> str:
+        raw = (candidate or cls._DEFAULT_TENANT).strip().lower()
+        sanitized = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_"})
+        return sanitized or cls._DEFAULT_TENANT
+
+    @classmethod
+    def api_key_get_by_token(cls, token: str, tenant: str) -> dict[str, Any] | None:
+        expected = (cls._STATIC_TOKEN or "").strip()
+        if not expected:
+            return None
+        if token.strip() != expected:
+            return None
+        normalized_tenant = cls.normalize_tenant(tenant)
+        return {
+            "token": expected,
+            "tenant": normalized_tenant,
+            "scopes": "*",
+            "origins": "*",
+        }
+
+    @classmethod
+    def strip_collection_tenant_prefix(cls, name: str, tenant: str) -> str:
+        prefix = f"{cls.normalize_tenant(tenant)}__"
+        return name[len(prefix) :] if name.startswith(prefix) else name
+
+    @classmethod
+    def canonical_collection_name(cls, name: str) -> str:
+        cleaned = (name or "").strip().lower().replace(" ", "_")
+        sanitized = "".join(ch for ch in cleaned if ch.isalnum() or ch in {"-", "_"})
+        return sanitized or "default"
+
+    @classmethod
+    def collection_name_for_tenant(cls, tenant: str, collection: str) -> str:
+        return f"{cls.normalize_tenant(tenant)}__{cls.canonical_collection_name(collection)}"
+
+
+logger = logging.getLogger(__name__)
+
+
+def _load_admin_backend() -> AdminDbProtocol:
+    for module_name in ("src.admin.db", "admin.db"):
+        try:
+            module = importlib.import_module(module_name)
+            return cast(AdminDbProtocol, module)
+        except ModuleNotFoundError:
+            continue
+    logger.warning("admin db module not found; falling back to static token checks")
+    return cast(AdminDbProtocol, _FallbackAdminDb)
+
+
+admindb = _load_admin_backend()
 
 router = APIRouter(prefix="/kb", tags=["kb"])
 

@@ -182,6 +182,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+      - /root/.streamlit
     logging:
       driver: json-file
       options:

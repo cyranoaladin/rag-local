@@ -18,6 +18,7 @@ from typing import Any, BinaryIO
 __all__ = [
     "Chunk",
     "parse_multimodal",
+    "iter_chunks",
 ]
 
 
@@ -164,6 +165,13 @@ def parse_multimodal(
             yield chunk
 
         _persist_cache(cache_root, raw_bytes, metadata["source_mtime"], emitted)
+
+
+# Legacy compatibility alias (maintains old import path expected by tests and
+# external automation). The implementation now simply delegates to
+# parse_multimodal while keeping the streaming contract unchanged.
+def iter_chunks(*args, **kwargs):
+    return parse_multimodal(*args, **kwargs)
 
 
 def _read_payload(stream: BinaryIO, timeout_s: float) -> tuple[bytes, bool]:

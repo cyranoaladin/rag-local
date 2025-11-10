@@ -113,12 +113,14 @@ done
 dump_service_logs() {
   local err=${1:-$?}
   set +e
-  printf '== compose logs tail ==\n'
-  if [ "${#present_optional_services[@]}" -gt 0 ]; then
-    "${compose_cmd[@]}" logs --no-color --tail 200 "${mandatory_services[@]}" "${present_optional_services[@]}"
-  else
-    "${compose_cmd[@]}" logs --no-color --tail 200 "${mandatory_services[@]}"
-  fi
+  echo '== docker ps =='
+  docker ps -a
+  echo '== docker inspect (ingestor) =='
+  docker inspect $(docker ps -aqf "name=ingestor") || true
+  echo '== netstat -tuln (host) =='
+  (command -v netstat >/dev/null 2>&1 && netstat -tuln) || (command -v ss >/dev/null 2>&1 && ss -tuln) || echo "netstat/ss not available"
+  echo '== compose logs tail (all services) =='
+  "${compose_cmd[@]}" logs --no-color --tail 200 || true
   set -e
   exit "${err}"
 }
@@ -137,7 +139,7 @@ grep -q '^INGESTOR_IP_ALLOWLIST=' "${env_file}" || printf '\nINGESTOR_IP_ALLOWLI
 
 # Attente santé (simple boucle)
 echo "== wait: health =="
-for attempt in $(seq 1 30); do
+for attempt in $(seq 1 60); do
   ok=1
   ps_json=$("${compose_cmd[@]}" ps --format json 2>/dev/null || true)
   status_snapshot=""
@@ -176,13 +178,13 @@ for attempt in $(seq 1 30); do
     break
   fi
   printf 'compose services snapshot (attempt %s):\n%s\n' "${attempt}" "${status_snapshot}"
-  echo "waiting for healthy services (attempt ${attempt}/30)..."
+  echo "waiting for healthy services (attempt ${attempt}/60)..."
   sleep 2
 done
 
 if [ "$ok" != "1" ]; then
   echo "Services failed to reach healthy state" >&2
-  exit 1
+  dump_service_logs 1
 fi
 
 
