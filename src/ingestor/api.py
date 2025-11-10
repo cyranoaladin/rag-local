@@ -1,5 +1,4 @@
-# Fichier: /srv/rag/ingestor/api.py
-# Fichier: /srv/rag/ingestor/api.py
+
 from __future__ import annotations
 
 import hashlib
@@ -9,11 +8,37 @@ import ipaddress
 import logging
 import mimetypes
 import os
+import socket
+import sys
+import tempfile
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, Literal, cast
+from urllib.parse import urlparse
+
+import chromadb
 import requests
+from bs4 import BeautifulSoup
+from chromadb.config import Settings
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from langchain.document_loaders import GoogleDriveLoader, PyPDFLoader
+from langchain.embeddings.ollama import OllamaEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from prometheus_client import CONTENT_TYPE_LATEST
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-_admin_api_module = importlib.import_module("admin_api")
-admin_api = _admin_api_module
+if TYPE_CHECKING:
+    from langchain.schema import Document
+else:
+    try:
+        from langchain.schema import Document
+    except ImportError:
+        Document = Any  # fallback for type checking
 
+# --- Metrics module loader ---
 def _load_metrics_module() -> ModuleType:
     module_name = "src.ingestor.metrics"
     existing = sys.modules.get(module_name)
@@ -64,14 +89,6 @@ INGEST_RESULT = ingest_metrics.INGEST_RESULT
 ingest_requests_total = ingest_metrics.ingest_requests_total
 
 logger = logging.getLogger(__name__)
-
-
-
-
-app = FastAPI(title="RAG Ingestor API")
-app.include_router(admin_api.router)
-
-...
 
 try:
     from .mm_adapter import Chunk, parse_multimodal
@@ -85,59 +102,6 @@ except ImportError:  # pragma: no cover - Docker execution path
     _admin_api_module = importlib.import_module("admin_api")
 
 admin_api = _admin_api_module
-
-
-def _load_metrics_module() -> ModuleType:
-    module_name = "src.ingestor.metrics"
-    existing = sys.modules.get(module_name)
-    if isinstance(existing, ModuleType):
-        return existing
-    spec = importlib.util.spec_from_file_location(
-        module_name,
-        Path(__file__).with_name("metrics.py"),
-    )
-    if spec and spec.loader:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[module_name] = module
-        spec.loader.exec_module(module)
-        return module
-    raise ImportError("Unable to load metrics module")
-
-
-ingest_metrics: ModuleType = _load_metrics_module()
-
-# --- Configuration ---
-CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
-CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-COLLECTION_NAME = "ressources_pedagogiques_terminale"
-CHROMA_REQUEST_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", "30"))
-OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "30"))
-MAX_REMOTE_BYTES = int(os.getenv("MAX_REMOTE_BYTES", str(10 * 1024 * 1024)))
-LOCAL_SOURCE_ROOT = Path(
-    os.getenv("LOCAL_SOURCE_ROOT", "/data/uploads")).resolve()
-ALLOW_UNRESTRICTED_LOCAL = os.getenv(
-    "ALLOW_UNRESTRICTED_LOCAL", "false").lower() == "true"
-URL_SCHEMES_ALLOWED = {"http", "https"}
-
-INGEST_CHUNK_SIZE = int(os.getenv("INGEST_CHUNK_SIZE", "1000"))
-INGEST_CHUNK_OVERLAP = int(os.getenv("INGEST_CHUNK_OVERLAP", "150"))
-METRICS_ENABLED = ingest_metrics.METRICS_ENABLED
-MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "false").lower() == "true"
-MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
-MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
-MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
-GOOGLE_DRIVE_TOKEN_PATH = os.getenv("GOOGLE_DRIVE_TOKEN_PATH", "/tmp/google-drive-token.json")
-
-# Keep metrics isolated per module import to avoid duplicate registration in tests.
-METRIC_REGISTRY = ingest_metrics.REGISTRY
-REQUEST_COUNT = ingest_metrics.REQUEST_COUNT
-REQUEST_LATENCY = ingest_metrics.REQUEST_LATENCY
-INGEST_RESULT = ingest_metrics.INGEST_RESULT
-ingest_requests_total = ingest_metrics.ingest_requests_total
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -298,6 +262,7 @@ def get_chroma_client() -> Any:
 
 
 def _load_docx_basic(file_path: str) -> list[Document]:
+    import docx
     try:
         d = docx.Document(file_path)
     except Exception as e:

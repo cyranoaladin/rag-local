@@ -19,101 +19,105 @@ PYTEST := $(PY) -m pytest
     compose-test-up compose-test-down print-tools dev compose-up compose-down compose-restart
 
 help:
-    @echo "Targets : venv | install-dev | lint | typecheck | test | test-integration | smoke | obs-up | obs-smoke | obs-down | obs-restart | obs-status | compose-test-up | compose-test-down | print-tools | dev | compose-up | compose-down | compose-restart"
+	@echo "Targets : venv | install-dev | lint | typecheck | test | test-integration | smoke | obs-up | obs-smoke | obs-down | obs-restart | obs-status | compose-test-up | compose-test-down | print-tools | dev | compose-up | compose-down | compose-restart"
 
 # Cree le venv si absent et met pip a jour
+
 venv:
-    @if [ ! -x "$(PY_VENV)" ]; then \
-      echo "-> create venv in $(VENVDIR)"; \
-      $(PY_SYS) -m venv "$(VENVDIR)"; \
-      "$(PY_VENV)" -m pip install -U pip; \
-    fi
+	@if [ ! -x "$(PY_VENV)" ]; then \
+		echo "-> create venv in $(VENVDIR)"; \
+		$(PY_SYS) -m venv "$(VENVDIR)"; \
+		"$(PY_VENV)" -m pip install -U pip; \
+	fi
 
 # Installe dependances runtime + dev si dispo
 install-dev: venv
-    @if [ -f requirements.txt ]; then "$(PY)" -m pip install -r requirements.txt; fi
-    @if [ -f requirements-dev.txt ]; then "$(PY)" -m pip install -r requirements-dev.txt; fi
-    # Fallback minimal si requirements-dev.txt est absent/incomplet
-    @for mod in ruff mypy pytest; do \
-      $(PY) -c "import importlib; importlib.import_module('$$mod')" >/dev/null 2>&1 || $(PY) -m pip install $$mod; \
-    done
+	@if [ -f requirements.txt ]; then "$(PY)" -m pip install -r requirements.txt; fi
+	@if [ -f requirements-dev.txt ]; then "$(PY)" -m pip install -r requirements-dev.txt; fi
+	# Fallback minimal si requirements-dev.txt est absent/incomplet
+	@for mod in ruff mypy pytest; do \
+		$(PY) -c "import importlib; importlib.import_module('$$mod')" >/dev/null 2>&1 || $(PY) -m pip install $$mod; \
+	done
 
 lint: install-dev
-    $(RUFF) check .
+	$(RUFF) check .
 
 typecheck: install-dev
-    $(MYPY) src
+	$(MYPY) src
 
 test: install-dev
-    $(PYTEST) -q
+	$(PYTEST) -q
 
 test-integration: install-dev
-    $(PYTEST) tests/integration -q
+	$(PYTEST) tests/integration -q
 
 # Smoke RAG deja present (si votre repo inclut infra/scripts/smoke.sh)
 smoke:
-    @if [ -x infra/scripts/smoke.sh ]; then bash infra/scripts/smoke.sh; else echo "No infra/scripts/smoke.sh"; fi
+	@if [ -x infra/scripts/smoke.sh ]; then bash infra/scripts/smoke.sh; else echo "No infra/scripts/smoke.sh"; fi
 
 # Observabilite (nomenclature compatible avec vos derniers commits)
 # Utilise les profils Compose db,llm,api,obs + env file s'il existe
 obs-up:
-    @ENV_FILE="infra/.env"; [ -f infra/.env.ci ] && ENV_FILE="infra/.env.ci"; \
-    echo "-> env: $$ENV_FILE"; \
-    COMPOSE_PROFILES=db,llm,api,obs docker compose \
-      -f infra/docker-compose.yml \
-      -f infra/docker-compose.obs.yml \
-      -f infra/docker-compose.obs.override.yml \
-      --env-file "$$ENV_FILE" \
-      up -d --remove-orphans
+	@ENV_FILE="infra/.env"; [ -f infra/.env.ci ] && ENV_FILE="infra/.env.ci"; \
+	echo "-> env: $$ENV_FILE"; \
+	COMPOSE_PROFILES=db,llm,api,obs docker compose \
+	  -f infra/docker-compose.yml \
+	  -f infra/docker-compose.obs.yml \
+	  -f infra/docker-compose.obs.override.yml \
+	  --env-file "$$ENV_FILE" \
+	  up -d --remove-orphans
 
 obs-down:
-    @ENV_FILE="infra/.env"; [ -f infra/.env.ci ] && ENV_FILE="infra/.env.ci"; \
-    COMPOSE_PROFILES=db,llm,api,obs docker compose \
-      -f infra/docker-compose.yml \
-      -f infra/docker-compose.obs.yml \
-      -f infra/docker-compose.obs.override.yml \
-      --env-file "$$ENV_FILE" \
-      down --remove-orphans
+	@ENV_FILE="infra/.env"; [ -f infra/.env.ci ] && ENV_FILE="infra/.env.ci"; \
+	COMPOSE_PROFILES=db,llm,api,obs docker compose \
+	  -f infra/docker-compose.yml \
+	  -f infra/docker-compose.obs.yml \
+	  -f infra/docker-compose.obs.override.yml \
+	  --env-file "$$ENV_FILE" \
+	  down --remove-orphans
 
 obs-restart: obs-down obs-up
 
+
 obs-status:
-    @docker compose -f infra/docker-compose.yml ps || true
+	@docker compose -f infra/docker-compose.yml ps || true
 
 obs-smoke:
-    @if [ -x infra/scripts/obs_smoke.sh ]; then bash infra/scripts/obs_smoke.sh; \
-        else \
-            echo "No infra/scripts/obs_smoke.sh"; \
-        fi
+	@if [ -x infra/scripts/obs_smoke.sh ]; then bash infra/scripts/obs_smoke.sh; \
+		else \
+			echo "No infra/scripts/obs_smoke.sh"; \
+		fi
 
 obs-quickcheck:
-    @if [ -x infra/scripts/metrics_quickcheck.sh ]; then \
-        PROM_URL=$${PROM_URL:-http://127.0.0.1:19090} \
-        TARGET_URL=$${TARGET_URL:-http://127.0.0.1:18001/metrics} \
-        bash infra/scripts/metrics_quickcheck.sh; \
-    else \
-        echo "infra/scripts/metrics_quickcheck.sh manquant (non bloquant)"; \
-    fi
+	@if [ -x infra/scripts/metrics_quickcheck.sh ]; then \
+		PROM_URL=$${PROM_URL:-http://127.0.0.1:19090} \
+		TARGET_URL=$${TARGET_URL:-http://127.0.0.1:18001/metrics} \
+		bash infra/scripts/metrics_quickcheck.sh; \
+	else \
+		echo "infra/scripts/metrics_quickcheck.sh manquant (non bloquant)"; \
+	fi
 
 compose-test-up:
-    @docker compose -f infra/docker-compose.test.yml up -d --remove-orphans
-
-compose-test-down:
-    @docker compose -f infra/docker-compose.test.yml down --remove-orphans
-
-print-tools:
-    @echo "PY         = $(PY)"
-    @$(PY) -c "import shutil; print('RUFF path  = ' + (shutil.which('ruff') or '(module)'))"
-    @$(PY) -c "import shutil; print('MYPY path  = ' + (shutil.which('mypy') or '(module)'))"
-    @$(PY) -c "import shutil; print('PYTEST path= ' + (shutil.which('pytest') or '(module)'))"
+	@docker compose -f infra/docker-compose.test.yml up -d --remove-orphans
 
 dev:
-    python -V && pip -V
+
+compose-test-down:
+	@docker compose -f infra/docker-compose.test.yml down --remove-orphans
+
+print-tools:
+	@echo "PY         = $(PY)"
+	@$(PY) -c "import shutil; print('RUFF path  = ' + (shutil.which('ruff') or '(module)'))"
+	@$(PY) -c "import shutil; print('MYPY path  = ' + (shutil.which('mypy') or '(module)'))"
+	@$(PY) -c "import shutil; print('PYTEST path= ' + (shutil.which('pytest') or '(module)'))"
+
+dev:
+	python -V && pip -V
 
 compose-up:
-    docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
+	docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
 
 compose-down:
-    docker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
+	docker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
 
 compose-restart: compose-down compose-up
