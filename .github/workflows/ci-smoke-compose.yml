@@ -1,10 +1,10 @@
-<!--
-Ce workflow appelle le script infra/scripts/smoke.sh qui :
-- Attend jusqu'à 2 minutes que tous les services soient healthy (60 tentatives)
-- Affiche automatiquement tous les logs, l'état réseau, docker ps, inspect, etc. en cas d'échec
-- Permet un diagnostic immédiat en cas de problème CI
-Voir CI_ROBUSTESSE.md pour plus de détails.
--->
+#
+# Ce workflow appelle le script infra/scripts/smoke.sh qui :
+# - Attend jusqu'à 2 minutes que tous les services soient healthy (60 tentatives)
+# - Affiche automatiquement tous les logs, l'état réseau, docker ps, inspect, etc. en cas d'échec
+# - Permet un diagnostic immédiat en cas de problème CI
+# Voir CI_ROBUSTESSE.md pour plus de détails.
+
 name: CI Smoke (Compose)
 
 'on':
