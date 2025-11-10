@@ -12,6 +12,7 @@ from chromadb.utils import embedding_functions
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
+
 class AdminDbProtocol(Protocol):
     def normalize_tenant(self, candidate: str | None) -> str: ...
     def api_key_get_by_token(self, token: str, tenant: str) -> dict[str, Any] | None: ...

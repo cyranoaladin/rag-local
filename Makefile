@@ -82,7 +82,9 @@ obs-status:
 
 obs-smoke:
     @if [ -x infra/scripts/obs_smoke.sh ]; then bash infra/scripts/obs_smoke.sh; \
-    else echo "No infra/scripts/obs_smoke.sh"; fi
+        else \
+            echo "No infra/scripts/obs_smoke.sh"; \
+        fi
 
 obs-quickcheck:
     @if [ -x infra/scripts/metrics_quickcheck.sh ]; then \
