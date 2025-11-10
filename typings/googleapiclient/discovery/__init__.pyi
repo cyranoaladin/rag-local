@@ -1,0 +1,3 @@
+from typing import Any
+
+def build(serviceName: str, version: str, *, credentials: Any | None = ..., **kwargs: Any) -> Any: ...

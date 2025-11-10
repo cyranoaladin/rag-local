@@ -1,0 +1,6 @@
+services:
+  n8n:
+    # Cette section ne s applique QUE si le service n8n existe dans le compose principal.
+    # Pas de ports publiés par défaut en production ; activer uniquement avec --profile n8n.
+    profiles: ["n8n"]
+    ports: []

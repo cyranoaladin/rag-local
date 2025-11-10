@@ -106,3 +106,18 @@ print-tools:
 	@$(PY) -c "import shutil; print('RUFF path  = ' + (shutil.which('ruff') or '(module)'))"
 	@$(PY) -c "import shutil; print('MYPY path  = ' + (shutil.which('mypy') or '(module)'))"
 	@$(PY) -c "import shutil; print('PYTEST path= ' + (shutil.which('pytest') or '(module)'))"
+
+.PHONY: dev compose-up compose-down compose-restart smoke
+dev:
+\tpython -V && pip -V
+
+compose-up:
+\tdocker compose -f infra/docker-compose.yml --env-file infra/.env up -d
+
+compose-down:
+\tdocker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
+
+compose-restart: compose-down compose-up
+
+smoke:
+\tbash infra/scripts/smoke.sh
