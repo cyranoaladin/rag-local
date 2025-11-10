@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import ipaddress
 import logging
@@ -38,6 +39,13 @@ try:
 except ImportError:
     # Allow running when the module is executed as a top-level script (e.g. inside Docker).
     from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
+
+try:
+    from . import admin_api as _admin_api_module
+except ImportError:  # pragma: no cover - Docker execution path
+    _admin_api_module = importlib.import_module("admin_api")
+
+admin_api = _admin_api_module
 
 
 def _load_metrics_module() -> ModuleType:
@@ -81,6 +89,7 @@ MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "false").lower() == "true"
 MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
 MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
 MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
+GOOGLE_DRIVE_TOKEN_PATH = os.getenv("GOOGLE_DRIVE_TOKEN_PATH", "/tmp/google-drive-token.json")
 
 # Keep metrics isolated per module import to avoid duplicate registration in tests.
 METRIC_REGISTRY = ingest_metrics.REGISTRY
@@ -100,11 +109,13 @@ class PreparedBatch:
     modality: str
 
 app = FastAPI(title="RAG Ingestor API")
+app.include_router(admin_api.router)
 
 
 @app.middleware("http")
 async def _metrics_middleware(request, call_next):
     start = time.perf_counter()
+    code = 500
     try:
         response = await call_next(request)
         code = getattr(response, "status_code", 500)
@@ -456,7 +467,50 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
     if req.source_type == "url":
         return load_from_url(req.source)
     if req.source_type == "gdrive_folder":
-        loader = GoogleDriveLoader(folder_id=req.source, recursive=True)
+        loader_kwargs: dict[str, Any] = {"folder_id": req.source, "recursive": True}
+        service_account_raw = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if service_account_raw:
+            service_account_path = Path(service_account_raw)
+            if not service_account_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Configuration Google Drive invalide: le fichier de clé de service "
+                        "spécifié par GOOGLE_APPLICATION_CREDENTIALS est introuvable."
+                    ),
+                )
+            loader_kwargs["service_account_key"] = service_account_path
+            loader_kwargs["credentials_path"] = service_account_path
+        else:
+            default_credentials = Path.home() / ".credentials" / "credentials.json"
+            if default_credentials.exists():
+                loader_kwargs["credentials_path"] = default_credentials
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Identification Google Drive manquante: définissez GOOGLE_APPLICATION_CREDENTIALS "
+                        "ou placez un credentials.json valide dans ~/.credentials/."
+                    ),
+                )
+
+        token_path = Path(GOOGLE_DRIVE_TOKEN_PATH)
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:  # pragma: no cover - defensive guard
+            raise HTTPException(
+                status_code=500,
+                detail=f"Impossible de préparer le répertoire du token Google Drive: {exc}",
+            ) from exc
+        loader_kwargs["token_path"] = token_path
+
+        try:
+            loader = GoogleDriveLoader(**loader_kwargs)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Configuration Google Drive invalide: {exc}",
+            ) from exc
         return loader.load()
     if req.source_type == "pdf":
         path = _resolve_local_path(req.source)
@@ -488,12 +542,16 @@ def _prepare_chunks_for_chroma(
     documents: list[str] = []
     metadatas: list[dict[str, str]] = []
     modality = "text"
+    seen_ids: set[str] = set()
 
     for chunk in chunks:
         text = (chunk.page_content or "").strip()
         if not text:
             continue
         content_hash = get_content_hash(text)
+        if content_hash in seen_ids:
+            continue
+        seen_ids.add(content_hash)
         chunk_modality = (chunk.metadata or {}).get("modality", "text")
         metadata = {
             "sha256": content_hash,
@@ -520,6 +578,7 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
     documents: list[str] = []
     metadatas: list[dict[str, str]] = []
     modality_counts: dict[str, int] = {}
+    seen_ids: set[str] = set()
 
     for chunk in chunks:
         text = chunk.as_text() if hasattr(chunk, "as_text") else (chunk.text or "")
@@ -527,6 +586,9 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
         if not text:
             continue
         content_hash = get_content_hash(text)
+        if content_hash in seen_ids:
+            continue
+        seen_ids.add(content_hash)
         chunk_modality = (chunk.modality or "unknown").strip().lower() or "unknown"
         metadata: dict[str, Any] = {
             "sha256": content_hash,
