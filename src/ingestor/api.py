@@ -6,6 +6,7 @@ import importlib
 import importlib.util
 import ipaddress
 import logging
+import importlib
 import mimetypes
 import os
 import socket
@@ -23,9 +24,9 @@ import chromadb
 import docx
 import requests
 from bs4 import BeautifulSoup
-from chromadb.config import Settings
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response
+def test_placeholder_multimodal_present():
+    m = importlib.import_module("src.ingestor.mm_adapter")
+    assert hasattr(m, "iter_chunks")
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_core.documents import Document
