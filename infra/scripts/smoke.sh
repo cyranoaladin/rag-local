@@ -41,6 +41,30 @@ fi
 
 [ -f "${env_file}" ] || touch "${env_file}"
 
+read_env_value() {
+  local key="$1"
+  local line value
+  line=$(grep -E "^${key}=" "${env_file}" 2>/dev/null | tail -n 1 || true)
+  if [ -n "${line}" ]; then
+    value=${line#${key}=}
+    value=${value%$'\r'}
+    printf '%s' "${value}"
+  fi
+}
+
+ingest_header=${INGEST_AUTH_HEADER:-$(read_env_value "INGEST_AUTH_HEADER")}
+ingest_header=${ingest_header:-X-API-Token}
+ingest_token=${INGESTOR_API_TOKEN:-$(read_env_value "INGESTOR_API_TOKEN")}
+[ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_API_TOKEN")
+[ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_AUTH_TOKEN")
+[ -n "${ingest_token}" ] || ingest_token="devtoken"
+
+declare -a ingest_auth_headers
+ingest_auth_headers=(-H "X-API-Token: ${ingest_token}")
+if [ "${ingest_header}" != "X-API-Token" ]; then
+  ingest_auth_headers+=(-H "${ingest_header}: ${ingest_token}")
+fi
+
 # Compose helper (order-sensitive flags), reused throughout the script.
 # Compose CLI already reads COMPOSE_PROFILES from env; keeping flags minimal avoids "no service selected" edge cases in CI.
 compose_cmd=(docker compose)
@@ -161,8 +185,31 @@ if [ "$ok" != "1" ]; then
   exit 1
 fi
 
-# Checks côté hôte
-curl -fsS http://127.0.0.1:18001/health -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" -o /dev/null && echo "ingestor: OK"
+
+# Robust health check for ingestor (host-side)
+echo "== host health check: ingestor =="
+health_ok=0
+for attempt in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:18001/health "${ingest_auth_headers[@]}" -o /dev/null; then
+    echo "ingestor: OK (attempt ${attempt})"
+    health_ok=1
+    break
+  else
+    echo "waiting for ingestor health endpoint (attempt ${attempt}/30)..."
+    sleep 2
+  fi
+done
+
+if [ "$health_ok" != "1" ]; then
+  echo "ERROR: ingestor health endpoint not reachable after retries" >&2
+  echo "== docker ps =="
+  docker ps
+  echo "== netstat -tuln (host) =="
+  (command -v netstat >/dev/null 2>&1 && netstat -tuln) || echo "netstat not available"
+  echo "== compose logs (ingestor) =="
+  "${compose_cmd[@]}" logs --no-color --tail 100 ingestor || true
+  exit 1
+fi
 
 embed_model=${EMBED_MODEL:-nomic-embed-text}
 echo "== ensure embedding model: ${embed_model} =="
@@ -175,7 +222,7 @@ fi
 
 # Ingestion smoke
 ingest_raw=$(curl -sS -X POST "http://127.0.0.1:18001/ingest" \
-  -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" \
+  "${ingest_auth_headers[@]}" \
   -H "Content-Type: application/json" \
   -d '{"source_type":"url","source":"https://example.com","hints":{"env":"smoke"}}' \
   -w '\n%{http_code}' 2>&1) || dump_service_logs $?
