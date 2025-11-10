@@ -1,110 +1,144 @@
-# RAG – Export (pour GitHub)
-[![CI](https://github.com/cyranoaladin/rag-local/actions/workflows/ci.yml/badge.svg)](https://github.com/cyranoaladin/rag-local/actions/workflows/ci.yml)
-- `infra/` : docker-compose, .env.example (sanitisé), vhosts Nginx
-- `n8n/`   : workflows JSON, snapshot DB sqlite, webhooks dump
-- `src/ingestor/` : FastAPI (si extrait)
-- `src/ui/`       : Streamlit (si extrait)
-- `ollama-tags.json`, `chroma-heartbeat.http`
+docker compose -f infra/docker-compose.yml --env-file infra/.env up -d --remove-orphans
+docker compose logs --tail 200   # optionnel, suivi des journaux
+bash infra/scripts/smoke.sh  # health + ingestion factice
+docker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
+grep -q '^COMPOSE_PROFILES=' infra/.env || cp infra/.env.example infra/.env
+make nginx-up
+docker compose -f infra/docker-compose.yml --env-file infra/.env ps web || true
+make nginx-smoke
+make nginx-reload
+make nginx-down
 
-### Démarrer en local (dev)
+# rag-local — Documentation complète
+
+**Auteur : Alaeddine BEN RHOUMA**
+
+---
+
+## Présentation générale
+
+`rag-local` est une solution RAG (Retrieval-Augmented Generation) 100% locale, conçue pour fonctionner sur un VPS sans GPU, avec une architecture modulaire : ingestion de ressources (web, fichiers, GDrive), indexation vectorielle (ChromaDB), embeddings et LLM locaux (Ollama), UI de recherche (Streamlit), orchestrations (n8n, optionnel), et observabilité Prometheus. Le tout est orchestré par Docker Compose, sécurisé par Nginx, et prêt pour la production.
+
+**Objectifs** :
+- Zéro dépendance cloud/LLM externe
+- RAM et CPU maîtrisés (VPS-friendly)
+- Sécurité (auth, allowlist, reverse proxy)
+- Observabilité et CI/CD robustes
+
+---
+
+## Architecture détaillée
+
+```
+[n8n/UI] --HTTP--> [Ingestor FastAPI] --RPC--> [Ollama Embeddings]
+												  \--REST--> [ChromaDB]
+															\--> [Streamlit UI]
+```
+
+- **Ingestor** (FastAPI) : endpoint `/ingest` (URL, fichiers, GDrive), `/health`, `/metrics` (Prometheus)
+- **ChromaDB** : stockage vectoriel, collection unique
+- **Ollama** : embeddings (`nomic-embed-text`), LLM (`llama3.2`)
+- **UI** (Streamlit) : recherche sémantique, top-k borné, métadonnées
+- **n8n** (optionnel) : automatisations, webhooks, planifications
+- **Nginx** : reverse proxy, TLS, headers sécurité
+- **Prometheus** (optionnel) : observabilité, alertes
+
+Voir `docs/dossier-technique-exhaustif.md` et `SPEC.md` pour tous les détails (API, variables, sécurité, flux, profils Compose).
+
+---
+
+## Installation et usage local (développement)
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements-dev.txt
-
+pip install -r requirements-dev.txt
 cp infra/.env.example infra/.env
-# Adapter au besoin : INGESTOR_API_TOKEN, ports loopback, modèles Ollama…
-
+# Adapter les variables (tokens, ports, modèles Ollama…)
 docker compose -f infra/docker-compose.yml --env-file infra/.env up -d --remove-orphans
-docker compose logs --tail 200   # optionnel, suivi des journaux
-
 bash infra/scripts/smoke.sh  # health + ingestion factice
+```
 
-# Arrêter la stack
+Qualité :
+- `make lint` (ruff)
+- `make typecheck` (mypy)
+- `make test` (pytest)
+- `make smoke` (stack + health)
+
+Arrêt :
+```bash
 docker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
 ```
 
-Outils de contrôle qualité : `make lint`, `make typecheck`, `make test`, `make test-integration`, `make smoke`.
+---
 
-### Déploiement sur un VPS (production)
+## Déploiement production (VPS)
 
-Script d'automatisation : `scripts/deploy-prod.sh`.
+1. Cloner le repo sur le VPS (`/srv/rag-local` recommandé)
+2. Copier `infra/.env.example` → `infra/.env` et renseigner toutes les variables (voir section Sécurité)
+3. Générer les secrets (voir tableau ci-dessous)
+4. Préparer les credentials GDrive si besoin (`/srv/rag/creds/gdrive-service-account.json`)
+5. Rendre les vhosts Nginx via `envsubst` et activer TLS avec certbot
+6. Lancer le déploiement :
+	```bash
+	cd /srv/rag-local
+	sudo scripts/deploy-prod.sh
+	```
 
-Prérequis avant exécution :
-- Cloner le dépôt sur le serveur dans `/srv/rag-local` (ou définir `PROJECT_ROOT`).
-- Préparer `/srv/rag/.env` à partir de `infra/.env.prod.example` et renseigner toutes les valeurs.
-- Copier la clé Google Drive dans `/srv/rag/creds/gdrive-service-account.json` (droits `600`).
-- S'assurer que `/etc/nginx/.htpasswd-n8n` contient l'empreinte BasicAuth correspondant aux valeurs de `.env`.
-- Disposer des droits root (le script vérifie `EUID=0`).
+**Secrets à générer** :
+| Nom | Longueur | Usage |
+|-----|----------|-------|
+| `INGEST_AUTH_TOKEN` | 64 hex | Auth `/ingest` |
+| `INGESTOR_API_TOKEN` | 64 hex | UI ↔ API |
+| `N8N_ENCRYPTION_KEY` | 64 hex | n8n credentials |
+| `N8N_BASIC_AUTH_PASSWORD` | 32 | n8n UI |
+| `PROMETHEUS_SCRAPE_PASSWORD` | 32 | /metrics |
 
-Déploiement :
+**Modèles Ollama** : `nomic-embed-text`, `llama3.2:3b` (précharger via `infra/scripts/ollama-preload.sh`)
 
-```bash
-cd /srv/rag-local
-sudo scripts/deploy-prod.sh
-```
+---
 
-Variables optionnelles : `TARGET_DIR` (par défaut `/srv/rag`), `BACKUP_ROOT` (`/srv/rag-backups`), `HTPASSWD_SOURCE` (copie automatique vers `/etc/nginx/.htpasswd-n8n`).
+## Sécurité et bonnes pratiques
 
-## Observability & CI
-- Endpoint Prometheus `GET /metrics` (ingestor) activé via `METRICS_ENABLED=true` (désactivé par défaut). Voir `docs/observability.md`.
-- Métriques : `ingestor_ingests_total{source,modality,status}` et histogramme `ingestor_ingest_duration_seconds` (buckets adaptés VPS).
-- Qualité locale : `make lint`, `make typecheck`, `make test`, `make test-integration` (chaque commande indépendante).
-- Pipeline GitHub Actions (`.github/workflows/ci.yml`) enchaîne lint, mypy, tests unitaires et `make test-integration` (Python 3.11) puis archive les journaux pytest.
-- Job optionnel `smoke-compose` via `workflow_dispatch` pour bâtir le profil multimodal et exécuter `infra/scripts/smoke.sh`.
+- Authentification token sur `/ingest` (header configurable)
+- Allowlist CIDR IP (prod)
+- Fichiers uploadés : whitelist MIME, racine restreinte
+- Nginx : BasicAuth, TLS, headers CSP/HSTS
+- Secrets hors VCS, droits 600 sur les credentials
+- Jamais d’exposition directe des ports Compose en production
 
-## Contrat des métriques (Prometheus)
+---
 
-Le service `ingestor` expose ses métriques via `src/ingestor/metrics.py`. Points clés :
+## Observabilité et métriques
 
-- `METRICS_ENABLED=true` active l'exposition. Hors production, passez à `false` pour désactiver totalement `GET /metrics` (retourne `404`).
-- `METRICS_NAMESPACE` permet de préfixer les compteurs (`ingestor_ingests_total`, histogramme `ingestor_ingest_duration_seconds`).
-- La batterie de tests (`tests/test_metrics_gating.py`, `tests/test_metrics.py`, `tests/test_metrics_registry_singleton.py`) garantit le contrat 200/404 et l'unicité du registre.
-- Pour l'observabilité locale : profil Compose `obs` (`make obs-up`) qui démarre Prometheus + exporter, puis `make obs-quickcheck` pour valider `GET /metrics`.
+- Endpoint Prometheus `/metrics` (ingestor) activable via `METRICS_ENABLED=true`
+- Métriques : `ingestor_ingests_total{source,modality,status}`, `ingestor_ingest_duration_seconds`
+- Profil Compose `obs` pour Prometheus local
+- Alertes PromQL recommandées (cf. `docs/observability.md`)
 
-Commandes utiles :
+---
 
-```bash
-make lint && make typecheck && make test
-COMPOSE_PROFILES=db,llm,api,obs docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env up -d --build
-curl -s http://127.0.0.1:18001/metrics | head -n 20   # enabled
-docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env stop ingestor
-METRICS_ENABLED=false docker compose -f infra/docker-compose.yml -f infra/docker-compose.obs.yml --env-file infra/.env up -d ingestor
-curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:18001/metrics  # attendu: 404
-```
+## CI/CD et qualité logicielle
 
-## Nginx (web) service
-- Service profilé: `web` (activé via `COMPOSE_PROFILES`)
-- Prod: pas d'exposition de ports (interne au réseau Docker), à exposer via reverse proxy amont
-- Dev: ports loopback dans `infra/docker-compose.dev.yml` (80 -> 18080)
-- Templates vhost: `infra/nginx/rag-ui.conf.template`, `infra/nginx/rag-n8n.conf.template` rendus dans `infra/nginx/rendered/`
+- Pipeline GitHub Actions : lint, typecheck, tests, smoke
+- Script `infra/scripts/smoke.sh` : health check, logs, auto-diagnostic en cas d’échec
+- Robustesse : tous les logs, états réseau, inspect sont dumpés en cas de fail CI
+- Tests unitaires et d’intégration couvrant sécurité, chunking, métriques, multimodal
 
-Commandes utiles:
+---
 
-```bash
-# Préparer l'env
-grep -q '^COMPOSE_PROFILES=' infra/.env || cp infra/.env.example infra/.env
 
-# Rendre et démarrer Nginx
-make nginx-up
+## FAQ et ressources complémentaires
 
-# Vérifs réseau docker + hôte
-docker compose -f infra/docker-compose.yml --env-file infra/.env ps web || true
-make nginx-smoke
+- [English README](README-EN.md)
+- [Guide de troubleshooting](TROUBLESHOOTING.md)
+- Architecture détaillée : `docs/architecture.md`, `docs/dossier-technique-exhaustif.md`
+- Spécifications API et variables : `SPEC.md`
+- Observabilité : `docs/observability.md`
+- CI/CD et robustesse : `CI_ROBUSTESSE.md`
+- Instructions Copilot : `.github/copilot-instructions.md`
 
-# Recharger la config sans redémarrer
-make nginx-reload
+---
 
-# Arrêt du seul service Nginx
-make nginx-down
-```
+## Auteur
 
-## CI/CD robustesse & auto-diagnostic
-
-Voir le fichier `CI_ROBUSTESSE.md` pour la logique complète de robustesse, d'auto-diagnostic et de debug automatique en cas d'échec CI (logs, état réseau, inspect, etc.).
-
-Pour reproduire localement :
-```bash
-bash infra/scripts/smoke.sh
-```
+Ce guide a été rédigé et maintenu par **Alaeddine BEN RHOUMA** pour garantir la compréhension, la robustesse et la maintenabilité du projet rag-local en production.
