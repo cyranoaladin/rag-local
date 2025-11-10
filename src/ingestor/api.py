@@ -10,9 +10,8 @@ import logging
 import mimetypes
 import os
 import requests
-try:
-    _admin_api_module = importlib.import_module("admin_api")
 
+_admin_api_module = importlib.import_module("admin_api")
 admin_api = _admin_api_module
 
 def _load_metrics_module() -> ModuleType:
