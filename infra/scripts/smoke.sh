@@ -53,16 +53,34 @@ read_env_value() {
 }
 
 ingest_header=${INGEST_AUTH_HEADER:-$(read_env_value "INGEST_AUTH_HEADER")}
-ingest_header=${ingest_header:-X-API-Token}
+ingest_header=${ingest_header:-Authorization}
 ingest_token=${INGESTOR_API_TOKEN:-$(read_env_value "INGESTOR_API_TOKEN")}
 [ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_API_TOKEN")
 [ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_AUTH_TOKEN")
 [ -n "${ingest_token}" ] || ingest_token="devtoken"
 
+# Force compose variable substitution to use the same token as our HTTP header
+export INGESTOR_API_TOKEN="${ingest_token}"
+
+# Map legacy header names to supported ones
+header_normalized="${ingest_header}"
+case "$(printf '%s' "${ingest_header}" | tr '[:upper:]' '[:lower:]')" in
+  x-ingest-token|x-ingestor-token)
+    header_normalized="X-API-Token"
+    ;;
+  authorization)
+    header_normalized="Authorization"
+    ;;
+  *)
+    : # leave as-is
+    ;;
+ esac
+
 declare -a ingest_auth_headers
-ingest_auth_headers=(-H "X-API-Token: ${ingest_token}")
-if [ "${ingest_header}" != "X-API-Token" ]; then
-  ingest_auth_headers+=(-H "${ingest_header}: ${ingest_token}")
+if [ "${header_normalized}" = "Authorization" ]; then
+  ingest_auth_headers=(-H "Authorization: Bearer ${ingest_token}")
+else
+  ingest_auth_headers=(-H "${header_normalized}: ${ingest_token}")
 fi
 
 # Compose helper (order-sensitive flags), reused throughout the script.

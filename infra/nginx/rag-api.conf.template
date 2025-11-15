@@ -1,0 +1,42 @@
+# API reverse proxy with TLS and local-only /metrics
+server {
+  listen 80;
+  server_name ${RAG_API_EXTERNAL_DOMAIN};
+  location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }
+  location / { return 301 https://$host$request_uri; }
+}
+
+server {
+  listen 443 ssl http2;
+  server_name ${RAG_API_EXTERNAL_DOMAIN};
+
+  ssl_certificate /etc/letsencrypt/live/${RAG_API_EXTERNAL_DOMAIN}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${RAG_API_EXTERNAL_DOMAIN}/privkey.pem;
+  include /etc/letsencrypt/options-ssl-nginx.conf;
+  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+  client_max_body_size 100m;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header Referrer-Policy "no-referrer" always;
+  add_header X-Frame-Options "SAMEORIGIN" always;
+  add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+
+  location /metrics {
+    allow 127.0.0.1;
+    deny all;
+    proxy_pass http://127.0.0.1:${NGINX_API_PORT}/metrics;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+  }
+
+  location / {
+    proxy_pass http://127.0.0.1:${NGINX_API_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_read_timeout 300s;
+  }
+}

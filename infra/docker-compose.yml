@@ -5,7 +5,6 @@ networks:
 volumes:
   rag_chroma_data:
   rag_ollama_data:
-  rag_n8n_data:
   rag_mm_cache:
 
 services:
@@ -125,44 +124,6 @@ services:
           cpus: "2.0"
           memory: 8G
 
-  n8n:
-    image: docker.n8n.io/n8nio/n8n:stable
-    restart: unless-stopped
-    networks: [rag_net]
-    environment:
-      - GENERIC_TIMEZONE=${TZ}
-      - N8N_PROTOCOL=https
-      - N8N_HOST=${N8N_EXTERNAL_DOMAIN}
-      - WEBHOOK_URL=https://${N8N_EXTERNAL_DOMAIN}/
-      - N8N_PROXY_HOPS=1
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
-      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
-      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-      - N8N_DIAGNOSTICS_ENABLED=false
-      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
-      - N8N_HIRING_BANNER_ENABLED=false
-      - N8N_PERSONALIZATION_ENABLED=false
-      - N8N_FLAGS_METRICS=false
-      - N8N_PUBLIC_API_DISABLED=true
-      - N8N_TELEMETRY=false
-    volumes:
-      - rag_n8n_data:/home/node/.n8n
-    healthcheck:
-      test: ["CMD","sh","-ec","wget -q --spider http://127.0.0.1:${N8N_PORT}/healthz"]
-      start_period: 30s
-      interval: 20s
-      timeout: 5s
-      retries: 10
-    depends_on:
-      ingestor:
-        condition: service_healthy
-    profiles: ["automations"]
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "5"
 
   ui:
     build: ../src/ui
@@ -206,23 +167,3 @@ services:
           cpus: "1.0"
           memory: 2G
 
-  web:
-    image: nginx:1.27-alpine
-    restart: unless-stopped
-    profiles: ["web"]
-    depends_on:
-      ui:
-        condition: service_started
-      n8n:
-        condition: service_started
-    networks: [rag_net]
-    # No ports here → prod stays internal; expose only via dev override or a reverse proxy
-    volumes:
-      - ./nginx/rendered:/etc/nginx/conf.d:ro
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
-    healthcheck:
-      test: ["CMD-SHELL", "nginx -t && wget -qO- http://127.0.0.1/ >/dev/null"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-      start_period: 10s

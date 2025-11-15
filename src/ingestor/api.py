@@ -239,7 +239,16 @@ def _enforce_security(request: Any, _req: Any) -> None:
     headers = getattr(request, "headers", {}) or {}
     token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
     if token_env:
+        # Try X-API-Token first, then Authorization (Bearer or raw)
         header_token = headers.get("X-API-Token") or headers.get("x-api-token")
+        if not header_token:
+            auth = headers.get("Authorization") or headers.get("authorization")
+            if isinstance(auth, str) and auth.strip():
+                value = auth.strip()
+                if value.lower().startswith("bearer "):
+                    header_token = value.split(" ", 1)[1].strip()
+                else:
+                    header_token = value
         if header_token != token_env:
             raise HTTPException(status_code=401, detail="Unauthorized")
 

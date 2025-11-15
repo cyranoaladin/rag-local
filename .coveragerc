@@ -1,0 +1,17 @@
+[run]
+branch = True
+omit =
+    src/ingestor/mm_adapter.py
+    src/ingestor/search_api.py
+    src/ingestor/metrics.py
+    src/dashboard/*
+    src/backend/*
+    src/ui/app.py
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if __name__ == .__main__.: 
+skip_covered = True
+show_missing = True
