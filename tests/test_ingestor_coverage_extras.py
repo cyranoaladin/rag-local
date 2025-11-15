@@ -352,6 +352,136 @@ def test_embedding_valueerror_non_404_causes_500(monkeypatch: pytest.MonkeyPatch
     assert r.status_code == 500
 
 
+def test_download_to_temp_skips_empty_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+
+    class Resp:
+        def __init__(self):
+            self.headers = {}
+            self.status_code = 200
+            self.encoding = "utf-8"
+        def raise_for_status(self):
+            return None
+        def iter_content(self, chunk_size=8192):  # noqa: ARG002
+            yield b""
+            yield b"abc"
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": lambda *a, **k: Resp(), "RequestException": api.requests.RequestException}))
+    p = api._download_to_temp("http://example.com/file.txt", ".txt")
+    assert p.exists()
+    try:
+        p.unlink()
+    except OSError:
+        pass
+
+
+def test_fetch_remote_text_success_with_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+
+    class Hop:
+        def __init__(self, url):
+            self.url = url
+    class R:
+        def __init__(self):
+            self.headers = {}
+            self.encoding = "utf-8"
+            self.url = "http://final"
+            self.history = [Hop("http://intermediate")]
+        def iter_content(self, chunk_size=8192):  # noqa: ARG002
+            yield b"hello"
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": lambda *a, **k: R(), "RequestException": api.requests.RequestException}))
+    final, text = api._fetch_remote_text("http://example.com")
+    assert final == "http://final" and text.strip() == "hello"
+
+
+def test_load_from_url_empty_html(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+
+    monkeypatch.setattr(api, "_fetch_remote_text", lambda url: ("http://x", "<html></html>"))
+    class FakeSoup:
+        def __init__(self, t, parser):  # noqa: ARG002
+            pass
+        def get_text(self, *a, **k):
+            return ""
+    monkeypatch.setattr(api, "BeautifulSoup", FakeSoup)
+    with pytest.raises(api.HTTPException):
+        api.load_from_url("http://x")
+
+
+def test_gdrive_service_account_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch, env={"GOOGLE_APPLICATION_CREDENTIALS": "/nope/missing.json"})
+    with pytest.raises(api.HTTPException):
+        api._load_source_documents(api.IngestRequest(source_type="gdrive_folder", source="folder"))
+
+
+def test_gdrive_default_credentials_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    api = _reload_api(monkeypatch)
+    # point HOME to a temp dir with no ~/.credentials/credentials.json
+    monkeypatch.setattr(api.Path, "home", lambda: tmp_path)
+    with pytest.raises(api.HTTPException):
+        api._load_source_documents(api.IngestRequest(source_type="gdrive_folder", source="folder"))
+
+
+def test_gdrive_loader_valueerror_wrap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    api = _reload_api(monkeypatch)
+    # Create default creds file
+    home = tmp_path / "home"
+    creds_dir = home / ".credentials"
+    creds_dir.mkdir(parents=True, exist_ok=True)
+    (creds_dir / "credentials.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(api.Path, "home", lambda: home)
+
+    class GL:
+        def __init__(self, **kwargs):  # noqa: D401, ARG002
+            raise ValueError("bad cfg")
+    monkeypatch.setattr(api, "GoogleDriveLoader", GL)
+
+    with pytest.raises(api.HTTPException):
+        api._load_source_documents(api.IngestRequest(source_type="gdrive_folder", source="folder"))
+
+
+def test_prepare_chunks_for_chroma_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+    docs = [
+        api.Document(page_content="same", metadata={"modality": "text", "k": "1"}),
+        api.Document(page_content="same", metadata={"modality": "text", "k": "2"}),
+        api.Document(page_content="other", metadata={}),
+    ]
+    req = api.IngestRequest(source_type="markdown", source="x")
+    batch = api._prepare_chunks_for_chroma(req, docs)
+    assert len(batch.ids) == 2 and batch.modality == "text"
+
+
+def test_prepare_multimodal_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+
+    class SChunk:
+        def __init__(self, text, modality, metadata=None):
+            self.text = text
+            self.modality = modality
+            self.metadata = metadata or {}
+        def as_text(self):
+            return self.text
+
+    chunks = [
+        SChunk("hello", "image", {"a": 1}),
+        SChunk("hello", "image", {"a": 1}),  # duplicate
+        SChunk("world", "text", {}),
+    ]
+    req = api.IngestRequest(source_type="markdown", source="x")
+    batch = api._prepare_multimodal_chunks(req, chunks)
+    assert len(batch.ids) == 2 and batch.modality in {"image", "text"}
+
+
 def test_load_markdown_empty_and_unreadable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     api = _reload_api(monkeypatch)
     # empty file
