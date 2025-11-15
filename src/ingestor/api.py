@@ -169,6 +169,16 @@ class IngestRequest(BaseModel):
         validation_alias=AliasChoices("hints", "metadata"),
     )
 
+
+class SearchRequest(BaseModel):
+    q: str = Field(description="Query text")
+    k: int = Field(default=6, ge=1, le=50, description="Number of results")
+    include_documents: bool = Field(default=True, description="Include full text in hits")
+    collection: str = Field(
+        default=COLLECTION_NAME,
+        description="Target collection name (defaults to main collection)",
+    )
+
 # --- Utilitaires ---
 
 
@@ -768,3 +778,66 @@ def metrics() -> Response:
         raise HTTPException(status_code=404, detail="Metrics disabled")
     body = ingest_metrics.generate_latest(METRIC_REGISTRY)
     return Response(body, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/search")
+def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
+    # AuthN/AuthZ identical to ingestion
+    _enforce_security(request, payload)
+
+    # Prepare chroma collection
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=payload.collection, metadata={"hnsw:space": "cosine"})
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
+
+    # Compute query embedding using the same provider as indexing
+    try:
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        q_vec = emb.embed_query(payload.q)
+    except ValueError as exc:
+        message = str(exc)
+        if "HTTP code: 404" in message:
+            logger.warning("Ollama embeddings endpoint returned 404 for model '%s' (search)", EMBED_MODEL)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                    "Pull the model or adjust EMBED_MODEL before retrying."
+                ),
+            ) from exc
+        logger.exception("Embedding provider raised ValueError during search")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {message}") from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure while requesting embeddings (search)")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {exc}") from exc
+
+    # Query by embedding
+    try:
+        k = max(1, min(int(payload.k), 50))
+        results = collection.query(query_embeddings=[q_vec], n_results=k)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
+
+    documents = results.get("documents", [[]])[0] if results.get("documents") else []
+    metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] if results.get("distances") else []
+
+    hits: list[dict[str, Any]] = []
+    for idx, doc_id in enumerate(ids):
+        item: dict[str, Any] = {"id": doc_id, "metadata": metadatas[idx] if idx < len(metadatas) else {}}
+        if payload.include_documents and idx < len(documents):
+            item["document"] = documents[idx]
+        if distances and idx < len(distances) and distances[idx] is not None:
+            item["score"] = distances[idx]
+        hits.append(item)
+
+    _record_ingest_outcome("search", "text", "success")  # reuse metric surface for visibility
+    return {
+        "query": payload.q,
+        "collection": payload.collection,
+        "k": k,
+        "hits": hits,
+    }
