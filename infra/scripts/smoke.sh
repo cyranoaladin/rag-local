@@ -59,6 +59,9 @@ ingest_token=${INGESTOR_API_TOKEN:-$(read_env_value "INGESTOR_API_TOKEN")}
 [ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_AUTH_TOKEN")
 [ -n "${ingest_token}" ] || ingest_token="devtoken"
 
+# Force compose variable substitution to use the same token as our HTTP header
+export INGESTOR_API_TOKEN="${ingest_token}"
+
 declare -a ingest_auth_headers
 if [ "${ingest_header}" = "Authorization" ]; then
   ingest_auth_headers=(-H "Authorization: Bearer ${ingest_token}")
