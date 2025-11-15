@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.machinery
 import socket
 import sys
 import types
@@ -214,9 +215,9 @@ def test_load_docx_partition_and_basic_fallback(monkeypatch: pytest.MonkeyPatch,
 
     subdocx.partition_docx = part_ok
     pkg.partition = sub
-    sys.modules["unstructured"] = pkg
-    sys.modules["unstructured.partition"] = sub
-    sys.modules["unstructured.partition.docx"] = subdocx
+    monkeypatch.setitem(sys.modules, "unstructured", pkg)
+    monkeypatch.setitem(sys.modules, "unstructured.partition", sub)
+    monkeypatch.setitem(sys.modules, "unstructured.partition.docx", subdocx)
 
     docs = api.load_docx(str(tmp_path / "file.docx"))
     assert docs and docs[0].page_content == "A"
@@ -225,14 +226,17 @@ def test_load_docx_partition_and_basic_fallback(monkeypatch: pytest.MonkeyPatch,
     assert docs[0].metadata.get("mime_type")
 
     # Now force partition_docx to error -> fallback to basic loader
-    class FakeDocxModule:
-        class Paragraph:
-            def __init__(self, text):
-                self.text = text
-        class Document:
-            def __init__(self, path):  # noqa: ARG002
-                self.paragraphs = [FakeDocxModule.Paragraph("L1"), FakeDocxModule.Paragraph("")]
-    sys.modules["docx"] = FakeDocxModule()
+    docx_mod = types.ModuleType("docx")
+    class _Paragraph:
+        def __init__(self, text):
+            self.text = text
+    class _Document:
+        def __init__(self, path):  # noqa: ARG002
+            self.paragraphs = [_Paragraph("L1"), _Paragraph("")]
+    setattr(docx_mod, "Paragraph", _Paragraph)
+    setattr(docx_mod, "Document", _Document)
+    docx_mod.__spec__ = importlib.machinery.ModuleSpec(name="docx", loader=None)
+    monkeypatch.setitem(sys.modules, "docx", docx_mod)
 
     def part_fail(*_a, **_k):
         raise RuntimeError("fail")
@@ -297,9 +301,9 @@ def test_load_source_documents_pdf_docx_unknown(monkeypatch: pytest.MonkeyPatch,
     docx_docs = api._load_source_documents(api.IngestRequest(source_type="docx", source=str(d)))
     assert docx_docs and docx_docs[0].page_content == "d"
 
-    # unknown
-    with pytest.raises(api.HTTPException):
-        api._load_source_documents(api.IngestRequest(source_type="unknown", source="x"))
+    # unknown source type is rejected by pydantic validation
+    with pytest.raises(Exception):
+        api.IngestRequest(source_type="unknown", source="x")
 
 
 def test_ingest_mode_unsupported_and_loader_exception(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
