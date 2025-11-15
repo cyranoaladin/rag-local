@@ -8,6 +8,7 @@ import types
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 try:
     from fastapi.testclient import TestClient
@@ -233,8 +234,8 @@ def test_load_docx_partition_and_basic_fallback(monkeypatch: pytest.MonkeyPatch,
     class _Document:
         def __init__(self, path):  # noqa: ARG002
             self.paragraphs = [_Paragraph("L1"), _Paragraph("")]
-    setattr(docx_mod, "Paragraph", _Paragraph)
-    setattr(docx_mod, "Document", _Document)
+    docx_mod.Paragraph = _Paragraph
+    docx_mod.Document = _Document
     docx_mod.__spec__ = importlib.machinery.ModuleSpec(name="docx", loader=None)
     monkeypatch.setitem(sys.modules, "docx", docx_mod)
 
@@ -302,7 +303,7 @@ def test_load_source_documents_pdf_docx_unknown(monkeypatch: pytest.MonkeyPatch,
     assert docx_docs and docx_docs[0].page_content == "d"
 
     # unknown source type is rejected by pydantic validation
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         api.IngestRequest(source_type="unknown", source="x")
 
 
