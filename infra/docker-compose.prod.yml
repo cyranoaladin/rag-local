@@ -59,6 +59,13 @@ services:
       - LOCAL_SOURCE_ROOT=/data/uploads
       - METRICS_ENABLED=${METRICS_ENABLED:-true}
       - MULTIMODAL_ENABLED=${MULTIMODAL_ENABLED:-false}
+      - INGESTOR_API_TOKEN=${INGESTOR_API_TOKEN}
+      - INGESTOR_IP_ALLOWLIST=${INGESTOR_IP_ALLOWLIST:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/creds/gdrive-sa.json
+      - GOOGLE_DRIVE_TOKEN_PATH=/tmp/google-drive-token.json
+      - CHROMA_REQUEST_TIMEOUT=${CHROMA_REQUEST_TIMEOUT:-30}
+      - OLLAMA_REQUEST_TIMEOUT=${OLLAMA_REQUEST_TIMEOUT:-60}
+      - XDG_CACHE_HOME=/tmp
     volumes:
       - ./creds:/creds:ro
       - /srv/rag-data:/data/uploads:ro

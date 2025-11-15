@@ -117,3 +117,41 @@ Voir `SPEC.md` pour l’architecture et le contrat d’API.
 ## Observability profile (internal-only)
 - Set \`METRICS_ENABLED=true\`, bring up Prometheus with \`--profile obs\`
 - /metrics is **not** exposed publicly; Prometheus scrapes the ingestor over the bridge network.
+
+---
+
+## Activer Google Drive en prod
+
+1) Préparer la clé de Service Account Google Drive (JSON) et partager le dossier/Drive cible avec l’email du service account (lecteur).
+
+2) Déposer la clé sur le VPS et activer GDrive via le script
+
+```bash path=null start=null
+# Sur votre machine
+scp ./gdrive-sa.json root@<VPS>:/opt/rag-local/gdrive-sa.json
+
+# Sur le VPS
+sudo -i
+cd /opt/rag-local
+chmod 600 /opt/rag-local/gdrive-sa.json
+./infra/scripts/enable-gdrive-prod.sh /opt/rag-local/gdrive-sa.json
+```
+
+Ce script:
+- Installe la clé en `infra/creds/gdrive-sa.json` (chmod 600)
+- Ajoute/actualise dans `infra/.env`:
+  - `GOOGLE_APPLICATION_CREDENTIALS=/creds/gdrive-sa.json`
+  - `GOOGLE_DRIVE_TOKEN_PATH=/tmp/google-drive-token.json`
+- Redémarre la stack (systemd si présent, sinon `docker compose` pour `ingestor`).
+
+3) Tester l’ingestion GDrive
+
+```bash path=null start=null
+API="https://<RAG_API_DOMAIN>"     # ex. https://rag-api.example.com
+TOKEN="<INGESTOR_API_TOKEN>"       # valeur dans /opt/rag-local/infra/.env
+FOLDER_ID="<GOOGLE_FOLDER_ID>"     # ID du dossier Google Drive
+
+curl -sS -X POST "$API/ingest" \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"source_type\":\"gdrive_folder\",\"source\":\"$FOLDER_ID\",\"hints\":{\"tag\":\"drive\"}}"
+```

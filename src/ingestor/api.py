@@ -24,7 +24,8 @@ import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from langchain.document_loaders import GoogleDriveLoader, PyPDFLoader
+from langchain_google_community import GoogleDriveLoader
+from langchain.document_loaders import PyPDFLoader
 from langchain.embeddings.ollama import OllamaEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
