@@ -382,6 +382,9 @@ def test_download_to_temp_skips_empty_chunk(monkeypatch: pytest.MonkeyPatch) -> 
 def test_fetch_remote_text_success_with_history(monkeypatch: pytest.MonkeyPatch) -> None:
     api = _reload_api(monkeypatch)
 
+    # avoid real DNS
+    monkeypatch.setattr(api, "_validate_remote_url", lambda url: None)
+
     class Hop:
         def __init__(self, url):
             self.url = url
