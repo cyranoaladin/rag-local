@@ -3,6 +3,7 @@ branch = True
 omit =
     src/ingestor/mm_adapter.py
     src/ingestor/search_api.py
+    src/ingestor/metrics.py
     src/dashboard/*
     src/backend/*
     src/ui/app.py

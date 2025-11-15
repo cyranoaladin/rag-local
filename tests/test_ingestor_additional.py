@@ -12,19 +12,22 @@ except ImportError as exc:  # pragma: no cover
     raise RuntimeError("fastapi is required for tests") from exc
 
 
-def _load_api(monkeypatch: pytest.MonkeyPatch):
+def _load_api(monkeypatch: pytest.MonkeyPatch, pre_env: dict[str, str] | None = None):
     # Ensure a clean import for api module with desired env
     module_name = "src.ingestor.api"
     for mod in list(sys.modules):
         if mod.startswith("src.ingestor"):
             sys.modules.pop(mod)
+    # set env before import so module-level constants pick them up
     monkeypatch.setenv("INGESTOR_API_TOKEN", "tok")
     monkeypatch.delenv("INGESTOR_IP_ALLOWLIST", raising=False)
+    for k, v in (pre_env or {}).items():
+        monkeypatch.setenv(k, v)
     return importlib.import_module(module_name)
 
 
-def test_admin_endpoints_cover(monkeypatch: pytest.MonkeyPatch) -> None:
-    api = _load_api(monkeypatch)
+def test_admin_endpoints_cover(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    api = _load_api(monkeypatch, pre_env={"ADMIN_UPLOAD_DIR": str(tmp_path)})
     client = TestClient(api.app)
     # /admin/health should be ok
     r = client.get("/admin/health")
@@ -50,10 +53,7 @@ def test_ingest_markdown_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     md = tmp_path / "note.md"
     md.write_text("# Title\n\nHello world!", encoding="utf-8")
 
-    api = _load_api(monkeypatch)
-
-    # Force local path resolution into our tmp file when given the same path
-    monkeypatch.setenv("LOCAL_SOURCE_ROOT", str(tmp_path))
+    api = _load_api(monkeypatch, pre_env={"LOCAL_SOURCE_ROOT": str(tmp_path)})
 
     # Fake Chroma collection and client
     added_ids: list[str] = []
