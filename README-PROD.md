@@ -64,6 +64,7 @@ echo $RAG_API_EXTERNAL_DOMAIN | xargs -I {} sudo certbot --nginx -d {} --redirec
 - Chunking par défaut 800/120 (ajustable via `INGEST_CHUNK_SIZE`, `INGEST_CHUNK_OVERLAP`).
 - Les chunks et métadonnées sont stockés dans Chroma (v2).
 - Utilitaire CLI pour cron: `scripts/ingest-cli.py` (voir `scripts/requirements-cli.txt`).
+- API externe de consultation (agents): voir `docs/kb-api.md` (`POST /search`).
 
 ## UI
 
