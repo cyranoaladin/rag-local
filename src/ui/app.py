@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -12,11 +14,12 @@ from chromadb.config import Settings
 CHROMA_HOST = os.getenv("CHROMA_HOST", "chroma")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 COLLECTION = "ressources_pedagogiques_terminale"
-N8N_DEFAULT_WEBHOOK = os.getenv("N8N_DEFAULT_WEBHOOK", "")
 WEBHOOK_TIMEOUT = float(os.getenv("UI_WEBHOOK_TIMEOUT", "10"))
 INGEST_BASE_URL = os.getenv("INGEST_API_BASE") or os.getenv("INGEST_BASE_URL", "http://ingestor:8001")
 INGEST_API_TOKEN = os.getenv("INGEST_API_TOKEN") or os.getenv("INGESTOR_API_TOKEN", "")
-INGEST_AUTH_HEADER = os.getenv("INGEST_AUTH_HEADER", "X-API-Token")
+# Default to Authorization header with Bearer prefix for production
+INGEST_AUTH_HEADER = os.getenv("INGEST_AUTH_HEADER", os.getenv("UI_INGEST_AUTH_HEADER", "Authorization"))
+UI_INGEST_AUTH_BEARER_PREFIX = (os.getenv("UI_INGEST_AUTH_BEARER_PREFIX", "true").strip().lower() in {"1", "true", "yes"})
 INGEST_TIMEOUT = float(os.getenv("UI_INGEST_TIMEOUT", os.getenv("UI_WEBHOOK_TIMEOUT", "10")))
 CHROMA_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", os.getenv("UI_CHROMA_TIMEOUT", "30")))
 UI_MAX_K = max(1, int(os.getenv("UI_MAX_K", "8")))
@@ -25,21 +28,22 @@ STREAMLIT_IMPORT_ONLY = os.getenv("STREAMLIT_IMPORT_ONLY", "0") == "1"
 
 SOURCE_TYPE_LABELS: dict[str, str] = {
     "url": "URL / Page web",
-    "gdrive_folder": "Dossier Google Drive",
+    # Google Drive désactivé pour V1
+    # "gdrive_folder": "Dossier Google Drive",
     "pdf": "PDF local",
     "docx": "Document Word (.docx)",
     "markdown": "Markdown (.md)",
-    "video": "Vidéo (mp4, YouTube, etc.)",
+    # "video": "Vidéo (mp4, YouTube, etc.)",
 }
 SOURCE_PLACEHOLDERS: dict[str, str] = {
     "url": "https://eduscol.education.fr/...",
-    "gdrive_folder": "1xABCDEFGH123456789",
+    # "gdrive_folder": "1xABCDEFGH123456789",
     "pdf": "/data/uploads/ressource.pdf",
     "docx": "/data/uploads/ressource.docx",
     "markdown": "/data/uploads/ressource.md",
-    "video": "/data/uploads/cours.mp4",
+    # "video": "/data/uploads/cours.mp4",
 }
-MULTIMODAL_ONLY_TYPES = {"video"}
+MULTIMODAL_ONLY_TYPES: set[str] = set()
 
 
 def _build_metadata_inputs(prefix: str) -> tuple[str, str, dict[str, Any]]:
@@ -104,12 +108,6 @@ def _collection_count() -> int:
     return _chromadb_collection().count()
 
 
-def _call_webhook(url: str, body: dict[str, Any]) -> requests.Response:
-    response = requests.post(url, json=body, timeout=WEBHOOK_TIMEOUT)
-    response.raise_for_status()
-    return response
-
-
 def _query_chroma(collection, query_text: str, n_results: int):
     return collection.query(query_texts=[query_text], n_results=n_results)
 
@@ -126,34 +124,15 @@ def _call_ingest_api(
     url = f"{base_url.rstrip('/')}/ingest"
     headers = {"Content-Type": "application/json"}
     if token:
-        headers[header_name] = token
+        value = token
+        if header_name.lower() == "authorization" and UI_INGEST_AUTH_BEARER_PREFIX and not token.lower().startswith("bearer "):
+            value = f"Bearer {token}"
+        headers[header_name] = value
     response = requests.post(url, params={"mode": mode}, json=payload, headers=headers, timeout=INGEST_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
 
-def _render_ingestion_form() -> None:
-    st.subheader("Ingestion orchestrée via n8n")
-    webhook_default = N8N_DEFAULT_WEBHOOK or "https://EXEMPLE.webhook.url/ingestion"
-    webhook = st.text_input("URL Webhook n8n (production)", webhook_default)
-    with st.form("ingest"):
-        source, source_type, hints = _build_metadata_inputs("webhook_")
-        if st.form_submit_button("Envoyer"):
-            if not webhook.startswith("http"):
-                st.error("URL webhook invalide")
-            else:
-                payload = {
-                    "source": source,
-                    "source_type": source_type,
-                    "hints": hints,
-                }
-                try:
-                    _call_webhook(webhook, payload)
-                    st.success("Webhook accepté par n8n (voir journaux n8n pour le détail)")
-                except requests.HTTPError as exc:
-                    st.error(f"n8n a renvoyé {exc.response.status_code}: vérifier le workflow")
-                except requests.RequestException as exc:
-                    st.error(f"Erreur réseau webhook: {exc}")
 
 
 def _render_admin_form() -> None:
@@ -168,9 +147,7 @@ def _render_admin_form() -> None:
             "Jeton API (optionnel)", INGEST_API_TOKEN, type="password", key="direct_api_token"
         )
         source_direct, source_type_direct, hints_direct = _build_metadata_inputs("direct_")
-        mode_choice = st.selectbox("Mode", ["text", "multimodal"], key="direct_mode")
-        if source_type_direct in MULTIMODAL_ONLY_TYPES and mode_choice != "multimodal":
-            st.warning("Sélectionnez le mode 'multimodal' pour traiter une vidéo.")
+        mode_choice = st.selectbox("Mode", ["text"], key="direct_mode")
         if st.form_submit_button("Ingestion directe"):
             payload_direct = {
                 "source": source_direct,
@@ -233,11 +210,7 @@ def render_app() -> None:
     st.caption("L'interface doit rester derrière un proxy authentifié (Nginx Basic Auth recommandé).")
 
     st.header("1) Lancer une ingestion")
-    tab_n8n, tab_admin = st.tabs(["Via n8n", "Administration API"])
-    with tab_n8n:
-        _render_ingestion_form()
-    with tab_admin:
-        _render_admin_form()
+    _render_admin_form()
 
     _render_collection_explorer()
 

@@ -53,16 +53,17 @@ read_env_value() {
 }
 
 ingest_header=${INGEST_AUTH_HEADER:-$(read_env_value "INGEST_AUTH_HEADER")}
-ingest_header=${ingest_header:-X-API-Token}
+ingest_header=${ingest_header:-Authorization}
 ingest_token=${INGESTOR_API_TOKEN:-$(read_env_value "INGESTOR_API_TOKEN")}
 [ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_API_TOKEN")
 [ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_AUTH_TOKEN")
 [ -n "${ingest_token}" ] || ingest_token="devtoken"
 
 declare -a ingest_auth_headers
-ingest_auth_headers=(-H "X-API-Token: ${ingest_token}")
-if [ "${ingest_header}" != "X-API-Token" ]; then
-  ingest_auth_headers+=(-H "${ingest_header}: ${ingest_token}")
+if [ "${ingest_header}" = "Authorization" ]; then
+  ingest_auth_headers=(-H "Authorization: Bearer ${ingest_token}")
+else
+  ingest_auth_headers=(-H "${ingest_header}: ${ingest_token}")
 fi
 
 # Compose helper (order-sensitive flags), reused throughout the script.

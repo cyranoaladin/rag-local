@@ -15,30 +15,7 @@ def _import_app(monkeypatch: pytest.MonkeyPatch):
     return importlib.import_module("src.ui.app")
 
 
-def test_call_webhook_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    app = _import_app(monkeypatch)
-    calls: list[tuple[str, dict[str, Any], float]] = []
-
-    class DummyResponse:
-        status_code = 204
-
-        def raise_for_status(self) -> None:
-            return None
-
-    def fake_post(url: str, json: dict[str, Any], timeout: float, **_: Any):
-        calls.append((url, json, timeout))
-        return DummyResponse()
-
-    monkeypatch.setattr(app.requests, "post", fake_post)
-
-    payload = {"source": "https://example.com", "source_type": "url"}
-    response = app._call_webhook("https://hook.local", payload)
-
-    assert isinstance(response, DummyResponse)
-    assert calls == [("https://hook.local", payload, app.WEBHOOK_TIMEOUT)]
-
-
-def test_call_ingest_api_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_call_ingest_api_success_with_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
     app = _import_app(monkeypatch)
 
     class DummyResponse:
@@ -77,7 +54,7 @@ def test_call_ingest_api_success(monkeypatch: pytest.MonkeyPatch) -> None:
     result = app._call_ingest_api(
         "http://ingestor:8001",
         "tok",
-        "X-API-Token",
+        "Authorization",
         {"source": "/data/uploads/foo.pdf", "source_type": "pdf"},
         "text",
     )
@@ -85,11 +62,11 @@ def test_call_ingest_api_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result == {"status": "ok"}
     assert captured["url"] == "http://ingestor:8001/ingest"
     assert captured["params"] == {"mode": "text"}
-    assert captured["headers"] == {"Content-Type": "application/json", "X-API-Token": "tok"}
+    assert captured["headers"] == {"Content-Type": "application/json", "Authorization": "Bearer tok"}
     assert captured["timeout"] == app.INGEST_TIMEOUT
 
 
 def test_call_ingest_api_requires_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
     app = _import_app(monkeypatch)
     with pytest.raises(ValueError):
-        app._call_ingest_api(None, None, "X-API-Token", {}, "text")
+        app._call_ingest_api(None, None, "Authorization", {}, "text")
