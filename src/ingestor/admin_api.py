@@ -8,7 +8,10 @@ import requests
 from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel, Field
 
-from . import catalog
+try:
+    from . import catalog as catalog
+except Exception:  # pragma: no cover - executed when running as top-level module
+    import catalog as catalog
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 _logger = logging.getLogger(__name__)
