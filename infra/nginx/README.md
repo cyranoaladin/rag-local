@@ -28,3 +28,7 @@ sudo certbot --nginx -d "$RAG_API_EXTERNAL_DOMAIN" --redirect
 
 Certbot ajoutera automatiquement les blocs HTTPS.
 Ajoutez `add_header Strict-Transport-Security "max-age=63072000" always;` dans les blocs HTTPS de production.
+
+Rate limiting
+- Le vhost API inclut une zone `limit_req_zone` (20 r/s, burst 40) appliquée à `/ingest` et `/search`.
+- Ajustez ces valeurs si nécessaire en éditant `infra/nginx/rag-api.conf.template` avant rendu.
