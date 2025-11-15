@@ -32,6 +32,19 @@ docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
 docker compose -f infra/docker-compose.prod.yml --env-file infra/.env --profile db --profile llm --profile api --profile ui --profile obs up -d
 ```
 
+## Service systemd (recommandé en prod)
+```bash
+# depuis la racine du dépôt déjà synchronisé sur le VPS
+export RAG_DIR=/srv/rag-local
+sudo mkdir -p "$RAG_DIR"
+sudo rsync -a --delete ./ "$RAG_DIR"/
+cd "$RAG_DIR"
+# rendre le service et l'installer
+./infra/scripts/install-systemd.sh
+# vérifier
+systemctl status rag-local.service --no-pager
+```
+
 ## Exposition HTTPS (Nginx + Certbot)
 
 - Utiliser `infra/nginx/rag-ui.conf.template` et `infra/nginx/rag-api.conf.template` avec `envsubst` pour générer les vhosts (les templates n’emploient pas `${VAR:-def}`).
