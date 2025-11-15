@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import socket
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -188,6 +189,162 @@ def test_load_from_url_pdf_branch(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     monkeypatch.setattr(api, "PyPDFLoader", FakeLoader)
     docs = api.load_from_url("http://example.com/file.pdf")
     assert docs and docs[0].page_content == "pdf"
+
+
+def test_load_docx_partition_and_basic_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    api = _reload_api(monkeypatch)
+
+    # Simulate unstructured.partition.docx.partition_docx
+    pkg = types.ModuleType("unstructured")
+    sub = types.ModuleType("unstructured.partition")
+    subdocx = types.ModuleType("unstructured.partition.docx")
+
+    class Meta:
+        def __init__(self, d):
+            self._d = d
+        def to_dict(self):
+            return self._d
+    class Elem:
+        def __init__(self, text, meta):
+            self.text = text
+            self.metadata = meta
+
+    def part_ok(filename=None, include_metadata=True):  # noqa: ARG002
+        return [Elem("A", Meta({"k": "v"})), Elem("", Meta({}))]
+
+    subdocx.partition_docx = part_ok
+    pkg.partition = sub
+    sys.modules["unstructured"] = pkg
+    sys.modules["unstructured.partition"] = sub
+    sys.modules["unstructured.partition.docx"] = subdocx
+
+    docs = api.load_docx(str(tmp_path / "file.docx"))
+    assert docs and docs[0].page_content == "A"
+    assert docs[0].metadata.get("k") == "v"
+    assert docs[0].metadata.get("source") == "file.docx"
+    assert docs[0].metadata.get("mime_type")
+
+    # Now force partition_docx to error -> fallback to basic loader
+    class FakeDocxModule:
+        class Paragraph:
+            def __init__(self, text):
+                self.text = text
+        class Document:
+            def __init__(self, path):  # noqa: ARG002
+                self.paragraphs = [FakeDocxModule.Paragraph("L1"), FakeDocxModule.Paragraph("")]
+    sys.modules["docx"] = FakeDocxModule()
+
+    def part_fail(*_a, **_k):
+        raise RuntimeError("fail")
+    subdocx.partition_docx = part_fail
+
+    docs2 = api.load_docx(str(tmp_path / "other.docx"))
+    assert docs2 and docs2[0].page_content == "L1"
+
+
+def test_fetch_remote_text_redirect_and_req_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+
+    class Hop:
+        def __init__(self, url):
+            self.url = url
+    class Resp:
+        def __init__(self, url, history):
+            self.headers = {}
+            self.encoding = "utf-8"
+            self.url = url
+            self.history = history
+        def iter_content(self, chunk_size=8192):  # noqa: ARG002
+            yield b"hi"
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    def get_bad_history(*_a, **_k):
+        return Resp("http://final", [Hop("ftp://bad")])
+
+    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": get_bad_history, "RequestException": api.requests.RequestException}))
+    with pytest.raises(api.HTTPException):
+        api._fetch_remote_text("http://example.com")
+
+    def raise_req(*_a, **_k):
+        raise api.requests.RequestException("boom")
+    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": raise_req, "RequestException": api.requests.RequestException}))
+    with pytest.raises(api.HTTPException):
+        api._fetch_remote_text("http://example.com")
+
+
+def test_load_source_documents_pdf_docx_unknown(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    api = _reload_api(monkeypatch, env={"LOCAL_SOURCE_ROOT": str(tmp_path)})
+
+    # pdf local
+    p = tmp_path / "a.pdf"
+    p.write_bytes(b"%PDF-1.4\n...")
+    class PL:
+        def __init__(self, path):  # noqa: ARG002
+            pass
+        def load(self):
+            return [api.Document(page_content="p", metadata={})]
+    monkeypatch.setattr(api, "PyPDFLoader", PL)
+    pdf_docs = api._load_source_documents(api.IngestRequest(source_type="pdf", source=str(p)))
+    assert pdf_docs and pdf_docs[0].page_content == "p"
+
+    # docx local
+    monkeypatch.setattr(api, "load_docx", lambda path: [api.Document(page_content="d", metadata={})])
+    d = tmp_path / "b.docx"
+    d.write_text("x", encoding="utf-8")
+    docx_docs = api._load_source_documents(api.IngestRequest(source_type="docx", source=str(d)))
+    assert docx_docs and docx_docs[0].page_content == "d"
+
+    # unknown
+    with pytest.raises(api.HTTPException):
+        api._load_source_documents(api.IngestRequest(source_type="unknown", source="x"))
+
+
+def test_ingest_mode_unsupported_and_loader_exception(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    api = _reload_api(monkeypatch, env={"LOCAL_SOURCE_ROOT": str(tmp_path)})
+    f = tmp_path / "c.md"
+    f.write_text("ok", encoding="utf-8")
+
+    client = TestClient(api.app)
+    r = client.post("/ingest?mode=binary", json={"source_type":"markdown","source": f.name}, headers={"Authorization":"Bearer tok"})
+    assert r.status_code == 400
+
+    # loader raises generic error -> 500 wrapper
+    monkeypatch.setattr(api, "_load_source_documents", lambda req: (_ for _ in ()).throw(RuntimeError("oops")))
+    r2 = client.post("/ingest", json={"source_type":"markdown","source": f.name}, headers={"Authorization":"Bearer tok"})
+    assert r2.status_code == 500
+
+
+def test_embedding_valueerror_non_404_causes_500(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+
+    # prepare a doc
+    monkeypatch.setattr(api, "_load_source_documents", lambda req: [api.Document(page_content="abc", metadata={"source":"u"})])
+
+    class FakeCollection:
+        def get(self, ids=None, **_):
+            return {"ids": []}
+        def add(self, **_):
+            return None
+
+    class FakeClient:
+        def get_or_create_collection(self, *_, **__):
+            return FakeCollection()
+
+    class BadEmb:
+        def __init__(self, *a, **k):
+            pass
+        def embed_documents(self, docs):
+            raise ValueError("bad")
+
+    monkeypatch.setattr(api, "get_chroma_client", lambda: FakeClient())
+    monkeypatch.setattr(api, "TimedOllamaEmbeddings", BadEmb)
+
+    client = TestClient(api.app)
+    r = client.post("/ingest", json={"source_type":"markdown","source":"x.md"}, headers={"Authorization":"Bearer tok"})
+    assert r.status_code == 500
 
 
 def test_load_markdown_empty_and_unreadable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
