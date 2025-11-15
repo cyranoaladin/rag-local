@@ -7,7 +7,6 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${RAG_DIR}
-Environment=COMPOSE_PROFILES=db,llm,api,ui,obs
 ExecStart=/usr/bin/docker compose -f infra/docker-compose.prod.yml --env-file infra/.env --profile db --profile llm --profile api --profile ui --profile obs up -d
 ExecStop=/usr/bin/docker compose -f infra/docker-compose.prod.yml --env-file infra/.env down
 TimeoutStartSec=0

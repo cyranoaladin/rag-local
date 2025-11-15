@@ -37,6 +37,12 @@ docker compose -f infra/docker-compose.prod.yml --env-file infra/.env --profile 
 # depuis la racine du dépôt déjà synchronisé sur le VPS
 export RAG_DIR=/srv/rag-local
 sudo mkdir -p "$RAG_DIR"
+
+# ⚠️ ATTENTION : la commande suivante SUPPRIMERA tout fichier dans "$RAG_DIR" qui n'existe pas dans le dossier courant.
+# Assurez-vous d'être dans la racine du dépôt (là où se trouve ce README) avant d'exécuter cette commande !
+# Optionnel : vérification automatique (décommentez pour activer)
+# [ -f "README.md" ] || { echo "Erreur : exécutez cette commande depuis la racine du dépôt (README.md introuvable)"; exit 1; }
+
 sudo rsync -a --delete ./ "$RAG_DIR"/
 cd "$RAG_DIR"
 # rendre le service et l'installer
