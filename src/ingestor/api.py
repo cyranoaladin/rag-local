@@ -25,8 +25,8 @@ from bs4 import BeautifulSoup
 from chromadb.config import Settings
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from langchain_google_community import GoogleDriveLoader
-from langchain.document_loaders import PyPDFLoader
-from langchain.embeddings.ollama import OllamaEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.embeddings import OllamaEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
@@ -492,6 +492,11 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
         return load_from_url(req.source)
     if req.source_type == "gdrive_folder":
         loader_kwargs: dict[str, Any] = {"folder_id": req.source, "recursive": True}
+        loader_kwargs["export_mime_types"] = {
+            "application/vnd.google-apps.document": "text/plain",
+            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.presentation": "text/plain",
+        }
         service_account_raw = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
         if service_account_raw:
             service_account_path = Path(service_account_raw)
@@ -535,7 +540,32 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
                 status_code=500,
                 detail=f"Configuration Google Drive invalide: {exc}",
             ) from exc
-        return loader.load()
+        docs: list[Document] = []
+        try:
+            _lazy = getattr(loader, "lazy_load", None)
+            if callable(_lazy):
+                for _d in _lazy():
+                    try:
+                        if _d and getattr(_d, "page_content", "").strip():
+                            docs.append(_d)
+                    except Exception:
+                        continue
+            else:
+                docs = loader.load()
+        except Exception as _e:
+            try:
+                docs = []
+                for _d in loader.lazy_load():
+                    try:
+                        if _d and getattr(_d, "page_content", "").strip():
+                            docs.append(_d)
+                    except Exception:
+                        continue
+            except Exception as _e2:
+                raise HTTPException(status_code=500, detail=f"Echec chargement Google Drive: {_e2}") from _e2
+        if not docs:
+            raise HTTPException(status_code=500, detail="Aucun document lisible depuis Google Drive.")
+        return docs
     if req.source_type == "pdf":
         path = _resolve_local_path(req.source)
         return PyPDFLoader(str(path)).load()
@@ -840,5 +870,101 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
         "query": payload.q,
         "collection": payload.collection,
         "k": k,
+        "hits": hits,
+    }
+
+
+class RagQueryFilters(BaseModel):
+    domain: str | None = None
+    document_id: str | None = None
+    tags: list[str] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class RagQuery(BaseModel):
+    query: str
+    filters: RagQueryFilters | None = None
+    top_k: int = Field(default=6, ge=1, le=50)
+    collection: str = Field(default=COLLECTION_NAME)
+
+
+@app.post("/rag/query")
+def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
+    # AuthN/AuthZ identical to ingestion
+    _enforce_security(request, payload)
+
+    # Prepare chroma collection
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=payload.collection, metadata={"hnsw:space": "cosine"})
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
+
+    # Compute query embedding using the same provider as indexing
+    try:
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        q_vec = emb.embed_query(payload.query)
+    except ValueError as exc:
+        message = str(exc)
+        if "HTTP code: 404" in message:
+            logger.warning("Ollama embeddings endpoint returned 404 for model '%s' (rag/query)", EMBED_MODEL)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                    "Pull the model or adjust EMBED_MODEL before retrying."
+                ),
+            ) from exc
+        logger.exception("Embedding provider raised ValueError during rag/query")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {message}") from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure while requesting embeddings (rag/query)")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {exc}") from exc
+
+    # Build metadata filters (where)
+    where: dict[str, Any] = {}
+    if payload.filters:
+        f = payload.filters
+        if f.domain:
+            where["domain"] = f.domain
+        if f.document_id:
+            where["document_id"] = f.document_id
+        if f.tags:
+            where["tags"] = {"$in": f.tags}
+        if f.metadata:
+            for k, v in (f.metadata or {}).items():
+                if v is None or v == "":
+                    continue
+                where[str(k)] = v
+
+    # Query by embedding with optional filters
+    try:
+        k = max(1, min(int(payload.top_k), 50))
+        query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": k}
+        if where:
+            query_kwargs["where"] = where
+        results = collection.query(**query_kwargs)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
+
+    documents = results.get("documents", [[]])[0] if results.get("documents") else []
+    metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] if results.get("distances") else []
+
+    hits: list[dict[str, Any]] = []
+    for idx, doc_id in enumerate(ids):
+        item: dict[str, Any] = {"id": doc_id, "metadata": metadatas[idx] if idx < len(metadatas) else {}}
+        if idx < len(documents):
+            item["document"] = documents[idx]
+        if distances and idx < len(distances) and distances[idx] is not None:
+            item["score"] = distances[idx]
+        hits.append(item)
+
+    return {
+        "query": payload.query,
+        "collection": payload.collection,
+        "k": k,
+        "filters": where,
         "hits": hits,
     }
