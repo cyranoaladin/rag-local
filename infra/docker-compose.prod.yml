@@ -5,7 +5,8 @@ networks:
 volumes:
   rag_chroma_data:
   rag_ollama_data:
-  rag_n8n_data:
+  rag_prometheus_data:
+  rag_admin_data:
 
 services:
   chroma:
@@ -30,6 +31,8 @@ services:
     networks: [rag_net]
     environment:
       - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
     volumes:
       - rag_ollama_data:/root/.ollama
     healthcheck:
@@ -54,9 +57,24 @@ services:
       - OLLAMA_URL=http://ollama:${OLLAMA_PORT}
       - EMBED_MODEL=${EMBED_MODEL}
       - SMALL_LLM=${SMALL_LLM}
-      - GOOGLE_APPLICATION_CREDENTIALS=/creds/gdrive-service-account.json
+      - LOCAL_SOURCE_ROOT=/data/uploads
+      - METRICS_ENABLED=${METRICS_ENABLED:-true}
+      - MULTIMODAL_ENABLED=${MULTIMODAL_ENABLED:-false}
+      - INGESTOR_API_TOKEN=${INGESTOR_API_TOKEN}
+      - INGESTOR_IP_ALLOWLIST=${INGESTOR_IP_ALLOWLIST:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/creds/gdrive-sa.json
+      - GOOGLE_DRIVE_TOKEN_PATH=/tmp/google-drive-token.json
+      - CHROMA_REQUEST_TIMEOUT=${CHROMA_REQUEST_TIMEOUT:-30}
+      - OLLAMA_REQUEST_TIMEOUT=${OLLAMA_REQUEST_TIMEOUT:-60}
+      - XDG_CACHE_HOME=/tmp
+      - ADMIN_DB_PATH=/data/catalog.sqlite
+      - INGESTOR_PORT=${INGESTOR_PORT}
+      - GDRIVE_MAX_DOCS=${GDRIVE_MAX_DOCS:-200}
+      - ADMIN_INGEST_TIMEOUT_SECONDS=${ADMIN_INGEST_TIMEOUT_SECONDS:-1800}
     volumes:
       - ./creds:/creds:ro
+      - /srv/rag-data:/data/uploads:rw
+      - rag_admin_data:/data
     command: uvicorn api:app --host 0.0.0.0 --port ${INGESTOR_PORT}
     security_opt: ["no-new-privileges:true"]
     read_only: true
@@ -66,30 +84,14 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    ports:
+      - "127.0.0.1:${NGINX_API_PORT:-8001}:${INGESTOR_PORT}"
     deploy:
       resources:
         limits:
           cpus: '2.0'
           memory: 8G
 
-  n8n:
-    image: docker.n8n.io/n8nio/n8n:stable
-    restart: unless-stopped
-    networks: [rag_net]
-    environment:
-      - GENERIC_TIMEZONE=${TZ}
-      - N8N_PROTOCOL=https
-      - N8N_HOST=${N8N_EXTERNAL_DOMAIN}
-      - WEBHOOK_URL=https://${N8N_EXTERNAL_DOMAIN}/
-      - N8N_PROXY_HOPS=1
-      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
-      - N8N_BASIC_AUTH_ACTIVE=${N8N_BASIC_AUTH_ACTIVE}
-      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
-      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
-    volumes:
-      - rag_n8n_data:/home/node/.n8n
-    ports:
-      - "127.0.0.1:${NGINX_N8N_PORT}:${N8N_PORT}"
 
   ui:
     build: ./ui
@@ -99,6 +101,10 @@ services:
       - TZ=${TZ}
       - CHROMA_HOST=chroma
       - CHROMA_PORT=${CHROMA_PORT}
+      - INGEST_API_BASE=http://ingestor:${INGESTOR_PORT}
+      - INGEST_API_TOKEN=${INGESTOR_API_TOKEN}
+      - INGEST_AUTH_HEADER=Authorization
+      - UI_INGEST_AUTH_BEARER_PREFIX=true
     ports:
       - "127.0.0.1:${NGINX_UI_PORT}:${STREAMLIT_PORT}"
     security_opt: ["no-new-privileges:true"]
@@ -109,3 +115,24 @@ services:
         limits:
           cpus: '1.0'
           memory: 2G
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    networks: [rag_net]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=2d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - rag_prometheus_data:/prometheus
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-19090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

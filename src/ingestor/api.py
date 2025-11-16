@@ -1,7 +1,8 @@
-# Fichier: /srv/rag/ingestor/api.py
+
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import ipaddress
 import logging
@@ -15,31 +16,30 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlparse
 
 import chromadb
-import docx
 import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain_core.documents import Document
 from langchain_google_community import GoogleDriveLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-try:
-    from .mm_adapter import Chunk, parse_multimodal
-except ImportError:
-    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
-    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
+if TYPE_CHECKING:
+    from langchain.schema import Document
+else:
+    try:
+        from langchain.schema import Document
+    except ImportError:
+        Document = Any  # fallback for type checking
 
-
+# --- Metrics module loader ---
 def _load_metrics_module() -> ModuleType:
     module_name = "src.ingestor.metrics"
     existing = sys.modules.get(module_name)
@@ -55,7 +55,6 @@ def _load_metrics_module() -> ModuleType:
         spec.loader.exec_module(module)
         return module
     raise ImportError("Unable to load metrics module")
-
 
 ingest_metrics: ModuleType = _load_metrics_module()
 
@@ -81,6 +80,8 @@ MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "false").lower() == "true"
 MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
 MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
 MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
+GOOGLE_DRIVE_TOKEN_PATH = os.getenv("GOOGLE_DRIVE_TOKEN_PATH", "/tmp/google-drive-token.json")
+GDRIVE_MAX_DOCS = int(os.getenv("GDRIVE_MAX_DOCS", "0"))
 
 # Keep metrics isolated per module import to avoid duplicate registration in tests.
 METRIC_REGISTRY = ingest_metrics.REGISTRY
@@ -91,6 +92,31 @@ ingest_requests_total = ingest_metrics.ingest_requests_total
 
 logger = logging.getLogger(__name__)
 
+try:
+    from .mm_adapter import Chunk, parse_multimodal
+except ImportError:
+    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
+    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
+except Exception:  # pragma: no cover - older Python may fail on dataclass(slots=...)
+    # Provide lightweight stubs so that non-multimodal code paths continue to work.
+    class Chunk:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.text: str = ""
+            self.modality: str = "unknown"
+            self.metadata: dict[str, Any] = {}
+        def as_text(self) -> str:
+            return getattr(self, "text", "")
+    def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - stub
+        raise RuntimeError("Multimodal parser not available on this runtime")
+parse_multimodal = _parse_multimodal_stub
+
+try:
+    from . import admin_api as _admin_api_module
+except ImportError:  # pragma: no cover - Docker execution path
+    _admin_api_module = importlib.import_module("admin_api")
+
+admin_api = _admin_api_module
+
 
 @dataclass
 class PreparedBatch:
@@ -100,11 +126,13 @@ class PreparedBatch:
     modality: str
 
 app = FastAPI(title="RAG Ingestor API")
+app.include_router(admin_api.router)
 
 
 @app.middleware("http")
 async def _metrics_middleware(request, call_next):
     start = time.perf_counter()
+    code = 500
     try:
         response = await call_next(request)
         code = getattr(response, "status_code", 500)
@@ -153,6 +181,16 @@ class IngestRequest(BaseModel):
         default_factory=dict,
         alias="metadata",
         validation_alias=AliasChoices("hints", "metadata"),
+    )
+
+
+class SearchRequest(BaseModel):
+    q: str = Field(description="Query text")
+    k: int = Field(default=6, ge=1, le=50, description="Number of results")
+    include_documents: bool = Field(default=True, description="Include full text in hits")
+    collection: str = Field(
+        default=COLLECTION_NAME,
+        description="Target collection name (defaults to main collection)",
     )
 
 # --- Utilitaires ---
@@ -225,7 +263,16 @@ def _enforce_security(request: Any, _req: Any) -> None:
     headers = getattr(request, "headers", {}) or {}
     token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
     if token_env:
+        # Try X-API-Token first, then Authorization (Bearer or raw)
         header_token = headers.get("X-API-Token") or headers.get("x-api-token")
+        if not header_token:
+            auth = headers.get("Authorization") or headers.get("authorization")
+            if isinstance(auth, str) and auth.strip():
+                value = auth.strip()
+                if value.lower().startswith("bearer "):
+                    header_token = value.split(" ", 1)[1].strip()
+                else:
+                    header_token = value
         if header_token != token_env:
             raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -248,6 +295,7 @@ def get_chroma_client() -> Any:
 
 
 def _load_docx_basic(file_path: str) -> list[Document]:
+    import docx
     try:
         d = docx.Document(file_path)
     except Exception as e:
@@ -456,8 +504,144 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
     if req.source_type == "url":
         return load_from_url(req.source)
     if req.source_type == "gdrive_folder":
-        loader = GoogleDriveLoader(folder_id=req.source, recursive=True)
-        return loader.load()
+        loader_kwargs: dict[str, Any] = {"folder_id": req.source, "recursive": True}
+        loader_kwargs["supports_all_drives"] = True
+        loader_kwargs["export_mime_types"] = {
+            "application/vnd.google-apps.document": "text/plain",
+            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.presentation": "text/plain",
+        }
+        service_account_raw = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if service_account_raw:
+            service_account_path = Path(service_account_raw)
+            if not service_account_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Configuration Google Drive invalide: le fichier de clé de service "
+                        "spécifié par GOOGLE_APPLICATION_CREDENTIALS est introuvable."
+                    ),
+                )
+            loader_kwargs["service_account_key"] = service_account_path
+            loader_kwargs["credentials_path"] = service_account_path
+        else:
+            default_credentials = Path.home() / ".credentials" / "credentials.json"
+            if default_credentials.exists():
+                loader_kwargs["credentials_path"] = default_credentials
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Identification Google Drive manquante: définissez GOOGLE_APPLICATION_CREDENTIALS "
+                        "ou placez un credentials.json valide dans ~/.credentials/."
+                    ),
+                )
+
+        token_path = Path(GOOGLE_DRIVE_TOKEN_PATH)
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:  # pragma: no cover - defensive guard
+            raise HTTPException(
+                status_code=500,
+                detail=f"Impossible de préparer le répertoire du token Google Drive: {exc}",
+            ) from exc
+        loader_kwargs["token_path"] = token_path
+
+        # Fast path: when a limiter is configured, pre-list a few file ids and load only those.
+        limit = int(GDRIVE_MAX_DOCS)
+        file_ids: list[str] = []
+        if limit > 0:
+            try:
+                # Import inside the branch to avoid hard dependency at import time.
+                from google.oauth2 import service_account as _sa
+                from googleapiclient.discovery import build as _build
+                creds = _sa.Credentials.from_service_account_file(str(loader_kwargs.get("credentials_path", service_account_raw)))
+                svc = _build("drive", "v3", credentials=creds, cache_discovery=False)
+
+                def _list_children(parent_id: str, q_extra: str, page_size: int = 10) -> list[dict[str, Any]]:
+                    q = f"'{parent_id}' in parents and trashed=false {q_extra}"
+                    resp = svc.files().list(
+                        q=q,
+                        pageSize=page_size,
+                        fields="files(id,name,mimeType)",
+                        includeItemsFromAllDrives=True,
+                        supportsAllDrives=True,
+                    ).execute()
+                    return list(resp.get("files", []))
+
+                # Shallow BFS up to depth 2 to find up to `limit` non-folder files quickly.
+                queue: list[tuple[str, int]] = [(req.source, 0)]
+                seen: set[str] = {req.source}
+                while queue and len(file_ids) < limit:
+                    current, depth = queue.pop(0)
+                    try:
+                        files = _list_children(current, "and mimeType != 'application/vnd.google-apps.folder'", page_size=max(5, limit))
+                        for f in files:
+                            if len(file_ids) >= limit:
+                                break
+                            fid = str(f.get("id", "") or "")
+                            if fid:
+                                file_ids.append(fid)
+                        if len(file_ids) >= limit or depth >= 2:
+                            continue
+                        subs = _list_children(current, "and mimeType = 'application/vnd.google-apps.folder'", page_size=5)
+                        for sf in subs:
+                            sid = str(sf.get("id", "") or "")
+                            if sid and sid not in seen:
+                                seen.add(sid)
+                                queue.append((sid, depth + 1))
+                    except Exception:
+                        # Ignore listing errors at this stage; we'll fall back to loader recursion.
+                        continue
+
+                if file_ids:
+                    # Switch to file_ids mode for faster, bounded loading
+                    loader_kwargs.pop("folder_id", None)
+                    loader_kwargs.pop("recursive", None)
+                    loader_kwargs["file_ids"] = file_ids
+            except Exception:
+                # non-fatal; proceed with regular folder traversal
+                pass
+
+        try:
+            loader = GoogleDriveLoader(**loader_kwargs)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Configuration Google Drive invalide: {exc}",
+            ) from exc
+
+        docs: list[Document] = []
+        try:
+            _lazy = getattr(loader, "lazy_load", None)
+            if callable(_lazy):
+                for _d in _lazy():
+                    try:
+                        if _d and getattr(_d, "page_content", "").strip():
+                            docs.append(_d)
+                            if limit > 0 and len(docs) >= limit:
+                                break
+                    except Exception:
+                        continue
+            else:
+                docs = loader.load()
+                if limit > 0 and len(docs) > limit:
+                    docs = docs[:limit]
+        except Exception as _e:
+            try:
+                docs = []
+                for _d in loader.lazy_load():
+                    try:
+                        if _d and getattr(_d, "page_content", "").strip():
+                            docs.append(_d)
+                            if limit > 0 and len(docs) >= limit:
+                                break
+                    except Exception:
+                        continue
+            except Exception as _e2:
+                raise HTTPException(status_code=500, detail=f"Echec chargement Google Drive: {_e2}") from _e2
+        # Ne pas échouer si aucun document lisible: laissez l'API retourner added:0
+        return docs
     if req.source_type == "pdf":
         path = _resolve_local_path(req.source)
         return PyPDFLoader(str(path)).load()
@@ -488,12 +672,16 @@ def _prepare_chunks_for_chroma(
     documents: list[str] = []
     metadatas: list[dict[str, str]] = []
     modality = "text"
+    seen_ids: set[str] = set()
 
     for chunk in chunks:
         text = (chunk.page_content or "").strip()
         if not text:
             continue
         content_hash = get_content_hash(text)
+        if content_hash in seen_ids:
+            continue
+        seen_ids.add(content_hash)
         chunk_modality = (chunk.metadata or {}).get("modality", "text")
         metadata = {
             "sha256": content_hash,
@@ -520,6 +708,7 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
     documents: list[str] = []
     metadatas: list[dict[str, str]] = []
     modality_counts: dict[str, int] = {}
+    seen_ids: set[str] = set()
 
     for chunk in chunks:
         text = chunk.as_text() if hasattr(chunk, "as_text") else (chunk.text or "")
@@ -527,6 +716,9 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
         if not text:
             continue
         content_hash = get_content_hash(text)
+        if content_hash in seen_ids:
+            continue
+        seen_ids.add(content_hash)
         chunk_modality = (chunk.modality or "unknown").strip().lower() or "unknown"
         metadata: dict[str, Any] = {
             "sha256": content_hash,
@@ -693,3 +885,162 @@ def metrics() -> Response:
         raise HTTPException(status_code=404, detail="Metrics disabled")
     body = ingest_metrics.generate_latest(METRIC_REGISTRY)
     return Response(body, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.post("/search")
+def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
+    # AuthN/AuthZ identical to ingestion
+    _enforce_security(request, payload)
+
+    # Prepare chroma collection
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=payload.collection, metadata={"hnsw:space": "cosine"})
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
+
+    # Compute query embedding using the same provider as indexing
+    try:
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        q_vec = emb.embed_query(payload.q)
+    except ValueError as exc:
+        message = str(exc)
+        if "HTTP code: 404" in message:
+            logger.warning("Ollama embeddings endpoint returned 404 for model '%s' (search)", EMBED_MODEL)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                    "Pull the model or adjust EMBED_MODEL before retrying."
+                ),
+            ) from exc
+        logger.exception("Embedding provider raised ValueError during search")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {message}") from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure while requesting embeddings (search)")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {exc}") from exc
+
+    # Query by embedding
+    try:
+        n_results = max(1, min(int(payload.k), 50))
+        results = collection.query(query_embeddings=[q_vec], n_results=n_results)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
+
+    documents = results.get("documents", [[]])[0] if results.get("documents") else []
+    metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] if results.get("distances") else []
+
+    hits: list[dict[str, Any]] = []
+    for idx, doc_id in enumerate(ids):
+        item: dict[str, Any] = {"id": doc_id, "metadata": metadatas[idx] if idx < len(metadatas) else {}}
+        if payload.include_documents and idx < len(documents):
+            item["document"] = documents[idx]
+        if distances and idx < len(distances) and distances[idx] is not None:
+            item["score"] = distances[idx]
+        hits.append(item)
+
+    _record_ingest_outcome("search", "text", "success")  # reuse metric surface for visibility
+    return {
+        "query": payload.q,
+        "collection": payload.collection,
+        "k": n_results,
+        "hits": hits,
+    }
+
+
+class RagQueryFilters(BaseModel):
+    domain: str | None = None
+    document_id: str | None = None
+    tags: list[str] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class RagQuery(BaseModel):
+    query: str
+    filters: RagQueryFilters | None = None
+    top_k: int = Field(default=6, ge=1, le=50)
+    collection: str = Field(default=COLLECTION_NAME)
+
+
+@app.post("/rag/query")
+def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
+    # AuthN/AuthZ identical to ingestion
+    _enforce_security(request, payload)
+
+    # Prepare chroma collection
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=payload.collection, metadata={"hnsw:space": "cosine"})
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
+
+    # Compute query embedding using the same provider as indexing
+    try:
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        q_vec = emb.embed_query(payload.query)
+    except ValueError as exc:
+        message = str(exc)
+        if "HTTP code: 404" in message:
+            logger.warning("Ollama embeddings endpoint returned 404 for model '%s' (rag/query)", EMBED_MODEL)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                    "Pull the model or adjust EMBED_MODEL before retrying."
+                ),
+            ) from exc
+        logger.exception("Embedding provider raised ValueError during rag/query")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {message}") from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure while requesting embeddings (rag/query)")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {exc}") from exc
+
+    # Build metadata filters (where)
+    where: dict[str, Any] = {}
+    if payload.filters:
+        f = payload.filters
+        if f.domain:
+            where["domain"] = f.domain
+        if f.document_id:
+            where["document_id"] = f.document_id
+        if f.tags:
+            where["tags"] = {"$in": f.tags}
+        if f.metadata:
+            for k, v in (f.metadata or {}).items():
+                if v is None or v == "":
+                    continue
+                where[str(k)] = v
+
+    # Query by embedding with optional filters
+    try:
+        n_results = max(1, min(int(payload.top_k), 50))
+        query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": n_results}
+        if where:
+            query_kwargs["where"] = where
+        results = collection.query(**query_kwargs)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
+
+    documents = results.get("documents", [[]])[0] if results.get("documents") else []
+    metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] if results.get("distances") else []
+
+    hits: list[dict[str, Any]] = []
+    for idx, doc_id in enumerate(ids):
+        item: dict[str, Any] = {"id": doc_id, "metadata": metadatas[idx] if idx < len(metadatas) else {}}
+        if idx < len(documents):
+            item["document"] = documents[idx]
+        if distances and idx < len(distances) and distances[idx] is not None:
+            item["score"] = distances[idx]
+        hits.append(item)
+
+    return {
+        "query": payload.query,
+        "collection": payload.collection,
+        "k": n_results,
+        "filters": where,
+        "hits": hits,
+    }

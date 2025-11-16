@@ -41,6 +41,48 @@ fi
 
 [ -f "${env_file}" ] || touch "${env_file}"
 
+read_env_value() {
+  local key="$1"
+  local line value
+  line=$(grep -E "^${key}=" "${env_file}" 2>/dev/null | tail -n 1 || true)
+  if [ -n "${line}" ]; then
+    value=${line#${key}=}
+    value=${value%$'\r'}
+    printf '%s' "${value}"
+  fi
+}
+
+ingest_header=${INGEST_AUTH_HEADER:-$(read_env_value "INGEST_AUTH_HEADER")}
+ingest_header=${ingest_header:-Authorization}
+ingest_token=${INGESTOR_API_TOKEN:-$(read_env_value "INGESTOR_API_TOKEN")}
+[ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_API_TOKEN")
+[ -n "${ingest_token}" ] || ingest_token=$(read_env_value "INGEST_AUTH_TOKEN")
+[ -n "${ingest_token}" ] || ingest_token="devtoken"
+
+# Force compose variable substitution to use the same token as our HTTP header
+export INGESTOR_API_TOKEN="${ingest_token}"
+
+# Map legacy header names to supported ones
+header_normalized="${ingest_header}"
+case "$(printf '%s' "${ingest_header}" | tr '[:upper:]' '[:lower:]')" in
+  x-ingest-token|x-ingestor-token)
+    header_normalized="X-API-Token"
+    ;;
+  authorization)
+    header_normalized="Authorization"
+    ;;
+  *)
+    : # leave as-is
+    ;;
+ esac
+
+declare -a ingest_auth_headers
+if [ "${header_normalized}" = "Authorization" ]; then
+  ingest_auth_headers=(-H "Authorization: Bearer ${ingest_token}")
+else
+  ingest_auth_headers=(-H "${header_normalized}: ${ingest_token}")
+fi
+
 # Compose helper (order-sensitive flags), reused throughout the script.
 # Compose CLI already reads COMPOSE_PROFILES from env; keeping flags minimal avoids "no service selected" edge cases in CI.
 compose_cmd=(docker compose)
@@ -89,12 +131,14 @@ done
 dump_service_logs() {
   local err=${1:-$?}
   set +e
-  printf '== compose logs tail ==\n'
-  if [ "${#present_optional_services[@]}" -gt 0 ]; then
-    "${compose_cmd[@]}" logs --no-color --tail 200 "${mandatory_services[@]}" "${present_optional_services[@]}"
-  else
-    "${compose_cmd[@]}" logs --no-color --tail 200 "${mandatory_services[@]}"
-  fi
+  echo '== docker ps =='
+  docker ps -a
+  echo '== docker inspect (ingestor) =='
+  docker inspect $(docker ps -aqf "name=ingestor") || true
+  echo '== netstat -tuln (host) =='
+  (command -v netstat >/dev/null 2>&1 && netstat -tuln) || (command -v ss >/dev/null 2>&1 && ss -tuln) || echo "netstat/ss not available"
+  echo '== compose logs tail (all services) =='
+  "${compose_cmd[@]}" logs --no-color --tail 200 || true
   set -e
   exit "${err}"
 }
@@ -113,7 +157,7 @@ grep -q '^INGESTOR_IP_ALLOWLIST=' "${env_file}" || printf '\nINGESTOR_IP_ALLOWLI
 
 # Attente santé (simple boucle)
 echo "== wait: health =="
-for attempt in $(seq 1 30); do
+for attempt in $(seq 1 60); do
   ok=1
   ps_json=$("${compose_cmd[@]}" ps --format json 2>/dev/null || true)
   status_snapshot=""
@@ -152,17 +196,40 @@ for attempt in $(seq 1 30); do
     break
   fi
   printf 'compose services snapshot (attempt %s):\n%s\n' "${attempt}" "${status_snapshot}"
-  echo "waiting for healthy services (attempt ${attempt}/30)..."
+  echo "waiting for healthy services (attempt ${attempt}/60)..."
   sleep 2
 done
 
 if [ "$ok" != "1" ]; then
   echo "Services failed to reach healthy state" >&2
-  exit 1
+  dump_service_logs 1
 fi
 
-# Checks côté hôte
-curl -fsS http://127.0.0.1:18001/health -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" -o /dev/null && echo "ingestor: OK"
+
+# Robust health check for ingestor (host-side)
+echo "== host health check: ingestor =="
+health_ok=0
+for attempt in $(seq 1 30); do
+  if curl -fsS http://127.0.0.1:18001/health "${ingest_auth_headers[@]}" -o /dev/null; then
+    echo "ingestor: OK (attempt ${attempt})"
+    health_ok=1
+    break
+  else
+    echo "waiting for ingestor health endpoint (attempt ${attempt}/30)..."
+    sleep 2
+  fi
+done
+
+if [ "$health_ok" != "1" ]; then
+  echo "ERROR: ingestor health endpoint not reachable after retries" >&2
+  echo "== docker ps =="
+  docker ps
+  echo "== netstat -tuln (host) =="
+  (command -v netstat >/dev/null 2>&1 && netstat -tuln) || echo "netstat not available"
+  echo "== compose logs (ingestor) =="
+  "${compose_cmd[@]}" logs --no-color --tail 100 ingestor || true
+  exit 1
+fi
 
 embed_model=${EMBED_MODEL:-nomic-embed-text}
 echo "== ensure embedding model: ${embed_model} =="
@@ -175,7 +242,7 @@ fi
 
 # Ingestion smoke
 ingest_raw=$(curl -sS -X POST "http://127.0.0.1:18001/ingest" \
-  -H "X-API-Token: ${INGESTOR_API_TOKEN:-devtoken}" \
+  "${ingest_auth_headers[@]}" \
   -H "Content-Type: application/json" \
   -d '{"source_type":"url","source":"https://example.com","hints":{"env":"smoke"}}' \
   -w '\n%{http_code}' 2>&1) || dump_service_logs $?

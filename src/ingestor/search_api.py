@@ -1,22 +1,78 @@
 """Read-only knowledge base API guarded by per-token scopes."""
 from __future__ import annotations
 
+import importlib
+import logging
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import chromadb
 from chromadb.utils import embedding_functions
 from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
-if TYPE_CHECKING:
-    from ..admin import db as admindb
-else:  # pragma: no cover - fallback when executed as a script
-    try:
-        from ..admin import db as admindb
-    except ImportError:  # pragma: no cover - direct execution fallback
-        from admin import db as admindb
+
+class AdminDbProtocol(Protocol):
+    def normalize_tenant(self, candidate: str | None) -> str: ...
+    def api_key_get_by_token(self, token: str, tenant: str) -> dict[str, Any] | None: ...
+    def strip_collection_tenant_prefix(self, name: str, tenant: str) -> str: ...
+    def canonical_collection_name(self, name: str) -> str: ...
+    def collection_name_for_tenant(self, tenant: str, collection: str) -> str: ...
+
+class _FallbackAdminDb:
+    _DEFAULT_TENANT = os.getenv("DEFAULT_TENANT", "default") or "default"
+    _STATIC_TOKEN = os.getenv("SEARCH_API_TOKEN")
+
+    @classmethod
+    def normalize_tenant(cls, candidate: str | None) -> str:
+        raw = (candidate or cls._DEFAULT_TENANT).strip().lower()
+        sanitized = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_"})
+        return sanitized or cls._DEFAULT_TENANT
+
+    @classmethod
+    def api_key_get_by_token(cls, token: str, tenant: str) -> dict[str, Any] | None:
+        expected = (cls._STATIC_TOKEN or "").strip()
+        if not expected:
+            return None
+        if token.strip() != expected:
+            return None
+        normalized_tenant = cls.normalize_tenant(tenant)
+        return {
+            "token": expected,
+            "tenant": normalized_tenant,
+            "scopes": "*",
+            "origins": "*",
+        }
+
+    @classmethod
+    def strip_collection_tenant_prefix(cls, name: str, tenant: str) -> str:
+        prefix = f"{cls.normalize_tenant(tenant)}__"
+        return name[len(prefix):] if name.startswith(prefix) else name
+
+    @classmethod
+    def canonical_collection_name(cls, name: str) -> str:
+        cleaned = (name or "").strip().lower().replace(" ", "_")
+        sanitized = "".join(ch for ch in cleaned if ch.isalnum() or ch in {"-", "_"})
+        return sanitized or "default"
+
+    @classmethod
+    def collection_name_for_tenant(cls, tenant: str, collection: str) -> str:
+        return f"{cls.normalize_tenant(tenant)}__{cls.canonical_collection_name(collection)}"
+
+logger = logging.getLogger(__name__)
+
+def _load_admin_backend() -> AdminDbProtocol:
+    for module_name in ("src.admin.db", "admin.db"):
+        try:
+            module = importlib.import_module(module_name)
+            return cast(AdminDbProtocol, module)
+        except ModuleNotFoundError:
+            continue
+    logger.warning("admin db module not found; falling back to static token checks")
+    return cast(AdminDbProtocol, _FallbackAdminDb)
+
+admindb = _load_admin_backend()
 
 router = APIRouter(prefix="/kb", tags=["kb"])
 
@@ -39,7 +95,6 @@ _client: _ClientProtocol | None = None
 _embedder = None
 _reranker = None
 
-
 def _client_lazy() -> _ClientProtocol:
     global _client
     if _client is not None:
@@ -50,17 +105,14 @@ def _client_lazy() -> _ClientProtocol:
         _client = chromadb.PersistentClient(path=CHROMA_DIR)
     return _client
 
-
 def _embedder_lazy() -> Any:
     global _embedder
     if _embedder is None:
         _embedder = embedding_functions.SentenceTransformerEmbeddingFunction(model_name=SEARCH_EMBED_MODEL)
     return _embedder
 
-
 def _collection(name: str) -> Any:
     return _client_lazy().get_or_create_collection(name=name, embedding_function=_embedder_lazy())
-
 
 def _resolve_tenant(request: Request) -> str:
     candidate = (
@@ -69,7 +121,6 @@ def _resolve_tenant(request: Request) -> str:
         or request.headers.get("x-tenant")
     )
     return admindb.normalize_tenant(candidate)
-
 
 def _check_key(token: str | None, origin: str | None, tenant: str) -> dict[str, Any]:
     if not token:
@@ -88,14 +139,12 @@ def _check_key(token: str | None, origin: str | None, tenant: str) -> dict[str, 
         raise HTTPException(status.HTTP_403_FORBIDDEN, f"Origin '{origin}' not allowed for this key")
     return record
 
-
 class SearchQuery(BaseModel):
     q: str
     collection: str
     k: int = 6
     include_documents: bool = True
     rerank: bool | None = None
-
 
 @router.get("/collections")
 def list_collections(request: Request, x_api_key: str | None = Header(default=None)) -> dict[str, Any]:
@@ -119,7 +168,6 @@ def list_collections(request: Request, x_api_key: str | None = Header(default=No
         base = admindb.strip_collection_tenant_prefix(name, tenant)
         names.append({"name": base, "fullName": name})
     return {"collections": names}
-
 
 @router.post("/search")
 def search(
@@ -152,7 +200,6 @@ def search(
             global _reranker
             if _reranker is None:
                 from sentence_transformers import CrossEncoder
-
                 _reranker = CrossEncoder(RERANKER_MODEL)
             pairs = [(payload.q, doc) for doc in documents]
             raw_scores_any = _reranker.predict(pairs)

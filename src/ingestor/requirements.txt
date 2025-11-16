@@ -4,7 +4,7 @@ uvicorn[standard]==0.30.6
 langchain==0.2.14
 langchain-community==0.2.12
 langchain-text-splitters==0.2.2
-langchain-google-community==1.0.7
+langchain-google-community[drive]==1.0.7
 
 chromadb-client==1.1.1
 ollama==0.3.0

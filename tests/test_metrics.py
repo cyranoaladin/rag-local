@@ -5,7 +5,14 @@ from fastapi.testclient import TestClient
 from src.ingestor.api import app
 
 
-def test_metrics_endpoint_exposes_counters():
+def test_metrics_endpoint_exposes_counters(monkeypatch):
+    monkeypatch.setenv("METRICS_ENABLED", "true")
+    # Certains modules peuvent avoir déjà lu la config, on force aussi côté module
+    try:
+        import src.ingestor.metrics as metrics_mod
+        metrics_mod.METRICS_ENABLED = True
+    except ImportError:
+        pass
     client = TestClient(app)
     response = client.get("/health")
     assert response.status_code in (200, 204)

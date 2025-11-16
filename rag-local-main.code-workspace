@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../rag-local"
+		}
+	],
+	"settings": {
+		"terminal.integrated.sendKeybindingsToShell": true
+	}
+}

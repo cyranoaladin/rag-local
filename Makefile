@@ -1,5 +1,3 @@
-# Makefile venv-aware pour lint/type/tests/obs
-
 SHELL := /bin/bash
 VENVDIR ?= .venv
 
@@ -17,18 +15,19 @@ MYPY   := $(PY) -m mypy
 PYTEST := $(PY) -m pytest
 
 .PHONY: help venv install-dev lint typecheck test test-integration smoke \
-	obs-up obs-down obs-smoke obs-quickcheck obs-restart obs-status \
-	compose-test-up compose-test-down print-tools
+    obs-up obs-down obs-smoke obs-quickcheck obs-restart obs-status \
+    compose-test-up compose-test-down print-tools dev compose-up compose-down compose-restart
 
 help:
-	@echo "Targets : venv | install-dev | lint | typecheck | test | test-integration | smoke | obs-up | obs-smoke | obs-down | obs-restart | obs-status | compose-test-up | compose-test-down | print-tools"
+	@echo "Targets : venv | install-dev | lint | typecheck | test | test-integration | smoke | obs-up | obs-smoke | obs-down | obs-restart | obs-status | compose-test-up | compose-test-down | print-tools | dev | compose-up | compose-down | compose-restart"
 
 # Cree le venv si absent et met pip a jour
+
 venv:
 	@if [ ! -x "$(PY_VENV)" ]; then \
-	  echo "-> create venv in $(VENVDIR)"; \
-	  $(PY_SYS) -m venv "$(VENVDIR)"; \
-	  "$(PY_VENV)" -m pip install -U pip; \
+		echo "-> create venv in $(VENVDIR)"; \
+		$(PY_SYS) -m venv "$(VENVDIR)"; \
+		"$(PY_VENV)" -m pip install -U pip; \
 	fi
 
 # Installe dependances runtime + dev si dispo
@@ -37,7 +36,7 @@ install-dev: venv
 	@if [ -f requirements-dev.txt ]; then "$(PY)" -m pip install -r requirements-dev.txt; fi
 	# Fallback minimal si requirements-dev.txt est absent/incomplet
 	@for mod in ruff mypy pytest; do \
-	  $(PY) -c "import importlib; importlib.import_module('$$mod')" >/dev/null 2>&1 || $(PY) -m pip install $$mod; \
+		$(PY) -c "import importlib; importlib.import_module('$$mod')" >/dev/null 2>&1 || $(PY) -m pip install $$mod; \
 	done
 
 lint: install-dev
@@ -79,12 +78,15 @@ obs-down:
 
 obs-restart: obs-down obs-up
 
+
 obs-status:
 	@docker compose -f infra/docker-compose.yml ps || true
 
 obs-smoke:
 	@if [ -x infra/scripts/obs_smoke.sh ]; then bash infra/scripts/obs_smoke.sh; \
-	else echo "No infra/scripts/obs_smoke.sh"; fi
+		else \
+			echo "No infra/scripts/obs_smoke.sh"; \
+		fi
 
 obs-quickcheck:
 	@if [ -x infra/scripts/metrics_quickcheck.sh ]; then \
@@ -98,6 +100,8 @@ obs-quickcheck:
 compose-test-up:
 	@docker compose -f infra/docker-compose.test.yml up -d --remove-orphans
 
+dev:
+
 compose-test-down:
 	@docker compose -f infra/docker-compose.test.yml down --remove-orphans
 
@@ -107,17 +111,13 @@ print-tools:
 	@$(PY) -c "import shutil; print('MYPY path  = ' + (shutil.which('mypy') or '(module)'))"
 	@$(PY) -c "import shutil; print('PYTEST path= ' + (shutil.which('pytest') or '(module)'))"
 
-.PHONY: dev compose-up compose-down compose-restart smoke
 dev:
-\tpython -V && pip -V
+	python -V && pip -V
 
 compose-up:
-\tdocker compose -f infra/docker-compose.yml --env-file infra/.env up -d
+	docker compose -f infra/docker-compose.yml --env-file infra/.env up -d
 
 compose-down:
-\tdocker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
+	docker compose -f infra/docker-compose.yml --env-file infra/.env down --remove-orphans
 
 compose-restart: compose-down compose-up
-
-smoke:
-\tbash infra/scripts/smoke.sh

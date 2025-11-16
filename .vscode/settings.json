@@ -1,5 +1,7 @@
 {
   "chat.tools.terminal.autoApprove": { "*": true },
   "chat.agent.maxRequests": 1000,
-  "python.defaultInterpreterPath": "/bin/python3"
+  "python.defaultInterpreterPath": "/bin/python3",
+  "python-envs.defaultEnvManager": "ms-python.python:venv",
+  "python-envs.pythonProjects": []
 }

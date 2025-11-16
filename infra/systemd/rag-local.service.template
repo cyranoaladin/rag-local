@@ -1,0 +1,15 @@
+[Unit]
+Description=rag-local stack (docker compose)
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${RAG_DIR}
+ExecStart=/usr/bin/docker compose -f infra/docker-compose.prod.yml --env-file infra/.env --profile db --profile llm --profile api --profile ui --profile obs up -d
+ExecStop=/usr/bin/docker compose -f infra/docker-compose.prod.yml --env-file infra/.env down
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -1,7 +1,7 @@
 # Architecture RAG locale
 
 Flux principal (texte → réponse) :
-1. Client (UI ou n8n) appelle l'ingestor FastAPI.
+1. Client (UI ou CLI) appelle l'ingestor FastAPI.
 2. Ingestor valide le token/IP et récupère la source (URL, GDrive, PDF, DOCX).
 3. Extraction & nettoyage via loaders LangChain, streaming HTTP contrôlé.
 4. Découpage `RecursiveCharacterTextSplitter` (800/120) pour limiter la latence mémoire.
@@ -9,13 +9,12 @@ Flux principal (texte → réponse) :
 6. Déduplication SHA-256 pour éviter les doublons en base.
 7. Insertion des chunks + métadonnées normalisées dans Chroma (collection unique).
 8. UI Streamlit interroge Chroma (top-k borné) pour récupérer les passages pertinents.
-9. Résultats affichés (texte + métadonnées) et transmis à n8n/LLM si orchestration.
-10. Génération finale (hors repo) combine passages avec un LLM (Ollama) pour réponse.
+9. Génération finale (hors repo) combine passages avec un LLM (Ollama) pour réponse.
 
 ```
-[n8n/UI] --HTTP--> [Ingestor FastAPI] --RPC--> [Ollama Embeddings]
-                                      \--REST--> [ChromaDB]
-                                             \--> [Streamlit UI]
+[UI/CLI] --HTTP--> [Ingestor FastAPI] --RPC--> [Ollama Embeddings]
+                                     \--REST--> [ChromaDB]
+                                            \--> [Streamlit UI]
 ```
 
 Risques de latence/mémoire par étape :
