@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, Callable, cast
 from urllib.parse import urlparse
 
 import chromadb
@@ -107,16 +107,16 @@ def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cove
     raise RuntimeError("Multimodal parser not available on this runtime")
 
 # Assign stub by default; successful import below will override this name
-parse_multimodal = _parse_multimodal_stub
+parse_multimodal: Callable[..., Any] = _parse_multimodal_stub
 
 # Try package-relative import first, then fallback to local module path
 try:
-    from .mm_adapter import parse_multimodal as _mm_parse
-    parse_multimodal = _mm_parse
+    from . import mm_adapter as _mm
+    parse_multimodal = getattr(_mm, "parse_multimodal", parse_multimodal)
 except Exception:  # pragma: no cover - import fallback
     try:
-        from mm_adapter import parse_multimodal as _mm_parse
-        parse_multimodal = _mm_parse
+        import mm_adapter as _mm  # type: ignore[import-not-found]
+        parse_multimodal = getattr(_mm, "parse_multimodal", parse_multimodal)
     except Exception:
         # keep stub
         pass
