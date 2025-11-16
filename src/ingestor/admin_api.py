@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 import requests
 from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
@@ -12,7 +12,13 @@ try:
     from . import catalog as catalog
 except Exception:  # pragma: no cover - executed when running as top-level module
     import importlib as _importlib
-catalog = _importlib.import_module("catalog")
+    try:
+        catalog = _importlib.import_module("src.ingestor.catalog")
+    except Exception:
+        try:
+            catalog = _importlib.import_module("ingestor.catalog")
+        except Exception:
+            catalog = _importlib.import_module("catalog")
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 _logger = logging.getLogger(__name__)
@@ -57,11 +63,11 @@ def admin_health(request: Request) -> dict[str, str]:
 
 class CreateDocumentPayload(BaseModel):
     domain: str = Field(description="lycee | web3 | ...")
-    title: str | None = None
+    title: Optional[str] = None
     source_type: str = Field(description="url|gdrive_folder|pdf|docx|markdown|md|video")
     source_location: str
-    tags: list[str] | None = None
-    metadata: dict[str, Any] | None = None
+    tags: Optional[list[str]] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 @router.post("/documents")
@@ -80,7 +86,7 @@ def create_document(payload: CreateDocumentPayload, request: Request) -> dict[st
 
 
 @router.get("/documents")
-def list_documents(request: Request, domain: str | None = Query(default=None)) -> dict[str, Any]:
+def list_documents(request: Request, domain: Optional[str] = Query(default=None)) -> dict[str, Any]:
     _admin_guard(request)
     docs = catalog.list_documents(domain=domain.strip() if domain else None, path=os.getenv("ADMIN_DB_PATH"))
     return {"documents": docs}
@@ -139,7 +145,7 @@ def ingest_document(document_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.post("/reindex")
-def trigger_reindex(request: Request, payload: dict[str, Any] | None = None) -> dict[str, str]:
+def trigger_reindex(request: Request, payload: Optional[dict[str, Any]] = None) -> dict[str, str]:
     """Placeholder endpoint for batch reindex orchestration (no auth required).
 
     The actual implementation is environment-specific; for now we acknowledge the
@@ -162,9 +168,12 @@ def get_document_detail(document_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.patch("/documents/{document_id}")
-def update_document_detail(document_id: str, request: Request, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+async def update_document_detail(document_id: str, request: Request) -> dict[str, Any]:
     _admin_guard(request)
-    body = payload or {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid payload")
     forbidden = {"domain", "source_type", "source_location"}
@@ -201,9 +210,9 @@ def delete_document_detail(document_id: str, request: Request) -> dict[str, Any]
 @router.get("/ingestions")
 def list_all_ingestions_endpoint(
     request: Request,
-    document_id: str | None = Query(default=None),
-    status: str | None = Query(default=None),
-    since: str | None = Query(default=None),
+    document_id: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> dict[str, Any]:
     _admin_guard(request)
@@ -225,11 +234,11 @@ async def admin_upload(
     request: Request,
     file: UploadFile = File(...),  # noqa: B008 - FastAPI pattern for required file field
     ingest: bool = Query(default=False),
-    document_id: str | None = Query(default=None),
-    domain: str | None = Query(default=None),
-    title: str | None = Query(default=None),
-    tags: str | None = Query(default=None),  # JSON array as string
-    metadata: str | None = Query(default=None),  # JSON object as string
+    document_id: Optional[str] = Query(default=None),
+    domain: Optional[str] = Query(default=None),
+    title: Optional[str] = Query(default=None),
+    tags: Optional[str] = Query(default=None),  # JSON array as string
+    metadata: Optional[str] = Query(default=None),  # JSON object as string
 ) -> dict[str, Any]:
     _admin_guard(request)
     upload_dir = _ensure_upload_dir()
