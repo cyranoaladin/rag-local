@@ -11,6 +11,8 @@ import sys
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
+import sys as _sys
+import inspect as _inspect
 from pathlib import Path
 from types import ModuleType
 from typing import Any, BinaryIO
@@ -39,7 +41,18 @@ def _metrics() -> ModuleType:
     raise ImportError("Unable to load metrics module")
 
 
-@dataclass(slots=True)
+# Python 3.9 compatibility: dataclass(slots=...) not available before 3.10
+if "slots" in _inspect.signature(dataclass).parameters:
+    _DATACLASS_DECORATOR = dataclass
+    _DATACLASS_KW = {"slots": True}
+else:  # pragma: no cover - runtime on older Python
+    def _dataclass_compat(*d_args, **d_kwargs):
+        d_kwargs.pop("slots", None)
+        return dataclass(*d_args, **d_kwargs)
+    _DATACLASS_DECORATOR = _dataclass_compat  # type: ignore[assignment]
+    _DATACLASS_KW = {}
+
+@_DATACLASS_DECORATOR(**_DATACLASS_KW)
 class Chunk:
     """Represents a multimodal payload emitted by the parser."""
 
@@ -186,7 +199,7 @@ def _read_payload(stream: BinaryIO, timeout_s: float) -> tuple[bytes, bool]:
         chunk = stream.read(8192)
         if not chunk:
             break
-        if not isinstance(chunk, bytes | bytearray):
+        if not isinstance(chunk, (bytes, bytearray)):
             chunk = bytes(chunk)
         parts.append(bytes(chunk))
     duration = time.perf_counter() - start

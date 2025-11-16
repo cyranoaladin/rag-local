@@ -1,0 +1,11 @@
+groups:
+  - name: ingestor
+    rules:
+      - alert: IngestorDown
+        expr: up{job="ingestor"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Ingestor down
+          description: "up{job=\"ingestor\"} is 0 for over 2 minutes on {{ $labels.instance }}"

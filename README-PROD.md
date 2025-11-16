@@ -93,6 +93,30 @@ echo $RAG_API_EXTERNAL_DOMAIN | xargs -I {} sudo certbot --nginx -d {} --redirec
 
 ## Observabilité
 
+### Ops checks Nginx/API/UI (safe paste)
+
+Exécutez ces contrôles sur le VPS pour valider rapidement Nginx côté API/UI sans révéler de secrets.
+
+```bash path=null start=null
+set -euo pipefail
+
+# API et UI (déduits des vhosts)
+API_DOMAIN=$(sed -n 's/^[[:space:]]*server_name[[:space:]]\+\([^;]*\).*/\1/p' /etc/nginx/conf.d/rag-api.conf | head -n1)
+UI_DOMAIN=$(sed -n 's/^[[:space:]]*server_name[[:space:]]\+\([^;]*\).*/\1/p'  /etc/nginx/conf.d/rag-ui.conf  | head -n1)
+
+# API via SNI (boucle locale)
+HC=$(curl -k -sS -o /dev/null -w '%{http_code}' --resolve "${API_DOMAIN}:443:127.0.0.1" "https://${API_DOMAIN}/health")
+MC=$(curl -k -sS -I --resolve "${API_DOMAIN}:443:127.0.0.1" "https://${API_DOMAIN}/metrics" | awk '/^HTTP/{print $2}' | head -n1)
+echo "API: /health=$HC (200 attendu), /metrics HEAD=$MC (200 attendu côté localhost; FastAPI peut renvoyer 405 sur HEAD — utilisez GET si besoin)"
+
+# UI BasicAuth — renseignez un compte valide côté Nginx
+UI_USER={{UI_USER}}
+UI_PASS={{UI_PASS}}
+UC1=$(curl -k -sS -o /dev/null -w '%{http_code}' --resolve "${UI_DOMAIN}:443:127.0.0.1" "https://${UI_DOMAIN}/")
+UC2=$(curl -k -sS -o /dev/null -w '%{http_code}' --user "$UI_USER:$UI_PASS" --resolve "${UI_DOMAIN}:443:127.0.0.1" "https://${UI_DOMAIN}/")
+echo "UI: sans creds=$UC1 (401 attendu), avec creds=$UC2 (200 attendu)"
+```
+
 - Ingestor expose `GET /metrics` (Prometheus) lorsque `METRICS_ENABLED=true` dans `infra/.env`.
 - Restreindre `/metrics` côté Nginx API à `127.0.0.1` (voir `infra/nginx/rag-api.conf.template`).
 - Métriques clés:
@@ -119,6 +143,22 @@ Voir `SPEC.md` pour l’architecture et le contrat d’API.
 - /metrics is **not** exposed publicly; Prometheus scrapes the ingestor over the bridge network.
 
 ---
+
+## Uploads de fichiers (Admin UI / API)
+
+- Assurez-vous que le répertoire des uploads est monté en écriture:
+  - Volume: /srv/rag-data sur l’hôte mappé vers /data/uploads dans le conteneur ingestor (rw)
+  - NGINX_CLIENT_MAX_BODY_SIZE (ex: 64m) si vous uploadez de gros PDF
+- Authentification: même jeton que /ingest (Authorization: Bearer ou X-API-Token)
+- Endpoint: POST /admin/upload (multipart/form-data)
+  - Params: ingest=true|false, domain, title?, tags(JSON), metadata(JSON)
+  - Réponse: chemin, type MIME, taille, guess du source_type
+
+## Persistance du catalog Admin (SQLite)
+
+- Variable: ADMIN_DB_PATH=/data/catalog.sqlite (persisté via volume rag_admin_data)
+- Montez le volume rag_admin_data:/data pour conserver la base entre redémarrages
+- Sauvegarde: copiez /data/catalog.sqlite régulièrement (rsync/restic)
 
 ## Activer Google Drive en prod
 

@@ -1,5 +1,7 @@
 # Cahier des charges – Dashboards d’ingestion & API RAG externe
 
+Statut: V1 implémentée (Admin CRUD complet, endpoint global /admin/ingestions, upload via dashboard, ingestion URL & Google Drive opérationnelles).
+
 ## 1. Contexte
 
 `rag-local` est un moteur RAG 100 % local (FastAPI + Ollama + ChromaDB + Streamlit) déployé sur VPS, sans dépendance à des LLM externes.  

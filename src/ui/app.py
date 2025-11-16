@@ -174,6 +174,54 @@ def _render_admin_form() -> None:
                 st.error(str(exc))
 
 
+def _render_uploader() -> None:
+    st.header("1.b) Uploader un document")
+    uploaded = st.file_uploader(
+        "Choisissez un fichier (PDF, DOCX, MD)",
+        type=["pdf", "docx", "md", "markdown"],
+        key="admin_upload_file",
+    )
+    domain = st.selectbox("Domaine", ["lycee", "web3"], index=0, key="admin_upload_domain")
+    title_hint = st.text_input("Titre (optionnel)", "", key="admin_upload_title")
+    auto_ingest = st.checkbox("Ingestion immédiate", True, key="admin_upload_auto")
+
+    if uploaded is not None and st.button("Uploader", key="admin_upload_btn"):
+        files = {
+            "file": (
+                uploaded.name,
+                uploaded.getvalue(),
+                uploaded.type or "application/octet-stream",
+            )
+        }
+        headers: dict[str, str] = {}
+        token = INGEST_API_TOKEN
+        if token:
+            value = token
+            if INGEST_AUTH_HEADER.lower() == "authorization" and UI_INGEST_AUTH_BEARER_PREFIX and not token.lower().startswith("bearer "):
+                value = f"Bearer {token}"
+            headers[INGEST_AUTH_HEADER] = value
+        params = {
+            "ingest": "true" if auto_ingest else "false",
+            "domain": domain,
+            "title": title_hint or uploaded.name,
+        }
+        try:
+            r = requests.post(
+                f"{INGEST_BASE_URL.rstrip('/')}/admin/upload",
+                headers=headers,
+                files=files,
+                params=params,
+                timeout=max(60.0, INGEST_TIMEOUT),
+            )
+            if r.status_code >= 400:
+                st.error(f"Echec upload/ingest: {r.status_code} {r.text}")
+            else:
+                st.success("Upload réussi")
+                st.json(r.json())
+        except requests.RequestException as exc:
+            st.error(f"Erreur réseau API: {exc}")
+
+
 def _render_collection_explorer() -> None:
     st.header("2) Explorer Chroma")
     try:
@@ -212,6 +260,7 @@ def render_app() -> None:
     st.header("1) Lancer une ingestion")
     _render_admin_form()
 
+    _render_uploader()
     _render_collection_explorer()
 
 

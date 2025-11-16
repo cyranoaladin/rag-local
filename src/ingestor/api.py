@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 from urllib.parse import urlparse
 
 import chromadb
@@ -81,6 +81,7 @@ MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
 MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
 MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
 GOOGLE_DRIVE_TOKEN_PATH = os.getenv("GOOGLE_DRIVE_TOKEN_PATH", "/tmp/google-drive-token.json")
+GDRIVE_MAX_DOCS = int(os.getenv("GDRIVE_MAX_DOCS", "0"))
 
 # Keep metrics isolated per module import to avoid duplicate registration in tests.
 METRIC_REGISTRY = ingest_metrics.REGISTRY
@@ -96,6 +97,17 @@ try:
 except ImportError:
     # Allow running when the module is executed as a top-level script (e.g. inside Docker).
     from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
+except Exception:  # pragma: no cover - older Python may fail on dataclass(slots=...)
+    # Provide lightweight stubs so that non-multimodal code paths continue to work.
+    class Chunk:  # type: ignore[no-redef]
+        def __init__(self, *args, **kwargs) -> None:
+            self.text = ""
+            self.modality = "unknown"
+            self.metadata = {}
+        def as_text(self) -> str:
+            return getattr(self, "text", "")
+    def parse_multimodal(*args, **kwargs):  # type: ignore[no-redef]
+        raise RuntimeError("Multimodal parser not available on this runtime")
 
 try:
     from . import admin_api as _admin_api_module
@@ -492,6 +504,7 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
         return load_from_url(req.source)
     if req.source_type == "gdrive_folder":
         loader_kwargs: dict[str, Any] = {"folder_id": req.source, "recursive": True}
+        loader_kwargs["supports_all_drives"] = True
         loader_kwargs["export_mime_types"] = {
             "application/vnd.google-apps.document": "text/plain",
             "application/vnd.google-apps.spreadsheet": "text/csv",
@@ -533,6 +546,62 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
             ) from exc
         loader_kwargs["token_path"] = token_path
 
+        # Fast path: when a limiter is configured, pre-list a few file ids and load only those.
+        limit = int(GDRIVE_MAX_DOCS)
+        file_ids: list[str] = []
+        if limit > 0:
+            try:
+                # Import inside the branch to avoid hard dependency at import time.
+                from google.oauth2 import service_account as _sa  # type: ignore
+                from googleapiclient.discovery import build as _build  # type: ignore
+                creds = _sa.Credentials.from_service_account_file(str(loader_kwargs.get("credentials_path", service_account_raw)))
+                svc = _build("drive", "v3", credentials=creds, cache_discovery=False)
+
+                def _list_children(parent_id: str, q_extra: str, page_size: int = 10) -> list[dict[str, Any]]:
+                    q = f"'{parent_id}' in parents and trashed=false {q_extra}"
+                    resp = svc.files().list(
+                        q=q,
+                        pageSize=page_size,
+                        fields="files(id,name,mimeType)",
+                        includeItemsFromAllDrives=True,
+                        supportsAllDrives=True,
+                    ).execute()
+                    return list(resp.get("files", []))
+
+                # Shallow BFS up to depth 2 to find up to `limit` non-folder files quickly.
+                queue: list[tuple[str, int]] = [(req.source, 0)]
+                seen: set[str] = {req.source}
+                while queue and len(file_ids) < limit:
+                    current, depth = queue.pop(0)
+                    try:
+                        files = _list_children(current, "and mimeType != 'application/vnd.google-apps.folder'", page_size=max(5, limit))
+                        for f in files:
+                            if len(file_ids) >= limit:
+                                break
+                            fid = str(f.get("id", "") or "")
+                            if fid:
+                                file_ids.append(fid)
+                        if len(file_ids) >= limit or depth >= 2:
+                            continue
+                        subs = _list_children(current, "and mimeType = 'application/vnd.google-apps.folder'", page_size=5)
+                        for sf in subs:
+                            sid = str(sf.get("id", "") or "")
+                            if sid and sid not in seen:
+                                seen.add(sid)
+                                queue.append((sid, depth + 1))
+                    except Exception:
+                        # Ignore listing errors at this stage; we'll fall back to loader recursion.
+                        continue
+
+                if file_ids:
+                    # Switch to file_ids mode for faster, bounded loading
+                    loader_kwargs.pop("folder_id", None)
+                    loader_kwargs.pop("recursive", None)
+                    loader_kwargs["file_ids"] = file_ids
+            except Exception:
+                # non-fatal; proceed with regular folder traversal
+                pass
+
         try:
             loader = GoogleDriveLoader(**loader_kwargs)
         except ValueError as exc:
@@ -540,6 +609,7 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
                 status_code=500,
                 detail=f"Configuration Google Drive invalide: {exc}",
             ) from exc
+
         docs: list[Document] = []
         try:
             _lazy = getattr(loader, "lazy_load", None)
@@ -548,10 +618,14 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
                     try:
                         if _d and getattr(_d, "page_content", "").strip():
                             docs.append(_d)
+                            if limit > 0 and len(docs) >= limit:
+                                break
                     except Exception:
                         continue
             else:
                 docs = loader.load()
+                if limit > 0 and len(docs) > limit:
+                    docs = docs[:limit]
         except Exception as _e:
             try:
                 docs = []
@@ -559,12 +633,13 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
                     try:
                         if _d and getattr(_d, "page_content", "").strip():
                             docs.append(_d)
+                            if limit > 0 and len(docs) >= limit:
+                                break
                     except Exception:
                         continue
             except Exception as _e2:
                 raise HTTPException(status_code=500, detail=f"Echec chargement Google Drive: {_e2}") from _e2
-        if not docs:
-            raise HTTPException(status_code=500, detail="Aucun document lisible depuis Google Drive.")
+        # Ne pas échouer si aucun document lisible: laissez l'API retourner added:0
         return docs
     if req.source_type == "pdf":
         path = _resolve_local_path(req.source)
@@ -875,15 +950,15 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
 
 
 class RagQueryFilters(BaseModel):
-    domain: str | None = None
-    document_id: str | None = None
-    tags: list[str] | None = None
-    metadata: dict[str, Any] | None = None
+    domain: Optional[str] = None
+    document_id: Optional[str] = None
+    tags: Optional[list[str]] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class RagQuery(BaseModel):
     query: str
-    filters: RagQueryFilters | None = None
+    filters: Optional[RagQueryFilters] = None
     top_k: int = Field(default=6, ge=1, le=50)
     collection: str = Field(default=COLLECTION_NAME)
 

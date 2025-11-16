@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any
+from typing import Any, Optional, List, Dict
 
 import requests
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
 try:
@@ -46,8 +46,7 @@ def _ensure_upload_dir() -> str:
 
 @router.get("/health")
 def admin_health(request: Request) -> dict[str, str]:
-    """Basic readiness probe for admin integrations."""
-    _admin_guard(request)
+    """Basic readiness probe for admin integrations (no auth required)."""
     _ensure_upload_dir()
     catalog.init_db(os.getenv("ADMIN_DB_PATH"))
     return {"status": "ok"}
@@ -57,11 +56,11 @@ def admin_health(request: Request) -> dict[str, str]:
 
 class CreateDocumentPayload(BaseModel):
     domain: str = Field(description="lycee | web3 | ...")
-    title: str | None = None
+    title: Optional[str] = None
     source_type: str = Field(description="url|gdrive_folder|pdf|docx|markdown|md|video")
     source_location: str
-    tags: list[str] | None = None
-    metadata: dict[str, Any] | None = None
+    tags: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 @router.post("/documents")
@@ -80,9 +79,8 @@ def create_document(payload: CreateDocumentPayload, request: Request) -> dict[st
 
 
 @router.get("/documents")
-def list_documents(domain: str | None = Query(default=None), request: Request | None = None) -> dict[str, Any]:
-    if request is not None:
-        _admin_guard(request)
+def list_documents(request: Request, domain: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    _admin_guard(request)
     docs = catalog.list_documents(domain=domain.strip() if domain else None, path=os.getenv("ADMIN_DB_PATH"))
     return {"documents": docs}
 
@@ -127,7 +125,8 @@ def ingest_document(document_id: str, request: Request) -> dict[str, Any]:
         headers["Authorization"] = f"Bearer {token}"
 
     try:
-        resp = requests.post(f"{base_url}/ingest", json=ingest_payload, timeout=60, headers=headers)
+        timeout_s = int(os.getenv("ADMIN_INGEST_TIMEOUT_SECONDS", "1800") or "1800")
+        resp = requests.post(f"{base_url}/ingest", json=ingest_payload, timeout=timeout_s, headers=headers)
         resp.raise_for_status()
         body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
         added = int(body.get("added", 0)) if isinstance(body, dict) else 0
@@ -139,15 +138,189 @@ def ingest_document(document_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.post("/reindex")
-def trigger_reindex(payload: dict[str, Any] | None = None, request: Request | None = None) -> dict[str, str]:
-    """Placeholder endpoint for batch reindex orchestration.
+def trigger_reindex(request: Request, payload: Optional[dict[str, Any]] = None) -> dict[str, str]:
+    """Placeholder endpoint for batch reindex orchestration (no auth required).
 
     The actual implementation is environment-specific; for now we acknowledge the
     call so that automation hooks can validate connectivity.
     """
-    if request is not None:
-        _admin_guard(request)
     _ = payload
     _ensure_upload_dir()
     _logger.info("Received reindex request via admin API")
     raise HTTPException(status_code=503, detail="Reindexing backend not configured")
+
+
+@router.get("/documents/{document_id}")
+def get_document_detail(document_id: str, request: Request) -> dict[str, Any]:
+    _admin_guard(request)
+    db_path = os.getenv("ADMIN_DB_PATH")
+    doc = catalog.get_document(document_id, path=db_path)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return doc
+
+
+@router.patch("/documents/{document_id}")
+def update_document_detail(document_id: str, request: Request, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    _admin_guard(request)
+    body = payload or {}
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    forbidden = {"domain", "source_type", "source_location"}
+    if any(k in body for k in forbidden):
+        raise HTTPException(status_code=400, detail="Fields domain/source_type/source_location are immutable")
+    title = body.get("title")
+    tags = body.get("tags")
+    metadata = body.get("metadata")
+    if tags is not None and not isinstance(tags, list):
+        raise HTTPException(status_code=400, detail="tags must be a list of strings")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="metadata must be an object")
+    updated = catalog.update_document(
+        document_id,
+        title=(title.strip() if isinstance(title, str) else title),
+        tags=tags,
+        metadata=metadata,
+        path=os.getenv("ADMIN_DB_PATH"),
+    )
+    if not updated:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return updated
+
+
+@router.delete("/documents/{document_id}")
+def delete_document_detail(document_id: str, request: Request) -> dict[str, Any]:
+    _admin_guard(request)
+    ok = catalog.delete_document(document_id, path=os.getenv("ADMIN_DB_PATH"))
+    if not ok:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"deleted": True}
+
+
+@router.get("/ingestions")
+def list_all_ingestions_endpoint(
+    request: Request,
+    document_id: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    since: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    _admin_guard(request)
+    if document_id and not status and not since:
+        runs = catalog.list_ingestions(document_id=document_id, path=os.getenv("ADMIN_DB_PATH"))
+    else:
+        runs = catalog.list_all_ingestions(
+            document_id=document_id,
+            status=status,
+            since=since,
+            limit=limit,
+            path=os.getenv("ADMIN_DB_PATH"),
+        )
+    return {"ingestions": runs}
+
+
+@router.post("/upload")
+async def admin_upload(
+    request: Request,
+    file: UploadFile = File(...),
+    ingest: bool = Query(default=False),
+    document_id: Optional[str] = Query(default=None),
+    domain: Optional[str] = Query(default=None),
+    title: Optional[str] = Query(default=None),
+    tags: Optional[str] = Query(default=None),  # JSON array as string
+    metadata: Optional[str] = Query(default=None),  # JSON object as string
+) -> dict[str, Any]:
+    _admin_guard(request)
+    upload_dir = _ensure_upload_dir()
+    base_name = os.path.basename(file.filename or "upload.bin")
+    try:
+        import uuid as _uuid
+        safe_name = f"{_uuid.uuid4().hex}-{base_name}"
+        dest_path = os.path.join(upload_dir, safe_name)
+        size = 0
+        with open(dest_path, "wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                size += len(chunk)
+    except Exception as exc:  # pragma: no cover - filesystem hazards
+        _logger.error("Upload failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to save upload: {exc}") from exc
+
+    # Guess source type by extension / mime
+    try:
+        import mimetypes as _m
+        mime = file.content_type or _m.guess_type(dest_path)[0]
+    except Exception:
+        mime = file.content_type or None
+    ext = os.path.splitext(base_name)[1].lower()
+    guess: str | None
+    if ext == ".pdf" or (mime and "pdf" in mime):
+        guess = "pdf"
+    elif ext in {".docx", ".doc"} or (mime and ("word" in mime or "officedocument" in mime)):
+        guess = "docx"
+    elif ext in {".md", ".markdown"} or (mime and "markdown" in mime):
+        guess = "markdown"
+    else:
+        guess = None
+
+    info = {
+        "path": dest_path,
+        "filename": base_name,
+        "size_bytes": size,
+        "mime": mime,
+        "source_type_guess": guess,
+    }
+
+    if not ingest:
+        return info
+
+    # Optional creation of a document, then trigger ingestion
+    parsed_tags: list[str] | None = None
+    parsed_meta: dict[str, Any] | None = None
+    if tags:
+        try:
+            import json as _json
+            t = _json.loads(tags)
+            if not isinstance(t, list):
+                raise ValueError("tags must be a JSON array")
+            parsed_tags = [str(x) for x in t]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid tags: {exc}") from exc
+    if metadata:
+        try:
+            import json as _json
+            m = _json.loads(metadata)
+            if not isinstance(m, dict):
+                raise ValueError("metadata must be a JSON object")
+            parsed_meta = {str(k): str(v) for k, v in m.items() if v is not None}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid metadata: {exc}") from exc
+
+    db_path = os.getenv("ADMIN_DB_PATH")
+    if not document_id:
+        if not domain:
+            raise HTTPException(status_code=400, detail="domain is required when creating a document")
+        created = catalog.create_document(
+            domain=domain.strip(),
+            source_type=(guess or "markdown"),
+            source_location=dest_path,
+            title=(title.strip() if isinstance(title, str) and title.strip() else base_name),
+            tags=parsed_tags,
+            metadata=parsed_meta,
+            path=db_path,
+        )
+        document_id = created["id"]
+
+    # Trigger ingestion via the existing endpoint/function
+    try:
+        _ = ingest_document(document_id, request)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _logger.exception("Admin upload-triggered ingest failed")
+        raise HTTPException(status_code=500, detail=f"Ingestion trigger failed: {exc}") from exc
+
+    return info

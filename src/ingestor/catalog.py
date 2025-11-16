@@ -270,3 +270,90 @@ def list_ingestions(document_id: str, *, limit: int = 50, path: str | None = Non
             "chunks_count": chunks,
         })
     return out
+
+
+def update_document(
+    document_id: str,
+    *,
+    title: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    path: str | None = None,
+) -> dict[str, Any] | None:
+    """Update allowed fields only (title, tags, metadata). Domain/source_* are immutable.
+    Returns the updated document dict or None if not found.
+    """
+    init_db(path)
+    fields: list[str] = []
+    params: list[Any] = []
+    if title is not None:
+        fields.append("title = ?")
+        params.append(title)
+    if tags is not None:
+        tags_csv = ",".join([str(t).strip() for t in tags if t and str(t).strip()]) or None
+        fields.append("tags = ?")
+        params.append(tags_csv)
+    if metadata is not None:
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+        fields.append("metadata_json = ?")
+        params.append(metadata_json)
+    if not fields:
+        return get_document(document_id, path=path)
+    fields.append("updated_at = ?")
+    params.append(_utc_now())
+    params.append(document_id)
+    with db_conn(path) as conn:
+        conn.execute(f"UPDATE documents SET {', '.join(fields)} WHERE id = ?", params)
+    return get_document(document_id, path=path)
+
+
+def delete_document(document_id: str, *, path: str | None = None) -> bool:
+    """Delete a document by id. ON DELETE CASCADE removes related ingestion_runs."""
+    init_db(path)
+    with db_conn(path) as conn:
+        cur = conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
+        return cur.rowcount > 0
+
+
+def list_all_ingestions(
+    *,
+    document_id: str | None = None,
+    status: str | None = None,
+    since: str | None = None,
+    limit: int = 200,
+    path: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return list of ingestion_runs with optional filters across all documents."""
+    init_db(path)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if document_id:
+        clauses.append("document_id = ?")
+        params.append(document_id)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if since:
+        clauses.append("started_at >= ?")
+        params.append(since)
+    q = (
+        "SELECT id, document_id, started_at, finished_at, status, error_message, chunks_count FROM ingestion_runs"
+    )
+    if clauses:
+        q += " WHERE " + " AND ".join(clauses)
+    q += " ORDER BY started_at DESC LIMIT ?"
+    params.append(int(max(1, min(limit, 1000))))
+    with db_conn(path) as conn:
+        rows = conn.execute(q, params).fetchall()
+    out: list[dict[str, Any]] = []
+    for (rid, doc_id, started_at, finished_at, st, err, chunks) in rows:
+        out.append({
+            "id": rid,
+            "document_id": doc_id,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "status": st,
+            "error_message": err,
+            "chunks_count": chunks,
+        })
+    return out
