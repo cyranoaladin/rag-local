@@ -110,16 +110,18 @@ def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cove
 parse_multimodal: Callable[..., Any] = _parse_multimodal_stub
 
 # Try package-relative import first, then fallback to local module path
+_mm_mod: Optional[ModuleType] = None
 try:
-    from . import mm_adapter as _mm
-    parse_multimodal = getattr(_mm, "parse_multimodal", parse_multimodal)
+    from . import mm_adapter as _pkg_mm  # prefer package-relative when available
+    _mm_mod = _pkg_mm
 except Exception:  # pragma: no cover - import fallback
     try:
-        import mm_adapter as _mm  # type: ignore[import-not-found]
-        parse_multimodal = getattr(_mm, "parse_multimodal", parse_multimodal)
+        _mm_mod = importlib.import_module("mm_adapter")
     except Exception:
-        # keep stub
-        pass
+        _mm_mod = None
+
+if _mm_mod is not None:
+    parse_multimodal = getattr(_mm_mod, "parse_multimodal", parse_multimodal)
 
 # Import admin_api from the same package; support both package and script execution
 try:
