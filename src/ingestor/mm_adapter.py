@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import inspect as _inspect
 import io
 import json
 import os
@@ -11,8 +12,6 @@ import sys
 import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-import sys as _sys
-import inspect as _inspect
 from pathlib import Path
 from types import ModuleType
 from typing import Any, BinaryIO
@@ -49,7 +48,7 @@ else:  # pragma: no cover - runtime on older Python
     def _dataclass_compat(*d_args, **d_kwargs):
         d_kwargs.pop("slots", None)
         return dataclass(*d_args, **d_kwargs)
-    _DATACLASS_DECORATOR = _dataclass_compat  # type: ignore[assignment]
+    _DATACLASS_DECORATOR = _dataclass_compat
     _DATACLASS_KW = {}
 
 @_DATACLASS_DECORATOR(**_DATACLASS_KW)
@@ -93,7 +92,7 @@ class Chunk:
         blob_data = payload.get("blob_b64")
         blob = base64.b64decode(blob_data) if isinstance(blob_data, str) else None
         metadata = payload.get("metadata") or {}
-        return cls(
+        return cls(  # type: ignore[call-arg]
             modality=str(payload.get("modality", "unknown")),
             text=payload.get("text"),
             blob=blob,
@@ -161,7 +160,7 @@ def parse_multimodal(
 
         emitted: list[dict[str, Any]] = []
         for idx, snippet in enumerate(chunks, start=0):
-            chunk = Chunk(
+            chunk = Chunk(  # type: ignore[call-arg]
                 modality="text",
                 text=snippet,
                 metadata={
@@ -199,7 +198,7 @@ def _read_payload(stream: BinaryIO, timeout_s: float) -> tuple[bytes, bool]:
         chunk = stream.read(8192)
         if not chunk:
             break
-        if not isinstance(chunk, (bytes, bytearray)):
+        if not isinstance(chunk, (bytes, bytearray)):  # noqa: UP038 - keep Py3.9-compatible isinstance tuple
             chunk = bytes(chunk)
         parts.append(bytes(chunk))
     duration = time.perf_counter() - start
@@ -250,7 +249,7 @@ def _split_text(text: str, max_chars: int) -> Iterable[str]:
 
 
 def _emit_blob_chunks(payload: bytes, metadata: dict[str, Any], metrics_module: ModuleType) -> Iterator[Chunk]:
-    chunk = Chunk(
+    chunk = Chunk(  # type: ignore[call-arg]
         modality="other",
         blob=payload,
         metadata={

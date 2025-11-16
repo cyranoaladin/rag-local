@@ -5,15 +5,15 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import Any, Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
 DB_PATH = os.getenv("ADMIN_DB_PATH", "/data/catalog.sqlite")
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 @contextmanager

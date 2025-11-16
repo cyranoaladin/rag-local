@@ -206,8 +206,9 @@ def _render_uploader() -> None:
             "title": title_hint or uploaded.name,
         }
         try:
+            base_url = (INGEST_BASE_URL or "").rstrip('/')
             r = requests.post(
-                f"{INGEST_BASE_URL.rstrip('/')}/admin/upload",
+                f"{base_url}/admin/upload",
                 headers=headers,
                 files=files,
                 params=params,

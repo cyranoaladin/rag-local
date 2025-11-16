@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import urlparse
 
 import chromadb
@@ -24,10 +24,10 @@ import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from langchain_google_community import GoogleDriveLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_google_community import GoogleDriveLoader
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
@@ -100,14 +100,15 @@ except ImportError:
 except Exception:  # pragma: no cover - older Python may fail on dataclass(slots=...)
     # Provide lightweight stubs so that non-multimodal code paths continue to work.
     class Chunk:  # type: ignore[no-redef]
-        def __init__(self, *args, **kwargs) -> None:
-            self.text = ""
-            self.modality = "unknown"
-            self.metadata = {}
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.text: str = ""
+            self.modality: str = "unknown"
+            self.metadata: dict[str, Any] = {}
         def as_text(self) -> str:
             return getattr(self, "text", "")
-    def parse_multimodal(*args, **kwargs):  # type: ignore[no-redef]
+    def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - stub
         raise RuntimeError("Multimodal parser not available on this runtime")
+parse_multimodal = _parse_multimodal_stub
 
 try:
     from . import admin_api as _admin_api_module
@@ -552,8 +553,8 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
         if limit > 0:
             try:
                 # Import inside the branch to avoid hard dependency at import time.
-                from google.oauth2 import service_account as _sa  # type: ignore
-                from googleapiclient.discovery import build as _build  # type: ignore
+                from google.oauth2 import service_account as _sa
+                from googleapiclient.discovery import build as _build
                 creds = _sa.Credentials.from_service_account_file(str(loader_kwargs.get("credentials_path", service_account_raw)))
                 svc = _build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -921,8 +922,8 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
 
     # Query by embedding
     try:
-        k = max(1, min(int(payload.k), 50))
-        results = collection.query(query_embeddings=[q_vec], n_results=k)
+        n_results = max(1, min(int(payload.k), 50))
+        results = collection.query(query_embeddings=[q_vec], n_results=n_results)
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
 
@@ -944,21 +945,21 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
     return {
         "query": payload.q,
         "collection": payload.collection,
-        "k": k,
+        "k": n_results,
         "hits": hits,
     }
 
 
 class RagQueryFilters(BaseModel):
-    domain: Optional[str] = None
-    document_id: Optional[str] = None
-    tags: Optional[list[str]] = None
-    metadata: Optional[dict[str, Any]] = None
+    domain: str | None = None
+    document_id: str | None = None
+    tags: list[str] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class RagQuery(BaseModel):
     query: str
-    filters: Optional[RagQueryFilters] = None
+    filters: RagQueryFilters | None = None
     top_k: int = Field(default=6, ge=1, le=50)
     collection: str = Field(default=COLLECTION_NAME)
 
@@ -1014,8 +1015,8 @@ def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
 
     # Query by embedding with optional filters
     try:
-        k = max(1, min(int(payload.top_k), 50))
-        query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": k}
+        n_results = max(1, min(int(payload.top_k), 50))
+        query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": n_results}
         if where:
             query_kwargs["where"] = where
         results = collection.query(**query_kwargs)
@@ -1039,7 +1040,7 @@ def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
     return {
         "query": payload.query,
         "collection": payload.collection,
-        "k": k,
+        "k": n_results,
         "filters": where,
         "hits": hits,
     }
