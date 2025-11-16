@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import sys
-from typing import Any
 
 import pytest
 
