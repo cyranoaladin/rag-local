@@ -5,7 +5,7 @@ import os
 from typing import Any, Optional
 
 import requests
-from fastapi import APIRouter, Body, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
 try:
@@ -168,9 +168,12 @@ def get_document_detail(document_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.patch("/documents/{document_id}")
-def update_document_detail(document_id: str, request: Request, payload: Any = Body(default=None)) -> dict[str, Any]:
+async def update_document_detail(document_id: str, request: Request) -> dict[str, Any]:
     _admin_guard(request)
-    body = payload or {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="Invalid payload")
     forbidden = {"domain", "source_type", "source_location"}
