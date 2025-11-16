@@ -1,5 +1,6 @@
 [tool.ruff]
 line-length = 100
+# Keep global target at py311 for most modules
 target-version = "py311"
 extend-exclude = ["build", "dist", ".venv", "infra/creds", "n8n/workflows/examples"]
 fix = false
@@ -8,6 +9,14 @@ fix = false
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]  # longueur de ligne gérée pragmatiquement
 preview = false
+
+# Some ingestor modules must remain Python 3.9–compatible at runtime.
+# Per-file ignores prevent pyupgrade suggestions that would break py39
+# and suppress import reordering warnings for intentional dynamic imports.
+[tool.ruff.lint.per-file-ignores]
+"src/ingestor/api.py" = ["I001", "UP007", "UP017"]
+"src/ingestor/admin_api.py" = ["UP007"]
+"src/ingestor/catalog.py" = ["UP017"]
 
 [tool.mypy]
 python_version = "3.11"
