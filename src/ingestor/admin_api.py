@@ -5,7 +5,7 @@ import os
 from typing import Any, Optional
 
 import requests
-from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Body, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
 try:
@@ -168,7 +168,7 @@ def get_document_detail(document_id: str, request: Request) -> dict[str, Any]:
 
 
 @router.patch("/documents/{document_id}")
-def update_document_detail(document_id: str, request: Request, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def update_document_detail(document_id: str, request: Request, payload: Any = Body(default=None)) -> dict[str, Any]:
     _admin_guard(request)
     body = payload or {}
     if not isinstance(body, dict):
