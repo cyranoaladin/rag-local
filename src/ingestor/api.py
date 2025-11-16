@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 from urllib.parse import urlparse
 
 import chromadb
@@ -92,28 +92,45 @@ ingest_requests_total = ingest_metrics.ingest_requests_total
 
 logger = logging.getLogger(__name__)
 
-try:
-    from .mm_adapter import Chunk, parse_multimodal
-except ImportError:
-    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
-    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
-except Exception:  # pragma: no cover - older Python may fail on dataclass(slots=...)
-    # Provide lightweight stubs so that non-multimodal code paths continue to work.
-    class Chunk:  # type: ignore[no-redef]
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            self.text: str = ""
-            self.modality: str = "unknown"
-            self.metadata: dict[str, Any] = {}
-        def as_text(self) -> str:
-            return getattr(self, "text", "")
-    def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - stub
-        raise RuntimeError("Multimodal parser not available on this runtime")
-parse_multimodal = _parse_multimodal_stub
+# Multimodal adapter: default to safe stubs, then try to override with real impl
+class Chunk:  # type: ignore[no-redef]
+    def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - stub
+        self.text: str = ""
+        self.modality: str = "unknown"
+        self.metadata: dict[str, Any] = {}
 
+    def as_text(self) -> str:  # pragma: no cover - stub
+        return getattr(self, "text", "")
+
+
+def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - stub
+    raise RuntimeError("Multimodal parser not available on this runtime")
+
+# Assign stub by default; successful import below will override these names
+parse_multimodal = _parse_multimodal_stub  # type: ignore[assignment]
+
+# Try package-relative import first, then fallback to local module path
 try:
-    from . import admin_api as _admin_api_module
-except ImportError:  # pragma: no cover - Docker execution path
-    _admin_api_module = importlib.import_module("admin_api")
+    from .mm_adapter import Chunk as _MMChunk, parse_multimodal as _mm_parse  # type: ignore
+    Chunk = _MMChunk  # type: ignore[assignment]
+    parse_multimodal = _mm_parse  # type: ignore[assignment]
+except Exception:  # pragma: no cover - import fallback
+    try:
+        from mm_adapter import Chunk as _MMChunk, parse_multimodal as _mm_parse  # type: ignore
+        Chunk = _MMChunk  # type: ignore[assignment]
+        parse_multimodal = _mm_parse  # type: ignore[assignment]
+    except Exception:
+        # keep stubs
+        pass
+
+# Import admin_api from the same package; support both package and script execution
+try:
+    from . import admin_api as _admin_api_module  # type: ignore[no-redef]
+except Exception:  # pragma: no cover - flexible fallback
+    try:
+        _admin_api_module = importlib.import_module("ingestor.admin_api")
+    except Exception:
+        _admin_api_module = importlib.import_module("admin_api")
 
 admin_api = _admin_api_module
 
@@ -662,7 +679,7 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
 def _prepare_chunks_for_chroma(
     req: IngestRequest,
     docs: list[Document],
-    splitter: RecursiveCharacterTextSplitter | None = None,
+    splitter: Optional[RecursiveCharacterTextSplitter] = None,
 ) -> PreparedBatch:
     splitter = splitter or RecursiveCharacterTextSplitter(
         chunk_size=INGEST_CHUNK_SIZE, chunk_overlap=INGEST_CHUNK_OVERLAP
@@ -951,15 +968,15 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
 
 
 class RagQueryFilters(BaseModel):
-    domain: str | None = None
-    document_id: str | None = None
-    tags: list[str] | None = None
-    metadata: dict[str, Any] | None = None
+    domain: Optional[str] = None
+    document_id: Optional[str] = None
+    tags: Optional[list[str]] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class RagQuery(BaseModel):
     query: str
-    filters: RagQueryFilters | None = None
+    filters: Optional[RagQueryFilters] = None
     top_k: int = Field(default=6, ge=1, le=50)
     collection: str = Field(default=COLLECTION_NAME)
 
