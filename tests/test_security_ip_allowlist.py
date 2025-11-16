@@ -54,7 +54,7 @@ def test_search_allowed_with_loopback_client(monkeypatch: pytest.MonkeyPatch) ->
     r = client.post(
         "/search",
         json={"q": "x", "k": 1, "include_documents": False, "collection": api.COLLECTION_NAME},
-        headers={"Authorization": "Bearer tok"},
+        headers={"Authorization": "Bearer tok", "X-Forwarded-For": "127.0.0.1"},
     )
     assert r.status_code == 200
 
