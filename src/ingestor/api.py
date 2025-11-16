@@ -93,7 +93,7 @@ ingest_requests_total = ingest_metrics.ingest_requests_total
 logger = logging.getLogger(__name__)
 
 # Multimodal adapter: default to safe stubs, then try to override with real impl
-class Chunk:  # type: ignore[no-redef]
+class Chunk:
     def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - stub
         self.text: str = ""
         self.modality: str = "unknown"
@@ -106,26 +106,24 @@ class Chunk:  # type: ignore[no-redef]
 def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - stub
     raise RuntimeError("Multimodal parser not available on this runtime")
 
-# Assign stub by default; successful import below will override these names
-parse_multimodal = _parse_multimodal_stub  # type: ignore[assignment]
+# Assign stub by default; successful import below will override this name
+parse_multimodal = _parse_multimodal_stub
 
 # Try package-relative import first, then fallback to local module path
 try:
-    from .mm_adapter import Chunk as _MMChunk, parse_multimodal as _mm_parse  # type: ignore
-    Chunk = _MMChunk  # type: ignore[assignment]
-    parse_multimodal = _mm_parse  # type: ignore[assignment]
+    from .mm_adapter import parse_multimodal as _mm_parse
+    parse_multimodal = _mm_parse
 except Exception:  # pragma: no cover - import fallback
     try:
-        from mm_adapter import Chunk as _MMChunk, parse_multimodal as _mm_parse  # type: ignore
-        Chunk = _MMChunk  # type: ignore[assignment]
-        parse_multimodal = _mm_parse  # type: ignore[assignment]
+        from mm_adapter import parse_multimodal as _mm_parse
+        parse_multimodal = _mm_parse
     except Exception:
-        # keep stubs
+        # keep stub
         pass
 
 # Import admin_api from the same package; support both package and script execution
 try:
-    from . import admin_api as _admin_api_module  # type: ignore[no-redef]
+    from . import admin_api as _admin_api_module
 except Exception:  # pragma: no cover - flexible fallback
     try:
         _admin_api_module = importlib.import_module("ingestor.admin_api")
