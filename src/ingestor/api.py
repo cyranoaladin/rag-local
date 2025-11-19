@@ -442,8 +442,9 @@ def _validate_remote_url(url: str) -> None:
 
 def _download_to_temp(url: str, suffix: str) -> Path:
     _validate_remote_url(url)
+    headers = {"User-Agent": os.getenv("USER_AGENT", "rag-local-ingestor/1.0")}
     try:
-        with requests.get(url, timeout=30, stream=True) as response:
+        with requests.get(url, timeout=30, stream=True, headers=headers) as response:
             response.raise_for_status()
             total = 0
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
@@ -465,8 +466,9 @@ def _download_to_temp(url: str, suffix: str) -> Path:
 
 def _fetch_remote_text(url: str) -> tuple[str, str]:
     _validate_remote_url(url)
+    headers = {"User-Agent": os.getenv("USER_AGENT", "rag-local-ingestor/1.0")}
     try:
-        with requests.get(url, timeout=30, allow_redirects=True, stream=True) as response:
+        with requests.get(url, timeout=30, allow_redirects=True, stream=True, headers=headers) as response:
             if response.history:
                 for hop in response.history:
                     _validate_remote_url(hop.url)

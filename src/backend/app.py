@@ -1,6 +1,8 @@
 """Entry point for the dashboard backend FastAPI application."""
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,12 +10,14 @@ from .core.config import get_settings
 from .core.db import init_db
 from .routers import auth, users
 
-app = FastAPI(title="rag-local dashboard API")
 
-
-@app.on_event("startup")
-def startup_hook() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
+    yield
+
+
+app = FastAPI(title="rag-local dashboard API", lifespan=lifespan)
 
 
 settings = get_settings()

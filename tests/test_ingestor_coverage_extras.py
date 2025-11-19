@@ -119,7 +119,7 @@ def test_download_to_temp_max_bytes(monkeypatch: pytest.MonkeyPatch, tmp_path: P
         def __exit__(self, *a):
             return False
 
-    def fake_get(url, timeout=30, stream=True):  # noqa: ARG001
+    def fake_get(url, timeout=30, stream=True, headers=None):  # noqa: ARG001
         return FakeResp()
 
     monkeypatch.setattr(api, "requests", type("Rq", (), {"get": fake_get, "RequestException": api.requests.RequestException}))
@@ -163,13 +163,18 @@ def test_fetch_remote_text_limits_and_empty(monkeypatch: pytest.MonkeyPatch) -> 
     def get_empty(*_a, **_k):
         return EmptyResp()
 
+    def get_declared_with_headers(*_a, headers=None, **_k):
+        return DeclaredTooBig()
+    def get_empty_with_headers(*_a, headers=None, **_k):
+        return EmptyResp()
+
     # declared length branch
-    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": get_declared, "RequestException": api.requests.RequestException}))
+    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": get_declared_with_headers, "RequestException": api.requests.RequestException}))
     with pytest.raises(api.HTTPException):
         api._fetch_remote_text("http://example.com")
 
     # empty content branch
-    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": get_empty, "RequestException": api.requests.RequestException}))
+    monkeypatch.setattr(api, "requests", type("Rq", (), {"get": get_empty_with_headers, "RequestException": api.requests.RequestException}))
     with pytest.raises(api.HTTPException):
         api._fetch_remote_text("http://example.com")
 
