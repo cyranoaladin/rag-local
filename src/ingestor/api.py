@@ -23,13 +23,18 @@ import chromadb
 import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_google_community import GoogleDriveLoader
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+
+try:
+    from .drive_sync import DriveSyncManager
+except ImportError:
+    from drive_sync import DriveSyncManager
 
 if TYPE_CHECKING:
     from langchain.schema import Document
@@ -145,6 +150,8 @@ class PreparedBatch:
 app = FastAPI(title="RAG Ingestor API")
 app.include_router(admin_api.router)
 
+sync_manager = DriveSyncManager()
+
 
 @app.middleware("http")
 async def _metrics_middleware(request, call_next):
@@ -199,6 +206,11 @@ class IngestRequest(BaseModel):
         alias="metadata",
         validation_alias=AliasChoices("hints", "metadata"),
     )
+
+
+class DriveIngestRequest(BaseModel):
+    folder_id: str
+    metadata: dict[str, str] = Field(default_factory=dict)
 
 
 class SearchRequest(BaseModel):
@@ -783,6 +795,159 @@ def _prepare_multimodal_ingest(req: IngestRequest) -> PreparedBatch:
 # --- Endpoint ---
 
 
+def _index_batch(prepared: PreparedBatch, req_source_type: str, modality_label: str) -> dict[str, Any]:
+    if not prepared.ids:
+        _record_ingest_metrics(True)
+        _record_ingest_outcome(req_source_type, modality_label, "empty")
+        return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
+
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(
+            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+        )
+
+        existing = collection.get(ids=prepared.ids) or {}
+        existing_ids = set(existing.get("ids", []))
+
+        to_add_idx = [i for i, chunk_id in enumerate(prepared.ids) if chunk_id not in existing_ids]
+        if not to_add_idx:
+            _record_ingest_metrics(True)
+            _record_ingest_outcome(req_source_type, modality_label, "skipped")
+            return {"status": "ok", "added": 0, "skipped": len(prepared.ids)}
+
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        docs_to_add = [prepared.documents[i] for i in to_add_idx]
+        ids_to_add = [prepared.ids[i] for i in to_add_idx]
+        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
+        try:
+            embs_to_add = emb.embed_documents(docs_to_add)
+        except ValueError as exc:
+            message = str(exc)
+            if "HTTP code: 404" in message:
+                logger.warning(
+                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                        "Pull the model or adjust EMBED_MODEL before retrying."
+                    ),
+                ) from exc
+            logger.exception("Embedding provider raised ValueError")
+            raise
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Unexpected failure while requesting embeddings")
+            raise
+
+        meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
+        embeddings_seq = cast(list[Sequence[float]], embs_to_add)
+        collection.add(
+            documents=docs_to_add,
+            ids=ids_to_add,
+            metadatas=meta_mappings,
+            embeddings=embeddings_seq,
+        )
+        _record_ingest_metrics(True)
+        _record_ingest_outcome(req_source_type, modality_label, "success")
+        return {
+            "status": "ok",
+            "added": len(ids_to_add),
+            "skipped": len(existing_ids),
+        }
+    except HTTPException as exc:
+        _record_ingest_metrics(False)
+        _record_ingest_outcome(req_source_type, modality_label, f"http_{exc.status_code}")
+        raise
+    except Exception as exc:
+        _record_ingest_metrics(False)
+        _record_ingest_outcome(req_source_type, modality_label, "error")
+        raise HTTPException(
+            status_code=500, detail=f"Erreur d'ingestion dans ChromaDB: {exc}"
+        ) from exc
+
+
+def background_drive_ingest(folder_id: str, metadata: dict):
+    logger.info(f"Starting background drive ingest for folder {folder_id}")
+    try:
+        updates = sync_manager.list_updates(folder_id)
+        if not updates:
+            logger.info("Aucune mise à jour pour le dossier Drive.")
+            return
+
+        # Setup credentials once
+        loader_kwargs_base: dict[str, Any] = {}
+        loader_kwargs_base["supports_all_drives"] = True
+        loader_kwargs_base["export_mime_types"] = {
+            "application/vnd.google-apps.document": "text/plain",
+            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.presentation": "text/plain",
+        }
+        service_account_raw = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if service_account_raw:
+            service_account_path = Path(service_account_raw)
+            if service_account_path.exists():
+                loader_kwargs_base["service_account_key"] = service_account_path
+                loader_kwargs_base["credentials_path"] = service_account_path
+        else:
+            default_credentials = Path.home() / ".credentials" / "credentials.json"
+            if default_credentials.exists():
+                loader_kwargs_base["credentials_path"] = default_credentials
+        
+        token_path = Path(GOOGLE_DRIVE_TOKEN_PATH)
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        loader_kwargs_base["token_path"] = token_path
+
+        for file_meta in updates:
+            try:
+                fid = file_meta.get("id")
+                logger.info(f"Processing file {fid} ({file_meta.get('name')})")
+                
+                # Load specific file
+                kwargs = loader_kwargs_base.copy()
+                kwargs["file_ids"] = [fid]
+                
+                try:
+                    loader = GoogleDriveLoader(**kwargs)
+                    docs = loader.load()
+                except Exception as e:
+                    logger.warning(f"Failed to load file {fid}: {e}")
+                    continue
+                
+                if not docs:
+                    logger.warning(f"No content loaded for file {fid}")
+                    continue
+
+                # Prepare chunks
+                req = IngestRequest(
+                    sourceType="gdrive_folder", 
+                    sourceUrl=folder_id, 
+                    metadata=metadata
+                )
+                prepared = _prepare_chunks_for_chroma(req, docs)
+                
+                # Index
+                try:
+                    _index_batch(prepared, "gdrive_folder", "text")
+                except Exception as e:
+                    logger.error(f"Indexing failed for {fid}: {e}")
+                    continue
+                
+                # Mark as ingested
+                sync_manager.mark_as_ingested(file_meta)
+                
+            except Exception as e:
+                logger.error(f"Error processing file {file_meta.get('id')}: {e}")
+                continue
+                
+    except Exception as e:
+        logger.error(f"Background ingest failed: {e}")
+
+
 @app.post("/ingest")
 def ingest_data(
     req: IngestRequest,
@@ -826,71 +991,20 @@ def ingest_data(
         _record_ingest_outcome(req.source_type, modality_label, "empty")
         return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
 
-    try:
-        client = get_chroma_client()
-        collection = client.get_or_create_collection(
-            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
-        )
+    return _index_batch(prepared, req.source_type, modality_label)
 
-        existing = collection.get(ids=prepared.ids) or {}
-        existing_ids = set(existing.get("ids", []))
 
-        to_add_idx = [i for i, chunk_id in enumerate(prepared.ids) if chunk_id not in existing_ids]
-        if not to_add_idx:
-            _record_ingest_metrics(True)
-            _record_ingest_outcome(req.source_type, modality_label, "skipped")
-            return {"status": "ok", "added": 0, "skipped": len(prepared.ids)}
-
-        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
-        docs_to_add = [prepared.documents[i] for i in to_add_idx]
-        ids_to_add = [prepared.ids[i] for i in to_add_idx]
-        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
-        try:
-            embs_to_add = emb.embed_documents(docs_to_add)
-        except ValueError as exc:
-            message = str(exc)
-            if "HTTP code: 404" in message:
-                logger.warning(
-                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
-                        "Pull the model or adjust EMBED_MODEL before retrying."
-                    ),
-                ) from exc
-            logger.exception("Embedding provider raised ValueError")
-            raise
-        except Exception:  # pragma: no cover - defensive logging
-            logger.exception("Unexpected failure while requesting embeddings")
-            raise
-
-        meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
-        embeddings_seq = cast(list[Sequence[float]], embs_to_add)
-        collection.add(
-            documents=docs_to_add,
-            ids=ids_to_add,
-            metadatas=meta_mappings,
-            embeddings=embeddings_seq,
-        )
-        _record_ingest_metrics(True)
-        _record_ingest_outcome(req.source_type, modality_label, "success")
-        return {
-            "status": "ok",
-            "added": len(ids_to_add),
-            "skipped": len(existing_ids),
-        }
-    except HTTPException as exc:
-        _record_ingest_metrics(False)
-        _record_ingest_outcome(req.source_type, modality_label, f"http_{exc.status_code}")
-        raise
-    except Exception as exc:
-        _record_ingest_metrics(False)
-        _record_ingest_outcome(req.source_type, modality_label, "error")
-        raise HTTPException(
-            status_code=500, detail=f"Erreur d'ingestion dans ChromaDB: {exc}"
-        ) from exc
+@app.post("/ingest/drive")
+def ingest_drive(
+    req: DriveIngestRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+):
+    # Reuse security check
+    _enforce_security(request, req)
+    
+    background_tasks.add_task(background_drive_ingest, req.folder_id, req.metadata)
+    return {"status": "accepted", "message": "Ingestion Drive démarrée en arrière-plan"}
 
 
 @app.get("/health")
