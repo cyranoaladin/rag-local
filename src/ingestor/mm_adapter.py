@@ -234,10 +234,74 @@ def _decode_to_text(payload: bytes, mime: str) -> str:
     if not payload:
         return ""
     mime_lower = (mime or "").lower()
-    if mime_lower.startswith("text/"):
+
+    # Text-based formats: decode directly
+    if mime_lower.startswith("text/") or mime_lower in {"application/json", "application/xml"}:
         return payload.decode("utf-8", errors="ignore")
-    if mime_lower in {"application/json", "application/xml"}:
-        return payload.decode("utf-8", errors="ignore")
+
+    # Images: OCR via pytesseract
+    if mime_lower.startswith("image/"):
+        try:
+            import pytesseract
+            from PIL import Image
+            img = Image.open(io.BytesIO(payload))
+            # Try French first, fallback to English
+            try:
+                text = pytesseract.image_to_string(img, lang="fra+eng")
+            except Exception:
+                text = pytesseract.image_to_string(img, lang="eng")
+            return (text or "").strip()
+        except ImportError:
+            pass  # pytesseract not installed, fall through
+        except Exception:
+            pass
+
+    # PDFs: extract text via pdfplumber or pypdf
+    if mime_lower == "application/pdf":
+        try:
+            import pdfplumber
+            text_parts: list[str] = []
+            with pdfplumber.open(io.BytesIO(payload)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_parts.append(page_text)
+            return "\n".join(text_parts)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        # Fallback to pypdf
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(payload))
+            return "\n".join(
+                (page.extract_text() or "") for page in reader.pages
+            )
+        except Exception:
+            pass
+
+    # Audio: try whisper transcription if available
+    if mime_lower.startswith("audio/") or mime_lower.startswith("video/"):
+        try:
+            import whisper
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
+                tmp.write(payload)
+                tmp_path = tmp.name
+            model = whisper.load_model("base")
+            result = model.transcribe(tmp_path, language="fr")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return (result.get("text", "") or "").strip()
+        except ImportError:
+            pass  # whisper not installed
+        except Exception:
+            pass
+
+    # Fallback: try decoding as UTF-8
     return payload.decode("utf-8", errors="ignore")
 
 

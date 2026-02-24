@@ -23,7 +23,7 @@ import chromadb
 import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
@@ -193,7 +193,7 @@ def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
 
 class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video"] = Field(
+    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video", "image", "audio", "auto"] = Field(
         alias="sourceType",
         validation_alias=AliasChoices("source_type", "sourceType"),
     )
@@ -211,6 +211,22 @@ class IngestRequest(BaseModel):
 class DriveIngestRequest(BaseModel):
     folder_id: str
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class UrlBatchRequest(BaseModel):
+    """Requête d'ingestion par lot d'URLs."""
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    urls: list[str] = Field(description="Liste d'URLs à ingérer")
+    metadata_hints: dict[str, str] = Field(
+        default_factory=dict,
+        alias="metadata",
+        validation_alias=AliasChoices("hints", "metadata"),
+    )
+
+
+class DeduplicationCheckRequest(BaseModel):
+    """Requête de vérification de doublons avant ingestion."""
+    sources: list[str] = Field(description="Liste de source_path ou URLs à vérifier")
 
 
 class SearchRequest(BaseModel):
@@ -682,11 +698,25 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
     if req.source_type in {"markdown", "md"}:
         path = _resolve_local_path(req.source)
         return load_markdown(path)
-    if req.source_type == "video":
+    if req.source_type in {"video", "image", "audio"}:
         raise HTTPException(
             status_code=400,
-            detail="Ingestion vidéo disponible uniquement en mode multimodal (mode=multimodal).",
+            detail=(
+                f"Ingestion {req.source_type} disponible uniquement en mode multimodal "
+                "(mode=multimodal). Utilisez /ingest/upload-files pour un traitement automatique."
+            ),
         )
+    if req.source_type == "auto":
+        path = _resolve_local_path(req.source)
+        ext = path.suffix.lower()
+        if ext == ".pdf":
+            return PyPDFLoader(str(path)).load()
+        if ext in {".docx", ".doc"}:
+            return load_docx(str(path))
+        if ext in {".md", ".markdown", ".txt", ".csv", ".html", ".htm"}:
+            return load_markdown(path)
+        # Default: try as text
+        return load_markdown(path)
     raise HTTPException(status_code=400, detail=f"source_type non géré: {req.source_type}")
 
 
@@ -1005,6 +1035,221 @@ def ingest_drive(
     
     background_tasks.add_task(background_drive_ingest, req.folder_id, req.metadata)
     return {"status": "accepted", "message": "Ingestion Drive démarrée en arrière-plan"}
+
+
+@app.post("/ingest/urls")
+def ingest_urls(
+    req: UrlBatchRequest,
+    request: Request,
+    mode: str = Query(default="text"),
+) -> dict[str, Any]:
+    """Ingestion par lot d'URLs — vérifie les doublons avant ingestion."""
+    _enforce_security(request, req)
+
+    if not req.urls:
+        raise HTTPException(status_code=400, detail="La liste d'URLs est vide.")
+
+    results: list[dict[str, Any]] = []
+    total_added = 0
+    total_skipped = 0
+
+    for url in req.urls:
+        url = url.strip()
+        if not url:
+            continue
+        try:
+            # Vérifier doublon par content hash
+            sub_req = IngestRequest(
+                sourceType="url", sourceUrl=url, metadata=req.metadata_hints
+            )
+            docs = load_from_url(url)
+            if not docs:
+                results.append({"url": url, "status": "empty", "added": 0, "skipped": 0})
+                continue
+
+            prepared = _prepare_chunks_for_chroma(sub_req, docs)
+            if not prepared.ids:
+                results.append({"url": url, "status": "empty", "added": 0, "skipped": 0})
+                continue
+
+            result = _index_batch(prepared, "url", prepared.modality or "text")
+            added = result.get("added", 0)
+            skipped = result.get("skipped", 0)
+            total_added += added
+            total_skipped += skipped
+            results.append({"url": url, "status": "ok", "added": added, "skipped": skipped})
+        except HTTPException as exc:
+            results.append({"url": url, "status": "error", "detail": exc.detail})
+        except Exception as exc:
+            results.append({"url": url, "status": "error", "detail": str(exc)})
+
+    return {
+        "status": "ok",
+        "total_urls": len(req.urls),
+        "total_added": total_added,
+        "total_skipped": total_skipped,
+        "results": results,
+    }
+
+
+@app.post("/ingest/upload-files")
+async def ingest_upload_files(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    metadata: str = Query(default="{}"),
+    mode: str = Query(default="text"),
+) -> dict[str, Any]:
+    """Upload et ingestion de plusieurs fichiers simultanément avec déduplication."""
+    import json as _json
+    import uuid as _uuid
+
+    _enforce_security(request, None)
+
+    try:
+        hints = _json.loads(metadata)
+        if not isinstance(hints, dict):
+            hints = {}
+    except Exception:
+        hints = {}
+
+    upload_dir = Path(os.getenv("ADMIN_UPLOAD_DIR", "/data/uploads"))
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, Any]] = []
+    total_added = 0
+    total_skipped = 0
+
+    for file in files:
+        fname = file.filename or "upload.bin"
+        safe_name = f"{_uuid.uuid4().hex}-{os.path.basename(fname)}"
+        dest = upload_dir / safe_name
+
+        try:
+            # Sauvegarder le fichier
+            content = await file.read()
+            dest.write_bytes(content)
+
+            # Calculer le hash pour déduplication
+            file_hash = hashlib.sha256(content).hexdigest()
+
+            # Vérifier doublon : même hash déjà présent dans ChromaDB
+            client = get_chroma_client()
+            collection = client.get_or_create_collection(
+                name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+            )
+            existing = collection.get(where={"sha256": file_hash}, limit=1)
+            existing_ids = existing.get("ids", []) if existing else []
+            if existing_ids:
+                total_skipped += 1
+                results.append({
+                    "filename": fname,
+                    "status": "duplicate",
+                    "detail": "Fichier déjà ingéré (même hash SHA256).",
+                })
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                continue
+
+            # Déterminer le type de source
+            ext = dest.suffix.lower()
+            source_type_map: dict[str, str] = {
+                ".pdf": "pdf", ".docx": "docx", ".doc": "docx",
+                ".md": "markdown", ".markdown": "markdown",
+                ".txt": "markdown", ".csv": "markdown",
+                ".html": "url", ".htm": "url",
+                ".jpg": "image", ".jpeg": "image", ".png": "image",
+                ".gif": "image", ".bmp": "image", ".webp": "image",
+                ".mp3": "audio", ".wav": "audio", ".m4a": "audio",
+                ".mp4": "video", ".avi": "video", ".mkv": "video",
+            }
+            detected_type = source_type_map.get(ext, "markdown")
+
+            # Déterminer le mode d'ingestion
+            use_mode = mode
+            if detected_type in {"image", "audio", "video"}:
+                use_mode = "multimodal"
+
+            sub_req = IngestRequest(
+                sourceType=cast(Any, detected_type),
+                sourceUrl=str(dest),
+                metadata={**hints, "original_filename": fname, "file_hash": file_hash},
+            )
+
+            if use_mode == "multimodal" and MULTIMODAL_ENABLED:
+                prepared = _prepare_multimodal_ingest(sub_req)
+            else:
+                docs = _load_source_documents(sub_req)
+                if not docs:
+                    results.append({"filename": fname, "status": "empty", "added": 0})
+                    continue
+                prepared = _prepare_chunks_for_chroma(sub_req, docs)
+
+            if not prepared.ids:
+                results.append({"filename": fname, "status": "empty", "added": 0})
+                continue
+
+            result = _index_batch(prepared, detected_type, prepared.modality or "text")
+            added = result.get("added", 0)
+            skipped = result.get("skipped", 0)
+            total_added += added
+            total_skipped += skipped
+            results.append({
+                "filename": fname,
+                "status": "ok",
+                "added": added,
+                "skipped": skipped,
+                "source_type": detected_type,
+            })
+        except HTTPException as exc:
+            results.append({"filename": fname, "status": "error", "detail": exc.detail})
+        except Exception as exc:
+            logger.exception("Upload ingestion failed for %s", fname)
+            results.append({"filename": fname, "status": "error", "detail": str(exc)})
+
+    return {
+        "status": "ok",
+        "total_files": len(files),
+        "total_added": total_added,
+        "total_skipped": total_skipped,
+        "results": results,
+    }
+
+
+@app.post("/ingest/check-duplicates")
+def check_duplicates(
+    req: DeduplicationCheckRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Vérifie si des sources ont déjà été ingérées pour éviter les doublons."""
+    _enforce_security(request, req)
+
+    client = get_chroma_client()
+    collection = client.get_or_create_collection(
+        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+    )
+
+    results: list[dict[str, Any]] = []
+    for source in req.sources:
+        source = source.strip()
+        if not source:
+            continue
+        # Vérifier par source path dans les métadonnées
+        try:
+            existing = collection.get(where={"source": source}, limit=1)
+            already_ingested = bool(existing and existing.get("ids"))
+        except Exception:
+            already_ingested = False
+        results.append({
+            "source": source,
+            "already_ingested": already_ingested,
+        })
+
+    return {
+        "sources_checked": len(results),
+        "results": results,
+    }
 
 
 @app.get("/health")

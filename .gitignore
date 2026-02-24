@@ -36,3 +36,5 @@ data/
 
 # Nginx rendered configs (dir)
 infra/nginx/rendered/
+.env
+.env.*

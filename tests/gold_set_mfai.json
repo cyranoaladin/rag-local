@@ -1,0 +1,37 @@
+{
+  "tenant": "mfai",
+  "version": "1.0",
+  "description": "Gold set d'évaluation RAG pour MFAI / Journey Simulator",
+  "questions": [
+    {
+      "id": "q001",
+      "question": "Comment fonctionne la simulation de parcours utilisateur ?",
+      "relevant_keywords": ["simulation", "parcours", "utilisateur", "journey"],
+      "expected_sources_contain": ["simulation", "parcours"]
+    },
+    {
+      "id": "q002",
+      "question": "Quels sont les différents types de phases dans le simulateur ?",
+      "relevant_keywords": ["phase", "type", "simulateur", "étape"],
+      "expected_sources_contain": ["phase", "simulateur"]
+    },
+    {
+      "id": "q003",
+      "question": "Comment intégrer un nouveau module dans le backend MFAI ?",
+      "relevant_keywords": ["module", "backend", "intégration", "MFAI"],
+      "expected_sources_contain": ["module", "backend"]
+    },
+    {
+      "id": "q004",
+      "question": "Quelles sont les API disponibles pour le frontend ?",
+      "relevant_keywords": ["API", "frontend", "endpoint", "REST"],
+      "expected_sources_contain": ["API", "endpoint"]
+    },
+    {
+      "id": "q005",
+      "question": "Comment configurer l'authentification utilisateur ?",
+      "relevant_keywords": ["authentification", "utilisateur", "login", "token"],
+      "expected_sources_contain": ["authentification", "sécurité"]
+    }
+  ]
+}
