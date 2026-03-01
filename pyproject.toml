@@ -24,9 +24,29 @@ ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 warn_unused_configs = true
-disallow_untyped_defs = false
+warn_return_any = true
+warn_unreachable = true
+disallow_untyped_defs = false  # Progressivement activé par module
+disallow_incomplete_defs = false
+check_untyped_defs = true
+disallow_any_generics = false
+no_implicit_optional = true
+strict_optional = true
 exclude = "(^\\.venv/|^infra/creds/|^n8n/workflows/)"
 disable_error_code = ["import-untyped"]
+
+# Modules avec typage strict (à étendre progressivement)
+[[tool.mypy.overrides]]
+module = [
+    "src.ingestor.audit_logger",
+    "src.ingestor.metrics",
+    "src.ingestor.database",
+    "src.ingestor.embedding_service",
+    "src.ingestor.hybrid_search",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
 
 [tool.pylint.main]
 py-version = "3.11"

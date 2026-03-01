@@ -9,25 +9,50 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, Field
 
 try:
+    from . import audit_logger as audit_logger
     from . import catalog as catalog
 except Exception:  # pragma: no cover - executed when running as top-level module
     import importlib as _importlib
     try:
         catalog = _importlib.import_module("src.ingestor.catalog")
+        audit_logger = _importlib.import_module("src.ingestor.audit_logger")
     except Exception:
         try:
             catalog = _importlib.import_module("ingestor.catalog")
+            audit_logger = _importlib.import_module("ingestor.audit_logger")
         except Exception:
             catalog = _importlib.import_module("catalog")
+            audit_logger = _importlib.import_module("audit_logger")
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 _logger = logging.getLogger(__name__)
+_audit = audit_logger.get_audit_logger()
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP from request headers."""
+    headers = request.headers or {}
+    forwarded = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
+    if isinstance(forwarded, str) and forwarded.strip():
+        return forwarded.split(",")[0].strip()
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    return host or "unknown"
+
+
+def _get_request_id(request: Request) -> Optional[str]:
+    """Extract request ID from headers for tracing."""
+    headers = request.headers or {}
+    return headers.get("X-Request-ID") or headers.get("x-request-id")
 
 
 # --- Security: reuse same token as /ingest (Bearer or X-API-Token) ---
 
 def _admin_guard(request: Request) -> None:
     token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
+    client_ip = _get_client_ip(request)
+    request_id = _get_request_id(request)
+    
     if not token_env:
         return  # no guard configured
     header_token = request.headers.get("X-API-Token") or request.headers.get("x-api-token")
@@ -35,8 +60,18 @@ def _admin_guard(request: Request) -> None:
         auth = request.headers.get("Authorization") or request.headers.get("authorization")
         if isinstance(auth, str) and auth.strip():
             value = auth.strip()
-            header_token = value.split(" ", 1)[1].strip() if value.lower().startswith("bearer ") else value
+            if value.lower().startswith("bearer "):
+                header_token = value.split(" ", 1)[1].strip()
+            else:
+                header_token = value
     if header_token != token_env:
+        # Log security violation
+        _audit.log_security_violation(
+            violation_type="invalid_admin_token",
+            client_ip=client_ip,
+            details={"header_provided": bool(header_token)},
+            request_id=request_id,
+        )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -73,6 +108,9 @@ class CreateDocumentPayload(BaseModel):
 @router.post("/documents")
 def create_document(payload: CreateDocumentPayload, request: Request) -> dict[str, Any]:
     _admin_guard(request)
+    client_ip = _get_client_ip(request)
+    request_id = _get_request_id(request)
+    
     doc = catalog.create_document(
         domain=payload.domain.strip(),
         source_type=payload.source_type.strip(),
@@ -82,13 +120,38 @@ def create_document(payload: CreateDocumentPayload, request: Request) -> dict[st
         metadata=payload.metadata or {},
         path=os.getenv("ADMIN_DB_PATH"),
     )
+    
+    # Audit log
+    _audit.log_success(
+        action=audit_logger.AuditAction.DOCUMENT_CREATE,
+        client_ip=client_ip,
+        resource_type="document",
+        resource_id=doc.get("id"),
+        details={"domain": payload.domain, "source_type": payload.source_type},
+        request_id=request_id,
+    )
+    
     return doc
 
 
 @router.get("/documents")
 def list_documents(request: Request, domain: Optional[str] = Query(default=None)) -> dict[str, Any]:
     _admin_guard(request)
-    docs = catalog.list_documents(domain=domain.strip() if domain else None, path=os.getenv("ADMIN_DB_PATH"))
+    client_ip = _get_client_ip(request)
+    request_id = _get_request_id(request)
+    
+    db_path = os.getenv("ADMIN_DB_PATH")
+    docs = catalog.list_documents(domain=domain.strip() if domain else None, path=db_path)
+    
+    # Audit log
+    _audit.log_success(
+        action=audit_logger.AuditAction.DOCUMENT_LIST,
+        client_ip=client_ip,
+        resource_type="document",
+        details={"domain_filter": domain, "count": len(docs.get("documents", []))},
+        request_id=request_id,
+    )
+    
     return {"documents": docs}
 
 
@@ -102,10 +165,22 @@ def list_doc_ingestions(document_id: str, request: Request) -> dict[str, Any]:
 @router.post("/documents/{document_id}/ingest")
 def ingest_document(document_id: str, request: Request) -> dict[str, Any]:
     _admin_guard(request)
+    client_ip = _get_client_ip(request)
+    request_id = _get_request_id(request)
+    
     db_path = os.getenv("ADMIN_DB_PATH")
     doc = catalog.get_document(document_id, path=db_path)
     if not doc:
+        _audit.log_failure(
+            action=audit_logger.AuditAction.DOCUMENT_INGEST,
+            reason="document_not_found",
+            client_ip=client_ip,
+            resource_type="document",
+            resource_id=document_id,
+            request_id=request_id,
+        )
         raise HTTPException(status_code=404, detail="Document not found")
+    
     run = catalog.create_ingestion_run(document_id=document_id, path=db_path)
 
     # Build ingest payload
@@ -133,14 +208,52 @@ def ingest_document(document_id: str, request: Request) -> dict[str, Any]:
 
     try:
         timeout_s = int(os.getenv("ADMIN_INGEST_TIMEOUT_SECONDS", "1800") or "1800")
-        resp = requests.post(f"{base_url}/ingest", json=ingest_payload, timeout=timeout_s, headers=headers)
+        resp = requests.post(
+            f"{base_url}/ingest",
+            json=ingest_payload,
+            timeout=timeout_s,
+            headers=headers,
+        )
         resp.raise_for_status()
-        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        content_type = resp.headers.get("content-type", "")
+        body = resp.json() if content_type.startswith("application/json") else {}
         added = int(body.get("added", 0)) if isinstance(body, dict) else 0
-        catalog.finish_ingestion_run(run["id"], status="success", error_message=None, chunks_count=added, path=db_path)
+        catalog.finish_ingestion_run(
+            run["id"],
+            status="success",
+            error_message=None,
+            chunks_count=added,
+            path=db_path,
+        )
+        
+        # Audit log
+        _audit.log_success(
+            action=audit_logger.AuditAction.DOCUMENT_INGEST,
+            client_ip=client_ip,
+            resource_type="document",
+            resource_id=document_id,
+            details={"chunks_added": added, "source_type": doc["source_type"]},
+            request_id=request_id,
+        )
         return {"status": "ok", "run": run, "result": body}
     except Exception as exc:
-        catalog.finish_ingestion_run(run["id"], status="error", error_message=str(exc), chunks_count=None, path=db_path)
+        catalog.finish_ingestion_run(
+            run["id"],
+            status="error",
+            error_message=str(exc),
+            chunks_count=None,
+            path=db_path,
+        )
+        
+        # Audit log - failure
+        _audit.log_failure(
+            action=audit_logger.AuditAction.DOCUMENT_INGEST,
+            reason=str(exc),
+            client_ip=client_ip,
+            resource_type="document",
+            resource_id=document_id,
+            request_id=request_id,
+        )
         raise HTTPException(status_code=500, detail=f"Admin ingest failed: {exc}") from exc
 
 
@@ -160,16 +273,40 @@ def trigger_reindex(request: Request, payload: Optional[dict[str, Any]] = None) 
 @router.get("/documents/{document_id}")
 def get_document_detail(document_id: str, request: Request) -> dict[str, Any]:
     _admin_guard(request)
+    client_ip = _get_client_ip(request)
+    request_id = _get_request_id(request)
+    
     db_path = os.getenv("ADMIN_DB_PATH")
     doc = catalog.get_document(document_id, path=db_path)
     if not doc:
+        # Audit log - not found
+        _audit.log_failure(
+            action=audit_logger.AuditAction.DOCUMENT_READ,
+            reason="document_not_found",
+            client_ip=client_ip,
+            resource_type="document",
+            resource_id=document_id,
+            request_id=request_id,
+        )
         raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Audit log
+    _audit.log_success(
+        action=audit_logger.AuditAction.DOCUMENT_READ,
+        client_ip=client_ip,
+        resource_type="document",
+        resource_id=document_id,
+        request_id=request_id,
+    )
     return doc
 
 
 @router.patch("/documents/{document_id}")
 async def update_document_detail(document_id: str, request: Request) -> dict[str, Any]:
     _admin_guard(request)
+    client_ip = _get_client_ip(request)
+    request_id = _get_request_id(request)
+    
     try:
         body = await request.json()
     except Exception:
@@ -194,16 +331,60 @@ async def update_document_detail(document_id: str, request: Request) -> dict[str
         path=os.getenv("ADMIN_DB_PATH"),
     )
     if not updated:
+        # Audit log - not found
+        _audit.log_failure(
+            action=audit_logger.AuditAction.DOCUMENT_UPDATE,
+            reason="document_not_found",
+            client_ip=client_ip,
+            resource_type="document",
+            resource_id=document_id,
+            request_id=request_id,
+        )
         raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Audit log
+    _audit.log_success(
+        action=audit_logger.AuditAction.DOCUMENT_UPDATE,
+        client_ip=client_ip,
+        resource_type="document",
+        resource_id=document_id,
+        details={
+            "title_updated": bool(title),
+            "tags_updated": bool(tags),
+            "metadata_updated": bool(metadata),
+        },
+        request_id=request_id,
+    )
     return updated
 
 
 @router.delete("/documents/{document_id}")
 def delete_document_detail(document_id: str, request: Request) -> dict[str, Any]:
     _admin_guard(request)
+    client_ip = _get_client_ip(request)
+    request_id = _get_request_id(request)
+    
     ok = catalog.delete_document(document_id, path=os.getenv("ADMIN_DB_PATH"))
     if not ok:
+        # Audit log - not found
+        _audit.log_failure(
+            action=audit_logger.AuditAction.DOCUMENT_DELETE,
+            reason="document_not_found",
+            client_ip=client_ip,
+            resource_type="document",
+            resource_id=document_id,
+            request_id=request_id,
+        )
         raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Audit log
+    _audit.log_success(
+        action=audit_logger.AuditAction.DOCUMENT_DELETE,
+        client_ip=client_ip,
+        resource_type="document",
+        resource_id=document_id,
+        request_id=request_id,
+    )
     return {"deleted": True}
 
 
@@ -312,7 +493,10 @@ async def admin_upload(
     db_path = os.getenv("ADMIN_DB_PATH")
     if not document_id:
         if not domain:
-            raise HTTPException(status_code=400, detail="domain is required when creating a document")
+            raise HTTPException(
+                status_code=400,
+                detail="domain is required when creating a document",
+            )
         created = catalog.create_document(
             domain=domain.strip(),
             source_type=(guess or "markdown"),
