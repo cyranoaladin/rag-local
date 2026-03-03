@@ -162,7 +162,7 @@ services:
       HYBRID_ALPHA: "${HYBRID_ALPHA:-0.7}"
       # Existing compat
       LOCAL_SOURCE_ROOT: /data/uploads
-      GOOGLE_APPLICATION_CREDENTIALS: /creds/gdrive-service-account.json
+      GOOGLE_APPLICATION_CREDENTIALS: /creds/gdrive-sa.json
       USER_AGENT: ${USER_AGENT:-rag-local-ingestor/2.0}
       MAX_REMOTE_BYTES: ${MAX_REMOTE_BYTES:-26214400}
       MULTIMODAL_ENABLED: ${MULTIMODAL_ENABLED:-true}

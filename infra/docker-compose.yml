@@ -68,7 +68,7 @@ services:
       OLLAMA_URL: "http://ollama:${OLLAMA_PORT:-11434}"
       EMBED_MODEL: ${EMBED_MODEL:-nomic-embed-text}
       SMALL_LLM: ${SMALL_LLM:-llama3.2:latest}
-      GOOGLE_APPLICATION_CREDENTIALS: /creds/gdrive-service-account.json
+      GOOGLE_APPLICATION_CREDENTIALS: /creds/gdrive-sa.json
       LOCAL_SOURCE_ROOT: /data/uploads
       INGESTOR_API_TOKEN: ${INGESTOR_API_TOKEN}
       INGESTOR_IP_ALLOWLIST: ${INGESTOR_IP_ALLOWLIST:-}
