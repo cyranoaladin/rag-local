@@ -68,7 +68,28 @@ CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-COLLECTION_NAME = "ressources_pedagogiques_terminale"
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_education")
+
+# ── Multi-collection architecture ──────────────────────────────────
+# Collections are organized by major section:
+#   - rag_education : all education resources (filtered by matiere/niveau/groupe via metadata)
+#   - rag_web3      : blockchain, DeFi, NFT, Solana, etc.
+# Within each collection, metadata filters provide fine-grained retrieval.
+COLLECTION_MAP: dict[str, str] = {
+    "education": "rag_education",
+    "web3": "rag_web3",
+    "blockchain": "rag_web3",
+    "default": "rag_education",
+}
+
+
+def resolve_collection_name(section: str | None = None, collection: str | None = None) -> str:
+    """Resolve the ChromaDB collection name from section or explicit collection name."""
+    if collection and collection.strip():
+        return collection.strip()
+    sec = (section or "default").strip().lower()
+    return COLLECTION_MAP.get(sec, COLLECTION_MAP["default"])
+
 CHROMA_REQUEST_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", "30"))
 OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "30"))
 MAX_REMOTE_BYTES = int(os.getenv("MAX_REMOTE_BYTES", str(10 * 1024 * 1024)))
@@ -227,6 +248,7 @@ class UrlBatchRequest(BaseModel):
 class DeduplicationCheckRequest(BaseModel):
     """Requête de vérification de doublons avant ingestion."""
     sources: list[str] = Field(description="Liste de source_path ou URLs à vérifier")
+    section: str = Field(default="education", description="Section pour cibler la bonne collection")
 
 
 class SearchRequest(BaseModel):
@@ -234,8 +256,16 @@ class SearchRequest(BaseModel):
     k: int = Field(default=6, ge=1, le=50, description="Number of results")
     include_documents: bool = Field(default=True, description="Include full text in hits")
     collection: str = Field(
-        default=COLLECTION_NAME,
-        description="Target collection name (defaults to main collection)",
+        default="",
+        description="Target collection name (overrides section-based routing)",
+    )
+    section: str = Field(
+        default="education",
+        description="Section (education, web3) — used to route to the correct collection",
+    )
+    filters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Metadata filters (matiere, niveau, groupe, type_ressource, etc.)",
     )
 
 # --- Utilitaires ---
@@ -662,7 +692,8 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
         try:
             _lazy = getattr(loader, "lazy_load", None)
             if callable(_lazy):
-                for _d in _lazy():
+                _iter = _lazy()
+                for _d in _iter if hasattr(_iter, "__iter__") else []:
                     try:
                         if _d and getattr(_d, "page_content", "").strip():
                             docs.append(_d)
@@ -825,7 +856,13 @@ def _prepare_multimodal_ingest(req: IngestRequest) -> PreparedBatch:
 # --- Endpoint ---
 
 
-def _index_batch(prepared: PreparedBatch, req_source_type: str, modality_label: str) -> dict[str, Any]:
+def _index_batch(
+    prepared: PreparedBatch,
+    req_source_type: str,
+    modality_label: str,
+    collection_name: str | None = None,
+) -> dict[str, Any]:
+    target_collection = collection_name or COLLECTION_NAME
     if not prepared.ids:
         _record_ingest_metrics(True)
         _record_ingest_outcome(req_source_type, modality_label, "empty")
@@ -834,7 +871,7 @@ def _index_batch(prepared: PreparedBatch, req_source_type: str, modality_label: 
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(
-            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+            name=target_collection, metadata={"hnsw:space": "cosine"}
         )
 
         existing = collection.get(ids=prepared.ids) or {}
@@ -1021,7 +1058,8 @@ def ingest_data(
         _record_ingest_outcome(req.source_type, modality_label, "empty")
         return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
 
-    return _index_batch(prepared, req.source_type, modality_label)
+    target_col = resolve_collection_name(section=req.metadata_hints.get("section"))
+    return _index_batch(prepared, req.source_type, modality_label, collection_name=target_col)
 
 
 @app.post("/ingest/drive")
@@ -1072,7 +1110,8 @@ def ingest_urls(
                 results.append({"url": url, "status": "empty", "added": 0, "skipped": 0})
                 continue
 
-            result = _index_batch(prepared, "url", prepared.modality or "text")
+            target_col = resolve_collection_name(section=req.metadata_hints.get("section"))
+            result = _index_batch(prepared, "url", prepared.modality or "text", collection_name=target_col)
             added = result.get("added", 0)
             skipped = result.get("skipped", 0)
             total_added += added
@@ -1133,9 +1172,10 @@ async def ingest_upload_files(
             file_hash = hashlib.sha256(content).hexdigest()
 
             # Vérifier doublon : même hash déjà présent dans ChromaDB
+            target_col = resolve_collection_name(section=hints.get("section"))
             client = get_chroma_client()
             collection = client.get_or_create_collection(
-                name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+                name=target_col, metadata={"hnsw:space": "cosine"}
             )
             existing = collection.get(where={"sha256": file_hash}, limit=1)
             existing_ids = existing.get("ids", []) if existing else []
@@ -1190,7 +1230,8 @@ async def ingest_upload_files(
                 results.append({"filename": fname, "status": "empty", "added": 0})
                 continue
 
-            result = _index_batch(prepared, detected_type, prepared.modality or "text")
+            target_col = resolve_collection_name(section=hints.get("section"))
+            result = _index_batch(prepared, detected_type, prepared.modality or "text", collection_name=target_col)
             added = result.get("added", 0)
             skipped = result.get("skipped", 0)
             total_added += added
@@ -1225,9 +1266,10 @@ def check_duplicates(
     """Vérifie si des sources ont déjà été ingérées pour éviter les doublons."""
     _enforce_security(request, req)
 
+    target_col = resolve_collection_name(section=req.section)
     client = get_chroma_client()
     collection = client.get_or_create_collection(
-        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+        name=target_col, metadata={"hnsw:space": "cosine"}
     )
 
     results: list[dict[str, Any]] = []
@@ -1257,6 +1299,64 @@ def health_check():
     return {"status": "healthy"}
 
 
+@app.get("/collections")
+def list_collections(request: Request) -> dict[str, Any]:
+    """List all ChromaDB collections with document counts and metadata."""
+    try:
+        client = get_chroma_client()
+        collections_raw = client.list_collections()
+        result = []
+        for col in collections_raw:
+            name = col.name if hasattr(col, 'name') else str(col)
+            try:
+                c = client.get_collection(name)
+                count = c.count()
+            except Exception:
+                count = 0
+            result.append({"name": name, "count": count})
+        return {"collections": result, "total": len(result)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur listing collections: {exc}") from exc
+
+
+@app.get("/stats/{collection_name}")
+def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
+    """Get statistics for a specific collection."""
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(
+            name=collection_name, metadata={"hnsw:space": "cosine"}
+        )
+        count = collection.count()
+        # Sample metadata to get unique values
+        sample_size = min(count, 100)
+        sample = collection.peek(limit=sample_size) if count > 0 else {}
+        metadatas = sample.get("metadatas", []) if sample else []
+        
+        # Extract unique values for key metadata fields
+        unique_matieres: set[str] = set()
+        unique_niveaux: set[str] = set()
+        unique_groupes: set[str] = set()
+        unique_types: set[str] = set()
+        for m in metadatas:
+            if m.get("matiere"): unique_matieres.add(m["matiere"])
+            if m.get("niveau"): unique_niveaux.add(m["niveau"])
+            if m.get("groupe"): unique_groupes.add(m["groupe"])
+            if m.get("type_ressource"): unique_types.add(m["type_ressource"])
+        
+        return {
+            "collection": collection_name,
+            "doc_count": count,
+            "embed_model": EMBED_MODEL,
+            "matieres": sorted(unique_matieres),
+            "niveaux": sorted(unique_niveaux),
+            "groupes": sorted(unique_groupes),
+            "types_ressource": sorted(unique_types),
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur stats collection: {exc}") from exc
+
+
 @app.get("/metrics")
 def metrics() -> Response:
     if not ingest_metrics.METRICS_ENABLED:
@@ -1270,10 +1370,13 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
     # AuthN/AuthZ identical to ingestion
     _enforce_security(request, payload)
 
+    # Resolve collection from section or explicit name
+    target_col = resolve_collection_name(section=payload.section, collection=payload.collection or None)
+
     # Prepare chroma collection
     try:
         client = get_chroma_client()
-        collection = client.get_or_create_collection(name=payload.collection, metadata={"hnsw:space": "cosine"})
+        collection = client.get_or_create_collection(name=target_col, metadata={"hnsw:space": "cosine"})
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
 
@@ -1298,10 +1401,26 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
         logger.exception("Unexpected failure while requesting embeddings (search)")
         raise HTTPException(status_code=500, detail=f"Embedding error: {exc}") from exc
 
+    # Build metadata filters from payload.filters
+    # ChromaDB requires $and operator when multiple conditions are present
+    where: dict[str, Any] = {}
+    if payload.filters:
+        conditions = []
+        for fk, fv in payload.filters.items():
+            if fv is not None and fv != "" and fv != "Tous":
+                conditions.append({str(fk): fv})
+        if len(conditions) == 1:
+            where = conditions[0]
+        elif len(conditions) > 1:
+            where = {"$and": conditions}
+
     # Query by embedding
     try:
         n_results = max(1, min(int(payload.k), 50))
-        results = collection.query(query_embeddings=[q_vec], n_results=n_results)
+        query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": n_results}
+        if where:
+            query_kwargs["where"] = where
+        results = collection.query(**query_kwargs)
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
 
@@ -1322,8 +1441,9 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
     _record_ingest_outcome("search", "text", "success")  # reuse metric surface for visibility
     return {
         "query": payload.q,
-        "collection": payload.collection,
+        "collection": target_col,
         "k": n_results,
+        "filters_applied": where,
         "hits": hits,
     }
 
