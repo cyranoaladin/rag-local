@@ -103,6 +103,7 @@ TYPES_RESSOURCE = [
 # Collections consultées automatiquement sur toute requête "Toutes"
 ALL_COLLECTIONS = [
     "rag_francais_premiere",
+    "rag_maths_premiere",
     "rag_education",
     "rag_web3",
     "rag_divers",
@@ -499,7 +500,8 @@ page = st.sidebar.radio(
     [
         "📊 Dashboard",
         "🎓 Éducation",
-        "🔗 Web3 & Blockchain",
+        "� Maths 1ère",
+        "�🔗 Web3 & Blockchain",
         "📦 Divers",
         "🔍 Recherche",
         "🔧 Administration",
@@ -530,6 +532,7 @@ if page == "📊 Dashboard":
                 total_docs += count
                 label = (
                     "📚 Français 1ère" if name == "rag_francais_premiere"
+                    else "📐 Maths 1ère" if name == "rag_maths_premiere"
                     else "🎓 Éducation" if "education" in name
                     else "🔗 Web3" if "web3" in name
                     else "📦 Divers" if "divers" in name
@@ -547,6 +550,7 @@ if page == "📊 Dashboard":
                 if stats:
                     section_label = (
                         "📚 Français 1ère" if name == "rag_francais_premiere"
+                        else "📐 Maths 1ère" if name == "rag_maths_premiere"
                         else "🎓 Éducation" if "education" in name
                         else "🔗 Web3" if "web3" in name
                         else "📦 Divers" if "divers" in name
@@ -606,9 +610,9 @@ elif page == "🎓 Éducation":
 
     collection_education = st.selectbox(
         "Collection cible",
-        ["rag_francais_premiere", "rag_education"],
+        ["rag_francais_premiere", "rag_maths_premiere", "rag_education"],
         index=0,
-        help="Utilisez `rag_francais_premiere` pour le corpus dédié Français Première et `rag_education` pour le corpus éducation global.",
+        help="`rag_francais_premiere` : Français 1ère | `rag_maths_premiere` : Maths 1ère spécialité | `rag_education` : corpus général",
     )
 
     st.markdown("---")
@@ -649,6 +653,67 @@ elif page == "🎓 Éducation":
             st.markdown(f"**{g}**")
             for it in items:
                 st.caption(f"  • {it}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# PAGE MATHS 1ÈRE
+# ═══════════════════════════════════════════════════════════════
+elif page == "📐 Maths 1ère":
+    st.title("📐 Maths Première — Spécialité")
+    st.markdown(
+        "Collection dédiée **Mathématiques Première** (spécialité). "
+        "Tous les documents ingici sont indexés dans **`rag_maths_premiere`**, "
+        "collection isolée pour des résultats de recherche plus pertinents. "
+        "Elle est aussi incluse dans la recherche **Toutes** multi-collection."
+    )
+
+    st.subheader("📂 Type de ressource")
+    col_t, col_d = st.columns(2)
+    with col_t:
+        maths_type = st.selectbox(
+            "Type de ressource",
+            TYPES_RESSOURCE,
+            index=TYPES_RESSOURCE.index("Exercices"),
+            key="maths_type",
+        )
+    with col_d:
+        maths_tag = st.text_input(
+            "Tag libre (optionnel)",
+            placeholder="ex: suites, second degré, probabilités…",
+            key="maths_tag",
+        )
+
+    st.markdown("---")
+
+    maths_meta: dict[str, str] = {
+        "section": "maths_premiere",
+        "collection": "rag_maths_premiere",
+        "matiere": "Mathématiques",
+        "niveau": "Première",
+        "groupe": "Enseignements de spécialité (EDS)",
+        "type_ressource": maths_type,
+    }
+    if maths_tag.strip():
+        maths_meta["tag"] = maths_tag.strip()
+
+    tab_up, tab_url, tab_drv = st.tabs(["📁 Upload fichiers", "🔗 URLs", "☁️ Google Drive"])
+    with tab_up:
+        _render_upload_tab(maths_meta, "maths")
+    with tab_url:
+        _render_urls_tab(maths_meta, "maths")
+    with tab_drv:
+        _render_drive_tab(maths_meta, "maths")
+
+    st.markdown("---")
+    with st.expander("📊 Statistiques collection Maths 1ère", expanded=False):
+        stats = api_get("/stats/rag_maths_premiere")
+        if stats:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Chunks", stats.get("doc_count", 0))
+            c2.metric("Types", len(stats.get("types_ressource", [])))
+            c3.metric("Embedding", stats.get("embed_model", "?"))
+            if stats.get("types_ressource"):
+                st.write(f"**Types** : {', '.join(stats['types_ressource'])}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -769,7 +834,7 @@ elif page == "🔍 Recherche":
     # Section ciblée
     search_section = st.radio(
         "Collection cible",
-        ["📚 Français Première", "🎓 Éducation", "🔗 Web3", "📦 Divers", "📦 Toutes"],
+        ["📚 Français Première", "📐 Maths 1ère", "🎓 Éducation", "🔗 Web3", "📦 Divers", "📦 Toutes"],
         horizontal=True,
     )
 
@@ -795,6 +860,9 @@ elif page == "🔍 Recherche":
                 filters["niveau"] = f_niveau
             if f_type != "Tous":
                 filters["type_ressource"] = f_type
+    elif search_section == "📐 Maths 1ère":
+        section_key = "maths_premiere"
+        collection_key = "rag_maths_premiere"
     elif search_section == "🎓 Éducation":
         section_key = "education"
         collection_key = "rag_education"

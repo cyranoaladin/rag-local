@@ -77,6 +77,7 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_education")
 # Collections are organized by major section:
 #   - rag_education        : all education resources (filtered by matiere/niveau/groupe via metadata)
 #   - rag_francais_premiere: dedicated Français Première corpus
+#   - rag_maths_premiere   : dedicated Mathématiques Première corpus (spécialité)
 #   - rag_web3             : blockchain, DeFi, NFT, Solana, etc.
 #   - rag_divers           : miscellaneous resources, always queried in "all" searches
 # Within each collection, metadata filters provide fine-grained retrieval.
@@ -85,6 +86,7 @@ COLLECTION_MAP: dict[str, str] = {
     "web3": "rag_web3",
     "blockchain": "rag_web3",
     "divers": "rag_divers",
+    "maths_premiere": "rag_maths_premiere",
     "default": "rag_education",
 }
 
