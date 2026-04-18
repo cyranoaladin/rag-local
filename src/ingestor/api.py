@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 from urllib.parse import urlparse
 
 import chromadb
+import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
@@ -1083,17 +1084,23 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                 ".webm", ".mkv", ".mp4", ".avi", ".mov", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
                 ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".tif", ".tiff", ".ico",
                 ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
-                ".ppt", ".pptx", ".pps", ".ppsx", ".doc", ".php",
+                ".ppt", ".pptx", ".pps", ".ppsx", ".php",
                 ".html", ".htm", ".txt",
+                # LaTeX auxiliary/compiled files
+                ".out", ".snm", ".aux", ".log", ".toc", ".bbl", ".blg", ".nav", ".vrb", ".fls", ".fdb_latexmk",
+                # PostScript (incompatible avec pypdf)
+                ".ps", ".eps",
             )
             unsupported_mimes = (
                 "video/", "audio/", "image/",
                 "application/zip", "application/x-zip", "application/x-zip-compressed",
+                "application/x-gzip", "application/gzip", "application/x-tar",
                 "application/x-rar", "application/vnd.rar", "application/x-7z-compressed",
                 "application/vnd.ms-powerpoint",
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                 "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
                 "text/html",
+                "application/postscript",
             )
             if mime_type.startswith(unsupported_mimes) or fname_lower.endswith(unsupported_exts):
                 logger.info(f"[{task_id}] Skipping unsupported Drive file {fid} ({fname}) [{mime_type}]")
@@ -1108,41 +1115,124 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                 })
                 continue
 
+            # .doc ancien → conversion libreoffice avant chargement
+            is_legacy_doc = fname_lower.endswith(".doc") or mime_type == "application/msword"
+
             try:
                 logger.info(f"[{task_id}] Processing file {fid} ({fname})")
 
-                # Load specific file
-                kwargs = loader_kwargs_base.copy()
-                kwargs["file_ids"] = [fid]
+                # Cas 1 : Google Docs/Sheets/Slides → export texte natif via Drive API
+                google_workspace_export: dict[str, str] = {
+                    "application/vnd.google-apps.document": "text/plain",
+                    "application/vnd.google-apps.spreadsheet": "text/csv",
+                    "application/vnd.google-apps.presentation": "text/plain",
+                }
+                docs: list[Any] = []
+                if mime_type in google_workspace_export:
+                    try:
+                        from google.oauth2 import service_account as _sa
+                        from googleapiclient.discovery import build as _build
+                        from langchain.schema import Document as _Doc
+                        _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+                        _creds = _sa.Credentials.from_service_account_file(
+                            _creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+                        )
+                        _svc = _build("drive", "v3", credentials=_creds, cache_discovery=False)
+                        export_mime = google_workspace_export[mime_type]
+                        content_bytes = _svc.files().export(
+                            fileId=fid, mimeType=export_mime
+                        ).execute()
+                        text = content_bytes.decode("utf-8", errors="replace") if isinstance(content_bytes, bytes) else str(content_bytes)
+                        if text.strip():
+                            docs = [_Doc(page_content=text, metadata={"source": fname})]
+                        logger.info(f"[{task_id}] Google Workspace export OK: {fname} ({export_mime})")
+                    except Exception as _e:
+                        logger.warning(f"[{task_id}] Google Workspace export failed for {fid}: {_e}")
+                        # Fallback: tenter GoogleDriveLoader
+                        docs = []
 
-                try:
-                    loader = GoogleDriveLoader(**kwargs)
-                    docs = loader.load()
-                except Exception as e:
-                    error_detail = str(e)
-                    logger.warning(f"[{task_id}] Failed to load file {fid}: {error_detail}")
-                    task.processed_files += 1
-                    invalid_markers = (
-                        "EOF marker not found",
-                        "cannot find",
-                        "trailer",
-                        "malformed",
-                        "invalid pdf",
-                        "file is not a pdf",
-                    )
-                    if any(marker in error_detail.lower() for marker in [m.lower() for m in invalid_markers]):
-                        task.skipped_files += 1
-                        task.file_results.append({
-                            "name": fname,
-                            "status": "invalid",
-                            "added": 0,
-                            "skipped": 1,
-                            "detail": error_detail,
-                        })
-                    else:
-                        task.error_files += 1
-                        task.file_results.append({"name": fname, "status": "error", "detail": error_detail})
-                    continue
+                # Cas 2 : .doc ancien → libreoffice → .docx → python-docx
+                elif is_legacy_doc:
+                    try:
+                        from google.oauth2 import service_account as _sa
+                        from googleapiclient.discovery import build as _build
+                        import subprocess
+                        _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+                        _creds = _sa.Credentials.from_service_account_file(
+                            _creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+                        )
+                        _svc = _build("drive", "v3", credentials=_creds, cache_discovery=False)
+                        content_bytes = _svc.files().get_media(fileId=fid).execute()
+                        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False, dir="/tmp") as tf:
+                            tf.write(content_bytes)
+                            tmp_doc = tf.name
+                        result = subprocess.run(
+                            ["libreoffice", "--headless", "--convert-to", "docx", "--outdir", "/tmp", tmp_doc],
+                            capture_output=True, timeout=60
+                        )
+                        tmp_docx = tmp_doc.replace(".doc", ".docx")
+                        if result.returncode == 0 and Path(tmp_docx).exists():
+                            docs = load_docx(tmp_docx)
+                            Path(tmp_doc).unlink(missing_ok=True)
+                            Path(tmp_docx).unlink(missing_ok=True)
+                            logger.info(f"[{task_id}] .doc converted via libreoffice: {fname}")
+                        else:
+                            Path(tmp_doc).unlink(missing_ok=True)
+                            raise RuntimeError(f"libreoffice conversion failed: {result.stderr.decode()[:200]}")
+                    except Exception as _e:
+                        logger.warning(f"[{task_id}] .doc conversion failed for {fid}: {_e}")
+                        docs = []
+
+                # Cas 3 : chargement standard via GoogleDriveLoader
+                if not docs and mime_type not in google_workspace_export and not is_legacy_doc:
+                    kwargs = loader_kwargs_base.copy()
+                    kwargs["file_ids"] = [fid]
+                    try:
+                        loader = GoogleDriveLoader(**kwargs)
+                        docs = loader.load()
+                    except Exception as e:
+                        error_detail = str(e)
+                        # Fallback pdfplumber pour PDFs corrompus (EOF marker not found)
+                        pdf_error_markers = ("eof marker", "startxref", "cannot read an empty", "trailer", "malformed pdf", "invalid pdf", "file is not a pdf")
+                        if any(m in error_detail.lower() for m in pdf_error_markers):
+                            try:
+                                from google.oauth2 import service_account as _sa2
+                                from googleapiclient.discovery import build as _build2
+                                from langchain.schema import Document as _Doc2
+                                _creds_path2 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+                                _creds2 = _sa2.Credentials.from_service_account_file(
+                                    _creds_path2, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+                                )
+                                _svc2 = _build2("drive", "v3", credentials=_creds2, cache_discovery=False)
+                                pdf_bytes = _svc2.files().get_media(fileId=fid).execute()
+                                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir="/tmp") as tf2:
+                                    tf2.write(pdf_bytes)
+                                    tmp_pdf = tf2.name
+                                texts = []
+                                with pdfplumber.open(tmp_pdf) as pdf_doc:
+                                    for pg in pdf_doc.pages:
+                                        t = pg.extract_text()
+                                        if t and t.strip():
+                                            texts.append(t.strip())
+                                Path(tmp_pdf).unlink(missing_ok=True)
+                                if texts:
+                                    docs = [_Doc2(page_content="\n\n".join(texts), metadata={"source": fname})]
+                                    logger.info(f"[{task_id}] pdfplumber fallback OK: {fname} ({len(texts)} pages)")
+                                else:
+                                    raise RuntimeError("pdfplumber extracted no text")
+                            except Exception as _fe:
+                                logger.warning(f"[{task_id}] pdfplumber fallback failed for {fid}: {_fe}")
+                                error_detail2 = f"{error_detail} | pdfplumber: {_fe}"
+                                task.processed_files += 1
+                                task.skipped_files += 1
+                                task.file_results.append({"name": fname, "status": "invalid", "added": 0, "skipped": 1, "detail": error_detail2})
+                                continue
+                        else:
+                            logger.warning(f"[{task_id}] Failed to load file {fid}: {error_detail}")
+                            task.processed_files += 1
+                            task.error_files += 1
+                            task.file_results.append({"name": fname, "status": "error", "detail": error_detail})
+                            continue
 
                 if not docs:
                     logger.warning(f"[{task_id}] No content loaded for file {fid}")
@@ -1598,21 +1688,47 @@ def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
             name=collection_name, metadata={"hnsw:space": "cosine"}
         )
         count = collection.count()
-        # Sample metadata to get unique values
-        sample_size = min(count, 100)
-        sample = collection.peek(limit=sample_size) if count > 0 else {}
-        metadatas = sample.get("metadatas", []) if sample else []
-        
-        # Extract unique values for key metadata fields
+        # Sample metadata across the full collection to extract unique field values.
+        # peek() only returns the first N rows (by insertion order) which may lack metadata.
+        # Strategy: fetch all IDs then sample up to 2000 evenly spread across the collection.
         unique_matieres: set[str] = set()
         unique_niveaux: set[str] = set()
         unique_groupes: set[str] = set()
         unique_types: set[str] = set()
-        for m in metadatas:
-            if m.get("matiere"): unique_matieres.add(m["matiere"])
-            if m.get("niveau"): unique_niveaux.add(m["niveau"])
-            if m.get("groupe"): unique_groupes.add(m["groupe"])
-            if m.get("type_ressource"): unique_types.add(m["type_ressource"])
+        if count > 0:
+            try:
+                # Stratégie multi-passes : on essaie d'abord un filtre sur source_type (chunks enrichis),
+                # puis un peek large en fallback. Ceci évite de charger tous les IDs (timeout sur >100k chunks).
+                _meta_sources: list[dict] = []
+                # Essayer plusieurs source_type connus pour trouver des chunks avec métadonnées riches.
+                # ChromaDB get() ne supporte pas $in — on enchaîne des requêtes exactes.
+                for _where in [
+                    {"source_type": "gdrive_folder"},
+                    {"source_type": "upload"},
+                    {"source_type": "url"},
+                    {"source_type": "pdf"},
+                ]:
+                    try:
+                        _r = collection.get(where=_where, limit=2000, include=["metadatas"])
+                        _found = _r.get("metadatas") or []
+                        _meta_sources.extend(_found)
+                        if len(_meta_sources) >= 2000:
+                            break
+                    except Exception:
+                        continue
+                if not _meta_sources:
+                    # Fallback peek
+                    _r2 = collection.peek(limit=500)
+                    _meta_sources = _r2.get("metadatas") or []
+                for m in _meta_sources:
+                    if not m:
+                        continue
+                    if m.get("matiere"): unique_matieres.add(m["matiere"])
+                    if m.get("niveau"): unique_niveaux.add(m["niveau"])
+                    if m.get("groupe"): unique_groupes.add(m["groupe"])
+                    if m.get("type_ressource"): unique_types.add(m["type_ressource"])
+            except Exception:
+                pass
         
         return {
             "collection": collection_name,
