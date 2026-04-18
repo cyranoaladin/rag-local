@@ -166,6 +166,27 @@ def api_post(endpoint: str, data: dict[str, Any], timeout: float = 60.0) -> dict
     return None
 
 
+def _build_search_payload(
+    *,
+    query: str,
+    k: int,
+    collection: str,
+    section: str,
+    filters: dict[str, Any],
+    score_threshold: float | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"q": query, "k": k}
+    if collection:
+        payload["collection"] = collection
+    elif section and section != "all":
+        payload["section"] = section
+    if filters:
+        payload["filters"] = filters
+    if score_threshold is not None:
+        payload["score_threshold"] = score_threshold
+    return payload
+
+
 def api_upload(
     endpoint: str,
     files: list[tuple[str, bytes, str]],
@@ -840,6 +861,15 @@ elif page == "🔍 Recherche":
 
     query = st.text_input("Question", placeholder="Qu'est-ce qu'un smart contract ?")
     k = st.slider("Nombre de résultats", 1, 20, 6)
+    use_score_threshold = st.checkbox("Activer un seuil de distance", value=True)
+    score_threshold = st.slider(
+        "Distance max",
+        min_value=0.0,
+        max_value=2.0,
+        value=0.55,
+        step=0.05,
+        disabled=not use_score_threshold,
+    )
 
     # Filtres contextuels
     filters: dict[str, Any] = {}
@@ -900,7 +930,14 @@ elif page == "🔍 Recherche":
                 all_hits: list[dict[str, Any]] = []
                 searched_cols: list[str] = []
                 for col_name in ALL_COLLECTIONS:
-                    payload_col: dict[str, Any] = {"q": query, "k": k, "collection": col_name}
+                    payload_col = _build_search_payload(
+                        query=query,
+                        k=k,
+                        collection=col_name,
+                        section="",
+                        filters={},
+                        score_threshold=score_threshold if use_score_threshold else None,
+                    )
                     r = api_post("/search", payload_col, timeout=60.0)
                     if r and r.get("hits"):
                         for h in r["hits"]:
@@ -915,13 +952,14 @@ elif page == "🔍 Recherche":
                     "collection": "toutes (" + ", ".join(searched_cols) + ")",
                 }
             else:
-                payload: dict[str, Any] = {"q": query, "k": k}
-                if collection_key:
-                    payload["collection"] = collection_key
-                elif section_key:
-                    payload["section"] = section_key
-                if filters:
-                    payload["filters"] = filters
+                payload = _build_search_payload(
+                    query=query,
+                    k=k,
+                    collection=collection_key,
+                    section=section_key,
+                    filters=filters,
+                    score_threshold=score_threshold if use_score_threshold else None,
+                )
                 result = api_post("/search", payload, timeout=60.0)
 
         if result:

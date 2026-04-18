@@ -54,7 +54,6 @@ def test_call_ingest_api_success_with_bearer(monkeypatch: pytest.MonkeyPatch) ->
     result = app._call_ingest_api(
         "http://ingestor:8001",
         "tok",
-        "Authorization",
         {"source": "/data/uploads/foo.pdf", "source_type": "pdf"},
         "text",
     )
@@ -69,4 +68,4 @@ def test_call_ingest_api_success_with_bearer(monkeypatch: pytest.MonkeyPatch) ->
 def test_call_ingest_api_requires_base_url(monkeypatch: pytest.MonkeyPatch) -> None:
     app = _import_app(monkeypatch)
     with pytest.raises(ValueError):
-        app._call_ingest_api(None, None, "Authorization", {}, "text")
+        app._call_ingest_api(None, None, {}, "text")

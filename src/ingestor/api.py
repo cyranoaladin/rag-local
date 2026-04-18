@@ -126,6 +126,8 @@ ingest_requests_total = ingest_metrics.ingest_requests_total
 
 logger = logging.getLogger(__name__)
 
+MEDIA_SOURCE_TYPES = frozenset({"video", "image", "audio"})
+
 # Multimodal adapter: default to safe stubs, then try to override with real impl
 class Chunk:
     def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - stub
@@ -289,6 +291,7 @@ class SearchRequest(BaseModel):
     q: str = Field(description="Query text")
     k: int = Field(default=6, ge=1, le=50, description="Number of results")
     include_documents: bool = Field(default=True, description="Include full text in hits")
+    score_threshold: float | None = Field(default=None, ge=0.0, description="Maximum accepted Chroma distance")
     collection: str = Field(
         default="",
         description="Target collection name (overrides section-based routing)",
@@ -301,6 +304,20 @@ class SearchRequest(BaseModel):
         default_factory=dict,
         description="Metadata filters (matiere, niveau, groupe, type_ressource, etc.)",
     )
+
+
+def _validate_upload_mode(source_type: str, mode: str) -> None:
+    normalized_source_type = (source_type or "").strip().lower()
+    normalized_mode = (mode or "text").strip().lower() or "text"
+    if normalized_source_type not in MEDIA_SOURCE_TYPES:
+        return
+    if normalized_mode != "multimodal":
+        raise HTTPException(
+            status_code=400,
+            detail="Ce type de fichier nécessite mode=multimodal.",
+        )
+    if not MULTIMODAL_ENABLED:
+        raise HTTPException(status_code=400, detail="Multimodal ingest disabled")
 
 # --- Utilitaires ---
 
@@ -1560,15 +1577,15 @@ async def ingest_upload_files(
                 ".html": "url", ".htm": "url",
                 ".jpg": "image", ".jpeg": "image", ".png": "image",
                 ".gif": "image", ".bmp": "image", ".webp": "image",
-                ".mp3": "audio", ".wav": "audio", ".m4a": "audio",
-                ".mp4": "video", ".avi": "video", ".mkv": "video",
+                ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".ogg": "audio",
+                ".flac": "audio", ".aac": "audio",
+                ".mp4": "video", ".avi": "video", ".mkv": "video", ".webm": "video", ".mov": "video",
             }
             detected_type = source_type_map.get(ext, "markdown")
+            _validate_upload_mode(detected_type, mode)
 
             # Déterminer le mode d'ingestion
             use_mode = mode
-            if detected_type in {"image", "audio", "video"}:
-                use_mode = "multimodal"
 
             sub_req = IngestRequest(
                 sourceType=cast(Any, detected_type),
@@ -1819,11 +1836,18 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
 
     hits: list[dict[str, Any]] = []
     for idx, doc_id in enumerate(ids):
+        distance = distances[idx] if distances and idx < len(distances) else None
+        if (
+            payload.score_threshold is not None
+            and distance is not None
+            and float(distance) > payload.score_threshold
+        ):
+            continue
         item: dict[str, Any] = {"id": doc_id, "metadata": metadatas[idx] if idx < len(metadatas) else {}}
         if payload.include_documents and idx < len(documents):
             item["document"] = documents[idx]
-        if distances and idx < len(distances) and distances[idx] is not None:
-            item["score"] = distances[idx]
+        if distance is not None:
+            item["score"] = distance
         hits.append(item)
 
     _record_ingest_outcome("search", "text", "success")  # reuse metric surface for visibility
@@ -1831,7 +1855,9 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
         "query": payload.q,
         "collection": target_col,
         "k": n_results,
+        "returned": len(hits),
         "filters_applied": where,
+        "score_threshold": payload.score_threshold,
         "hits": hits,
     }
 

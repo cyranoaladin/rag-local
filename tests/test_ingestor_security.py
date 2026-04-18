@@ -52,6 +52,17 @@ def ensure_dependency_stubs() -> None:
             return module
 
         ensure_module("chromadb", build_chromadb)
+        def build_chromadb_config():
+            module = types.ModuleType("chromadb.config")
+
+            class _DummySettings:
+                def __init__(self, *_args, **_kwargs):
+                    pass
+
+            module.Settings = _DummySettings
+            return module
+
+        ensure_module("chromadb.config", build_chromadb_config)
 
     if importlib.util.find_spec("docx") is None:
         def build_docx():
@@ -277,15 +288,103 @@ def test_ingest_accepts_token_and_stores_documents(monkeypatch: pytest.MonkeyPat
     assert added_payloads and len(added_payloads[0]) == 1
 
 
-def test_ingest_ip_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
-    api = reload_api(monkeypatch, token=None, allowlist="10.0.0.0/8")
+def test_ingest_no_token_configured_returns_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When INGESTOR_API_TOKEN is not set, all requests are rejected with 503."""
+    api = reload_api(monkeypatch, token=None)
     client = TestClient(api.app)
 
     response = client.post(
         "/ingest",
         json={"source_type": "url", "source": "https://example.com"},
-        headers={"X-Forwarded-For": "1.2.3.4"},
+    )
+
+    assert response.status_code == 503
+    assert "not configured" in response.json()["detail"]
+
+
+def test_ingest_ip_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When IP allowlist is set, requests from disallowed IPs are rejected with 403."""
+    api = reload_api(monkeypatch, token="test-token", allowlist="10.0.0.0/8")
+    client = TestClient(api.app)
+
+    response = client.post(
+        "/ingest",
+        json={"source_type": "url", "source": "https://example.com"},
+        headers={"X-API-Token": "test-token", "X-Forwarded-For": "1.2.3.4"},
     )
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Forbidden"
+
+
+def test_ingest_bearer_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bearer token in Authorization header is accepted."""
+    api = reload_api(monkeypatch, token="bearer-secret")
+
+    dummy_doc = api.Document(page_content="hello", metadata={"original": "test"})
+    monkeypatch.setattr(api, "load_from_url", lambda url: [dummy_doc])
+
+    class FakeCollection:
+        def get(self, ids=None, **_kwargs):
+            return {"ids": []}
+
+        def add(self, **_kwargs):
+            pass
+
+    class FakeClient:
+        def get_or_create_collection(self, *_args, **_kwargs):
+            return FakeCollection()
+
+    class FakeEmbeddings:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def embed_documents(self, documents):
+            return [[0.0] * 3 for _ in documents]
+
+    monkeypatch.setattr(api, "get_chroma_client", lambda: FakeClient())
+    monkeypatch.setattr(api, "OllamaEmbeddings", FakeEmbeddings)
+    if hasattr(api, "TimedOllamaEmbeddings"):
+        monkeypatch.setattr(api, "TimedOllamaEmbeddings", FakeEmbeddings)
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/ingest",
+        headers={"Authorization": "Bearer bearer-secret"},
+        json={"source_type": "url", "source": "https://example.com"},
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_health_is_public(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /health should work without any token."""
+    api = reload_api(monkeypatch, token="some-secret")
+    client = TestClient(api.app)
+
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+
+
+def test_metrics_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /metrics requires authentication."""
+    api = reload_api(monkeypatch, token="metrics-secret")
+    client = TestClient(api.app)
+
+    response = client.get("/metrics")
+    assert response.status_code == 401
+
+    response = client.get("/metrics", headers={"X-API-Token": "metrics-secret"})
+    # Either 200 (if metrics enabled) or 404 (if disabled) — but not 401
+    assert response.status_code in {200, 404}
+
+
+def test_collections_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /collections requires authentication."""
+    api = reload_api(monkeypatch, token="col-secret")
+    client = TestClient(api.app)
+
+    response = client.get("/collections")
+    assert response.status_code == 401
