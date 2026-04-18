@@ -1,8 +1,9 @@
+import logging
 import os
 import sqlite3
-import logging
 from pathlib import Path
-from typing import Any, List, Dict, Optional
+from typing import Any
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -61,7 +62,7 @@ class DriveSyncManager:
 
         return build("drive", "v3", credentials=creds, cache_discovery=False)
 
-    def verify_folder_access(self, folder_id: str) -> Dict[str, Any]:
+    def verify_folder_access(self, folder_id: str) -> dict[str, Any]:
         """Vérifie que le SA peut accéder au dossier. Lève une exception explicite sinon."""
         service = self._get_drive_service()
         try:
@@ -93,7 +94,7 @@ class DriveSyncManager:
             pass
         return "<service-account>"
 
-    def list_updates(self, folder_id: str) -> List[Dict[str, Any]]:
+    def list_updates(self, folder_id: str) -> list[dict[str, Any]]:
         """
         List files in folder (recursively) that are new or modified since last ingestion.
         Raises PermissionError if the folder is not accessible by the service account.
@@ -127,9 +128,9 @@ class DriveSyncManager:
 
         return updates
 
-    def _fetch_all_files(self, service, folder_id: str) -> List[Dict[str, Any]]:
+    def _fetch_all_files(self, service, folder_id: str) -> list[dict[str, Any]]:
         """Parcours DFS récursif du dossier Drive. Lève HttpError si accès refusé."""
-        files: List[Dict[str, Any]] = []
+        files: list[dict[str, Any]] = []
         stack = [folder_id]
         seen_folders: set = {folder_id}
 
@@ -176,7 +177,7 @@ class DriveSyncManager:
         logger.info(f"Drive scan found {len(files)} files in folder tree {folder_id}")
         return files
 
-    def is_unchanged(self, file_meta: Dict[str, Any], content_fingerprint: str = "") -> bool:
+    def is_unchanged(self, file_meta: dict[str, Any], content_fingerprint: str = "") -> bool:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -195,7 +196,7 @@ class DriveSyncManager:
             logger.error(f"Failed to compare file fingerprint: {e}")
             return False
 
-    def mark_as_ingested(self, file_meta: Dict[str, Any], content_fingerprint: str = ""):
+    def mark_as_ingested(self, file_meta: dict[str, Any], content_fingerprint: str = ""):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""

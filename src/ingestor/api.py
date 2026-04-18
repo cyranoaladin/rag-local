@@ -126,6 +126,8 @@ ingest_requests_total = ingest_metrics.ingest_requests_total
 
 logger = logging.getLogger(__name__)
 
+UPLOAD_FILES_PARAM = File(...)
+
 MEDIA_SOURCE_TYPES = frozenset({"video", "image", "audio"})
 
 # Multimodal adapter: default to safe stubs, then try to override with real impl
@@ -327,7 +329,7 @@ def normalize_metadata(d: dict) -> dict[str, str]:
     for key, value in d.items():
         if value is None or value == "":
             continue
-        if isinstance(value, (list, dict)) and not value:
+        if isinstance(value, list | dict) and not value:
             continue
         normalized[str(key).strip().lower().replace(" ", "_")] = str(value)
     return normalized
@@ -1461,8 +1463,6 @@ def ingest_urls(
     results: list[dict[str, Any]] = []
     total_added = 0
     total_skipped = 0
-    total_errors = 0
-    total_errors = 0
 
     for url in req.urls:
         url = url.strip()
@@ -1507,7 +1507,7 @@ def ingest_urls(
 @app.post("/ingest/upload-files")
 async def ingest_upload_files(
     request: Request,
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = UPLOAD_FILES_PARAM,
     metadata: str = Query(default="{}"),
     mode: str = Query(default="text"),
 ) -> dict[str, Any]:
@@ -1742,10 +1742,14 @@ def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
                 for m in _meta_sources:
                     if not m:
                         continue
-                    if m.get("matiere"): unique_matieres.add(m["matiere"])
-                    if m.get("niveau"): unique_niveaux.add(m["niveau"])
-                    if m.get("groupe"): unique_groupes.add(m["groupe"])
-                    if m.get("type_ressource"): unique_types.add(m["type_ressource"])
+                    if m.get("matiere"):
+                        unique_matieres.add(m["matiere"])
+                    if m.get("niveau"):
+                        unique_niveaux.add(m["niveau"])
+                    if m.get("groupe"):
+                        unique_groupes.add(m["groupe"])
+                    if m.get("type_ressource"):
+                        unique_types.add(m["type_ressource"])
             except Exception:
                 pass
         

@@ -284,8 +284,9 @@ def _decode_to_text(payload: bytes, mime: str) -> str:
     # Audio: try whisper transcription if available
     if mime_lower.startswith("audio/") or mime_lower.startswith("video/"):
         try:
-            import whisper
             import tempfile
+
+            import whisper
             with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
                 tmp.write(payload)
                 tmp_path = tmp.name

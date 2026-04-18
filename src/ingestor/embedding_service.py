@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-from typing import Optional
 
 import httpx
 import redis.asyncio as aioredis
@@ -23,7 +22,7 @@ class EmbeddingService:
         self,
         ollama_url: str,
         model: str,
-        redis_url: Optional[str] = None,
+        redis_url: str | None = None,
         cache_ttl: int = 86400,
     ) -> None:
         """Initialise le service d'embeddings.
@@ -38,8 +37,8 @@ class EmbeddingService:
         self.model = model
         self._redis_url = redis_url
         self.cache_ttl = cache_ttl
-        self._redis: Optional[aioredis.Redis] = None
-        self._http: Optional[httpx.AsyncClient] = None
+        self._redis: aioredis.Redis | None = None
+        self._http: httpx.AsyncClient | None = None
         self._cache_hits = 0
         self._cache_misses = 0
 
