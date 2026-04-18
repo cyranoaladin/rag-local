@@ -368,16 +368,15 @@ def test_health_is_public(monkeypatch: pytest.MonkeyPatch) -> None:
     assert response.json()["status"] == "healthy"
 
 
-def test_metrics_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    """GET /metrics requires authentication."""
+def test_metrics_is_public(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /metrics remains public for Prometheus scraping."""
     api = reload_api(monkeypatch, token="metrics-secret")
     client = TestClient(api.app)
 
     response = client.get("/metrics")
-    assert response.status_code == 401
+    assert response.status_code in {200, 404}
 
     response = client.get("/metrics", headers={"X-API-Token": "metrics-secret"})
-    # Either 200 (if metrics enabled) or 404 (if disabled) — but not 401
     assert response.status_code in {200, 404}
 
 

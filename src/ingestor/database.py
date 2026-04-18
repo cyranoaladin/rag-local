@@ -6,12 +6,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Optional
+from typing import Any, cast
 
-import asyncpg
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,7 @@ class RagDatabase:
 
     def __init__(self, dsn: str) -> None:
         self.dsn = dsn
-        self._pool: Optional[asyncpg.Pool] = None
+        self._pool: asyncpg.Pool | None = None
 
     async def connect(self, min_size: int = 5, max_size: int = 20) -> None:
         """Initialise le pool de connexions."""
@@ -64,10 +67,10 @@ class RagDatabase:
         file_hash: str,
         embed_model: str,
         embed_dim: int,
-        label: Optional[str] = None,
-        mime_type: Optional[str] = None,
-        char_count: Optional[int] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        label: str | None = None,
+        mime_type: str | None = None,
+        char_count: int | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Insert ou update un document, retourne son UUID."""
         async with self.acquire() as conn:
@@ -163,7 +166,7 @@ class RagDatabase:
         embedding: list[float],
         tenant: str,
         k: int = 20,
-        filters: Optional[dict[str, Any]] = None,
+        filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Recherche par similarité cosine (dense vector search)."""
         embedding_str = f"[{','.join(map(str, embedding))}]"
@@ -263,11 +266,11 @@ class RagDatabase:
         """Supprime un document et ses chunks (CASCADE)."""
         doc_uuid = uuid.UUID(document_id)
         async with self.acquire() as conn:
-            result = await conn.execute(
+            result = cast(str, await conn.execute(
                 "DELETE FROM rag_documents WHERE id = $1 AND tenant = $2",
                 doc_uuid,
                 tenant,
-            )
+            ))
             return result == "DELETE 1"
 
     async def get_stats(self, tenant: str) -> dict[str, Any]:
@@ -296,7 +299,7 @@ class RagDatabase:
             )
             return [r["tenant"] for r in rows]
 
-    async def document_exists(self, source_path: str, tenant: str) -> Optional[str]:
+    async def document_exists(self, source_path: str, tenant: str) -> str | None:
         """Vérifie si un document existe déjà par source_path, retourne son ID ou None."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -306,7 +309,7 @@ class RagDatabase:
             )
             return str(row["id"]) if row else None
 
-    async def document_exists_by_hash(self, file_hash: str, tenant: str) -> Optional[str]:
+    async def document_exists_by_hash(self, file_hash: str, tenant: str) -> str | None:
         """Vérifie si un document existe déjà par file_hash, retourne son ID ou None."""
         async with self.acquire() as conn:
             row = await conn.fetchrow(
@@ -348,10 +351,10 @@ class RagDatabase:
         precision_at_5: float,
         recall_at_5: float,
         mrr: float,
-        ndcg: Optional[float] = None,
-        avg_latency_ms: Optional[float] = None,
-        gold_set_version: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None,
+        ndcg: float | None = None,
+        avg_latency_ms: float | None = None,
+        gold_set_version: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Sauvegarde les résultats d'une évaluation RAG."""
         async with self.acquire() as conn:

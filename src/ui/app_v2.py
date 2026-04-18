@@ -147,7 +147,8 @@ def api_get(endpoint: str, timeout: float = 60.0) -> dict[str, Any] | None:
     try:
         resp = httpx.get(f"{API_BASE}{endpoint}", headers=_headers_json(), timeout=timeout)
         if resp.status_code == 200:
-            return resp.json()
+            from typing import cast
+            return cast(dict[str, Any], resp.json())
         st.error(f"API {resp.status_code}: {resp.text[:200]}")
     except Exception as exc:
         st.error(f"Connexion API échouée: {exc}")
@@ -159,7 +160,8 @@ def api_post(endpoint: str, data: dict[str, Any], timeout: float = 60.0) -> dict
     try:
         resp = httpx.post(f"{API_BASE}{endpoint}", json=data, headers=_headers_json(), timeout=timeout)
         if resp.status_code in (200, 202):
-            return resp.json()
+            from typing import cast
+            return cast(dict[str, Any], resp.json())
         st.error(f"API {resp.status_code}: {resp.text[:200]}")
     except Exception as exc:
         st.error(f"Connexion API échouée: {exc}")
@@ -201,7 +203,8 @@ def api_upload(
             params=params or {}, headers=_headers_upload(), timeout=timeout,
         )
         if resp.status_code in (200, 202):
-            return resp.json()
+            from typing import cast
+            return cast(dict[str, Any], resp.json())
         st.error(f"API {resp.status_code}: {resp.text[:200]}")
     except Exception as exc:
         st.error(f"Upload échoué: {exc}")
@@ -250,7 +253,7 @@ def _render_upload_tab(metadata: dict[str, str], key_prefix: str) -> None:
             total_added = 0
             total_duplicates = 0
             total_errors = 0
-            file_results: list[tuple[str, str, int, int, str]] = []
+            file_results: list[Any] = []
             
             progress_bar = st.progress(0, text="Préparation...")
             status_container = st.container()

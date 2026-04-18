@@ -8,7 +8,6 @@ import hashlib
 import json
 import logging
 import os
-from typing import Optional
 
 import httpx
 import redis.asyncio as aioredis
@@ -23,7 +22,7 @@ class EmbeddingService:
         self,
         ollama_url: str,
         model: str,
-        redis_url: Optional[str] = None,
+        redis_url: str | None = None,
         cache_ttl: int = 86400,
     ) -> None:
         """Initialise le service d'embeddings.
@@ -38,8 +37,8 @@ class EmbeddingService:
         self.model = model
         self._redis_url = redis_url
         self.cache_ttl = cache_ttl
-        self._redis: Optional[aioredis.Redis] = None
-        self._http: Optional[httpx.AsyncClient] = None
+        self._redis: aioredis.Redis | None = None
+        self._http: httpx.AsyncClient | None = None
         self._cache_hits = 0
         self._cache_misses = 0
 
@@ -113,7 +112,9 @@ class EmbeddingService:
                 cached = await self._redis.get(cache_key)
                 if cached:
                     self._cache_hits += 1
-                    return json.loads(cached)
+                    parsed = json.loads(cached)
+                    if isinstance(parsed, list) and all(isinstance(x, int | float) for x in parsed):
+                        return [float(x) for x in parsed]
             except Exception:
                 pass
 
@@ -133,7 +134,11 @@ class EmbeddingService:
                 f"Pull it with: ollama pull {self.model}"
             )
         resp.raise_for_status()
-        embedding = resp.json()["embedding"]
+        data = resp.json()
+        embedding_any = data.get("embedding") if isinstance(data, dict) else None
+        if not (isinstance(embedding_any, list) and all(isinstance(x, int | float) for x in embedding_any)):
+            raise RuntimeError("Ollama returned an invalid embedding payload")
+        embedding = [float(x) for x in embedding_any]
 
         # Mettre en cache
         if self._redis:
@@ -194,12 +199,12 @@ class EmbeddingService:
         return results
 
     @property
-    def cache_stats(self) -> dict[str, int]:
+    def cache_stats(self) -> dict[str, float]:
         """Retourne les statistiques de cache."""
         total = self._cache_hits + self._cache_misses
         return {
-            "hits": self._cache_hits,
-            "misses": self._cache_misses,
-            "total": total,
-            "hit_rate_pct": round(self._cache_hits / total * 100, 1) if total else 0,
+            "hits": float(self._cache_hits),
+            "misses": float(self._cache_misses),
+            "total": float(total),
+            "hit_rate_pct": round(self._cache_hits / total * 100, 1) if total else 0.0,
         }

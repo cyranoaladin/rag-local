@@ -311,8 +311,9 @@ def delete_document(document_id: str, *, path: str | None = None) -> bool:
     """Delete a document by id. ON DELETE CASCADE removes related ingestion_runs."""
     init_db(path)
     with db_conn(path) as conn:
+        from typing import cast
         cur = conn.execute("DELETE FROM documents WHERE id = ?", (document_id,))
-        return cur.rowcount > 0
+        return cast(int, cur.rowcount) > 0
 
 
 def list_all_ingestions(

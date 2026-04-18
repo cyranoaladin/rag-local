@@ -14,7 +14,8 @@ preview = false
 # Per-file ignores prevent pyupgrade suggestions that would break py39
 # and suppress import reordering warnings for intentional dynamic imports.
 [tool.ruff.lint.per-file-ignores]
-"src/ingestor/api.py" = ["I001", "UP007", "UP017"]
+"src/ingestor/api.py" = ["I001", "UP007", "UP017", "UP038"]
+"src/ingestor/audit_logger.py" = ["UP017"]
 "src/ingestor/admin_api.py" = ["UP007"]
 "src/ingestor/catalog.py" = ["UP017"]
 

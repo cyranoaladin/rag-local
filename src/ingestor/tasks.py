@@ -133,7 +133,7 @@ async def _run_ingestion(
         # 5. Insert chunks
         chunk_records = []
         char_offset = 0
-        for idx, (chunk_text, emb) in enumerate(zip(chunks_text, embeddings)):
+        for idx, (chunk_text, emb) in enumerate(zip(chunks_text, embeddings, strict=True)):
             chunk_records.append({
                 "chunk_index": idx,
                 "text": chunk_text,
@@ -264,4 +264,5 @@ def ingest_document_task(
         return {"status": "success", **result}
     except Exception as exc:
         logger.exception("Ingestion task failed for %s/%s", tenant, source_path)
-        raise self.retry(exc=exc, countdown=60 * (self.request.retries + 1))
+        countdown = 60 * (self.request.retries + 1)
+        raise self.retry(exc=exc, countdown=countdown) from exc

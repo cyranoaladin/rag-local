@@ -101,8 +101,12 @@ async def migrate(
 
         # Regrouper par source pour créer des documents
         source_groups: dict[str, list[dict[str, Any]]] = {}
-        for i, (text_id, text, emb, meta) in enumerate(
-            zip(ids, texts or [None] * len(ids), embeddings or [None] * len(ids), metadatas or [{}] * len(ids))
+        for text_id, text, emb, meta in zip(
+            ids,
+            texts or [None] * len(ids),
+            embeddings or [None] * len(ids),
+            metadatas or [{}] * len(ids),
+            strict=True,
         ):
             if not text or not emb:
                 continue

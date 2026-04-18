@@ -36,8 +36,8 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 try:
     from .drive_sync import DriveSyncManager
-except ImportError:
-    from drive_sync import DriveSyncManager
+except (ImportError, ValueError):
+    from drive_sync import DriveSyncManager  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     from langchain.schema import Document
@@ -94,7 +94,7 @@ COLLECTION_MAP: dict[str, str] = {
 def resolve_collection_name(section: str | None = None, collection: str | None = None) -> str:
     """Resolve the ChromaDB collection name from section or explicit collection name."""
     if collection and collection.strip():
-        return collection.strip()
+        return collection.strip().lower()
     sec = (section or "default").strip().lower()
     return COLLECTION_MAP.get(sec, COLLECTION_MAP["default"])
 
@@ -125,6 +125,8 @@ INGEST_RESULT = ingest_metrics.INGEST_RESULT
 ingest_requests_total = ingest_metrics.ingest_requests_total
 
 logger = logging.getLogger(__name__)
+
+UPLOAD_FILES_PARAM = File(...)
 
 MEDIA_SOURCE_TYPES = frozenset({"video", "image", "audio"})
 
@@ -417,6 +419,13 @@ def _enforce_security(request: Any, _req: Any) -> None:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
+def _require_api_token_configured() -> str:
+    token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
+    if not token_env:
+        raise HTTPException(status_code=503, detail="Ingestor API token not configured")
+    return token_env
+
+
 def get_chroma_client() -> Any:
     timeout_seconds = max(1, int(CHROMA_REQUEST_TIMEOUT))
     settings = Settings(
@@ -516,7 +525,7 @@ class TimedOllamaEmbeddings(OllamaEmbeddings):
             )
         try:
             t = res.json()
-            return t["embedding"]
+            return cast(list[float], t["embedding"])
         except requests.exceptions.JSONDecodeError as e:
             raise ValueError(
                 f"Error raised by inference API: {e}.\nResponse: {res.text}"
@@ -545,7 +554,8 @@ def _validate_remote_url(url: str) -> None:
         raise HTTPException(
             status_code=400, detail="Schéma d'URL non autorisé")
     if not parsed.hostname:
-        raise HTTPException(status_code=400, detail="URL invalide")
+        raise HTTPException(
+            status_code=400, detail="URL invalide")
     try:
         addr_info = socket.getaddrinfo(parsed.hostname, parsed.port or (
             443 if parsed.scheme == "https" else 80))
@@ -619,7 +629,7 @@ def _fetch_remote_text(url: str) -> tuple[str, str]:
             status_code=400, detail=f"Téléchargement impossible: {exc}") from exc
 
 
-def load_from_url(url: str):
+def load_from_url(url: str) -> list[Document]:
     if url.lower().endswith(".pdf"):
         tmp_path = _download_to_temp(url, suffix=".pdf")
         try:
@@ -754,7 +764,7 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
             _lazy = getattr(loader, "lazy_load", None)
             if callable(_lazy):
                 _result = _lazy()
-                _iterable: list[Any] = list(_result) if hasattr(_result, "__iter__") else []  # type: ignore[arg-type]
+                _iterable: list[Any] = list(_result) if hasattr(_result, "__iter__") else []
                 for _d in _iterable:
                     try:
                         if _d and getattr(_d, "page_content", "").strip():
@@ -1185,19 +1195,19 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False, dir="/tmp") as tf:
                             tf.write(content_bytes)
                             tmp_doc = tf.name
-                        result = subprocess.run(
+                        conv_res = subprocess.run(
                             ["libreoffice", "--headless", "--convert-to", "docx", "--outdir", "/tmp", tmp_doc],
                             capture_output=True, timeout=60
                         )
                         tmp_docx = tmp_doc.replace(".doc", ".docx")
-                        if result.returncode == 0 and Path(tmp_docx).exists():
+                        if conv_res.returncode == 0 and Path(tmp_docx).exists():
                             docs = load_docx(tmp_docx)
                             Path(tmp_doc).unlink(missing_ok=True)
                             Path(tmp_docx).unlink(missing_ok=True)
                             logger.info(f"[{task_id}] .doc converted via libreoffice: {fname}")
                         else:
                             Path(tmp_doc).unlink(missing_ok=True)
-                            raise RuntimeError(f"libreoffice conversion failed: {result.stderr.decode()[:200]}")
+                            raise RuntimeError(f"libreoffice conversion failed: {conv_res.stderr.decode()[:200]}")
                     except Exception as _e:
                         logger.warning(f"[{task_id}] .doc conversion failed for {fid}: {_e}")
                         docs = []
@@ -1296,9 +1306,9 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
 
                 # Index
                 try:
-                    result = _index_batch(prepared, "gdrive_folder", "text", collection_name=target_col)
-                    added = result.get("added", 0)
-                    skipped = result.get("skipped", 0)
+                    batch_res = _index_batch(prepared, "gdrive_folder", "text", collection_name=target_col)
+                    added = batch_res.get("added", 0)
+                    skipped = batch_res.get("skipped", 0)
                     task.added_chunks += added
                     if added == 0 and skipped > 0:
                         task.skipped_files += 1
@@ -1344,6 +1354,7 @@ def ingest_drive(
     request: Request,
 ):
     """Lance une ingestion Google Drive et retourne un task_id pour suivi de progression."""
+    _require_api_token_configured()
     _enforce_security(request, req)
 
     task_id = uuid.uuid4().hex[:12]
@@ -1366,6 +1377,7 @@ def ingest_drive(
 @app.get("/ingest/drive/status/{task_id}")
 def drive_ingest_status(task_id: str, request: Request) -> dict[str, Any]:
     """Retourne la progression d'une ingestion Google Drive."""
+    _require_api_token_configured()
     _enforce_security(request, None)
 
     task = _drive_tasks.get(task_id)
@@ -1409,6 +1421,7 @@ def ingest_data(
     mode_normalized = (mode or "text").strip().lower() or "text"
 
     try:
+        _require_api_token_configured()
         _enforce_security(request, req)
     except HTTPException as exc:
         _record_ingest_outcome(req.source_type, modality_label, f"http_{exc.status_code}")
@@ -1453,6 +1466,7 @@ def ingest_urls(
     mode: str = Query(default="text"),
 ) -> dict[str, Any]:
     """Ingestion par lot d'URLs — vérifie les doublons avant ingestion."""
+    _require_api_token_configured()
     _enforce_security(request, req)
 
     if not req.urls:
@@ -1461,8 +1475,6 @@ def ingest_urls(
     results: list[dict[str, Any]] = []
     total_added = 0
     total_skipped = 0
-    total_errors = 0
-    total_errors = 0
 
     for url in req.urls:
         url = url.strip()
@@ -1507,7 +1519,7 @@ def ingest_urls(
 @app.post("/ingest/upload-files")
 async def ingest_upload_files(
     request: Request,
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = UPLOAD_FILES_PARAM,
     metadata: str = Query(default="{}"),
     mode: str = Query(default="text"),
 ) -> dict[str, Any]:
@@ -1515,6 +1527,7 @@ async def ingest_upload_files(
     import json as _json
     import uuid as _uuid
 
+    _require_api_token_configured()
     _enforce_security(request, None)
 
     try:
@@ -1643,6 +1656,7 @@ def check_duplicates(
     request: Request,
 ) -> dict[str, Any]:
     """Vérifie si des sources ont déjà été ingérées pour éviter les doublons."""
+    _require_api_token_configured()
     _enforce_security(request, req)
 
     target_col = resolve_collection_name(section=req.section, collection=req.collection)
@@ -1681,6 +1695,8 @@ def health_check():
 @app.get("/collections")
 def list_collections(request: Request) -> dict[str, Any]:
     """List all ChromaDB collections with document counts and metadata."""
+    _require_api_token_configured()
+    _enforce_security(request, None)
     try:
         client = get_chroma_client()
         collections_raw = client.list_collections()
@@ -1701,6 +1717,8 @@ def list_collections(request: Request) -> dict[str, Any]:
 @app.get("/stats/{collection_name}")
 def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
     """Get statistics for a specific collection."""
+    _require_api_token_configured()
+    _enforce_security(request, None)
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(
@@ -1742,10 +1760,14 @@ def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
                 for m in _meta_sources:
                     if not m:
                         continue
-                    if m.get("matiere"): unique_matieres.add(m["matiere"])
-                    if m.get("niveau"): unique_niveaux.add(m["niveau"])
-                    if m.get("groupe"): unique_groupes.add(m["groupe"])
-                    if m.get("type_ressource"): unique_types.add(m["type_ressource"])
+                    if m.get("matiere"):
+                        unique_matieres.add(m["matiere"])
+                    if m.get("niveau"):
+                        unique_niveaux.add(m["niveau"])
+                    if m.get("groupe"):
+                        unique_groupes.add(m["groupe"])
+                    if m.get("type_ressource"):
+                        unique_types.add(m["type_ressource"])
             except Exception:
                 pass
         
@@ -1763,7 +1785,8 @@ def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
 
 
 @app.get("/metrics")
-def metrics() -> Response:
+def metrics(request: Request) -> Response:
+    _ = request
     if not ingest_metrics.METRICS_ENABLED:
         raise HTTPException(status_code=404, detail="Metrics disabled")
     body = ingest_metrics.generate_latest(METRIC_REGISTRY)
@@ -1773,6 +1796,7 @@ def metrics() -> Response:
 @app.post("/search")
 def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
     # AuthN/AuthZ identical to ingestion
+    _require_api_token_configured()
     _enforce_security(request, payload)
 
     # Resolve collection from section or explicit name
@@ -1879,6 +1903,7 @@ class RagQuery(BaseModel):
 @app.post("/rag/query")
 def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
     # AuthN/AuthZ identical to ingestion
+    _require_api_token_configured()
     _enforce_security(request, payload)
 
     # Prepare chroma collection

@@ -46,7 +46,7 @@ typecheck: install-dev
 	$(MYPY) src
 
 test: install-dev
-	$(PYTEST) -q
+	PYTHONPATH=src $(PYTEST) -q -m "not integration"
 
 test-integration: install-dev
 	$(PYTEST) tests/integration -q

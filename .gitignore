@@ -38,3 +38,5 @@ data/
 infra/nginx/rendered/
 .env
 .env.*
+.coverage
+.codex
