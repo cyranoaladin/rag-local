@@ -124,7 +124,13 @@ def rerank(
         tolist = getattr(raw_scores, "tolist", None)
         scores_list = tolist() if callable(tolist) else list(raw_scores)
 
-        for candidate, score in zip(candidates, scores_list, strict=False):
+        if len(scores_list) != len(candidates):
+            raise ValueError(
+                "Reranker returned %d scores for %d candidates"
+                % (len(scores_list), len(candidates))
+            )
+
+        for candidate, score in zip(candidates, scores_list, strict=True):
             candidate.rerank_score = float(score)
 
         candidates.sort(key=lambda c: c.rerank_score or 0.0, reverse=True)

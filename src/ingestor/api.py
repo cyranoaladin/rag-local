@@ -329,7 +329,7 @@ def normalize_metadata(d: dict) -> dict[str, str]:
     for key, value in d.items():
         if value is None or value == "":
             continue
-        if isinstance(value, list | dict) and not value:
+        if isinstance(value, (list, dict)) and not value:
             continue
         normalized[str(key).strip().lower().replace(" ", "_")] = str(value)
     return normalized

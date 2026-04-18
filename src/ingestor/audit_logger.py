@@ -9,7 +9,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -45,7 +45,7 @@ class AuditStatus(str, Enum):
 @dataclass
 class AuditEvent:
     """Événement d'audit structuré."""
-    timestamp: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     action: str = ""
     status: str = ""
     user_id: str | None = None

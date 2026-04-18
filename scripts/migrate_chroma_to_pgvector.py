@@ -106,7 +106,7 @@ async def migrate(
             texts or [None] * len(ids),
             embeddings or [None] * len(ids),
             metadatas or [{}] * len(ids),
-            strict=False,
+            strict=True,
         ):
             if not text or not emb:
                 continue
