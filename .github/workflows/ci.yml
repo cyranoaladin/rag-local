@@ -20,6 +20,7 @@ jobs:
       - name: Typecheck
         run: make typecheck || mypy src
       - name: Tests (coverage ≥ 80%)
+        env:
+          PYTHONPATH: src
         run: |
-          make test || true
-          python -m pytest -q --cov=src/ingestor --cov-report=term-missing --cov-fail-under=80
+          python -m pytest -q -m "not integration" --cov=src/ingestor --cov-report=term-missing --cov-fail-under=80

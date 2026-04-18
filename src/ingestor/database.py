@@ -11,7 +11,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any, cast
 
-import asyncpg
+try:
+    import asyncpg
+except ImportError:
+    asyncpg = None
 
 logger = logging.getLogger(__name__)
 

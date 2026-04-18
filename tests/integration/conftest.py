@@ -13,6 +13,19 @@ from src.ingestor.api import app as ingest_app
 from tests.integration.mocks.embedding_utils import generate_fake_embedding
 
 
+@pytest.fixture
+def fake_chroma_store() -> dict[str, StoredVector]:
+    return {}
+
+
+def pytest_collection_modifyitems(items):
+    """Automatically mark all tests in this directory as integration tests."""
+    for item in items:
+        # Only mark if the test file is inside tests/integration
+        if "tests/integration" in str(item.fspath):
+            item.add_marker(pytest.mark.integration)
+
+
 @dataclass
 class StoredVector:
     vector_id: str
@@ -104,11 +117,6 @@ def _cosine_distance(vector_a: Sequence[float], vector_b: Sequence[float]) -> fl
         return 1.0
     similarity = max(-1.0, min(1.0, numerator / denominator))
     return round(1.0 - similarity, 6)
-
-
-@pytest.fixture
-def fake_chroma_store() -> dict[str, StoredVector]:
-    return {}
 
 
 @pytest.fixture

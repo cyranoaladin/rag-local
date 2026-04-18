@@ -9,26 +9,23 @@ Usage :
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 
 import pytest
 
-# Ensure src/ingestor is importable
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "ingestor"))
-
-from database import RagDatabase
+from ingestor.database import RagDatabase
 
 DSN = os.getenv(
     "DATABASE_URL_TEST",
     "postgresql://raguser:test@localhost:5435/ragdb_test",
 )
 
-# Skip all tests if no test database is available
-pytestmark = pytest.mark.skipif(
-    not os.getenv("DATABASE_URL_TEST"),
-    reason="DATABASE_URL_TEST not set — skip integration tests",
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.getenv("DATABASE_URL_TEST"),
+        reason="DATABASE_URL_TEST not set — skip integration tests",
+    ),
+]
 
 
 @pytest.fixture
