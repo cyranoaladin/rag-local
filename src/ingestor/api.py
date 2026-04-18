@@ -11,9 +11,11 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Literal, Optional, cast
@@ -72,13 +74,16 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_education")
 
 # ── Multi-collection architecture ──────────────────────────────────
 # Collections are organized by major section:
-#   - rag_education : all education resources (filtered by matiere/niveau/groupe via metadata)
-#   - rag_web3      : blockchain, DeFi, NFT, Solana, etc.
+#   - rag_education        : all education resources (filtered by matiere/niveau/groupe via metadata)
+#   - rag_francais_premiere: dedicated Français Première corpus
+#   - rag_web3             : blockchain, DeFi, NFT, Solana, etc.
+#   - rag_divers           : miscellaneous resources, always queried in "all" searches
 # Within each collection, metadata filters provide fine-grained retrieval.
 COLLECTION_MAP: dict[str, str] = {
     "education": "rag_education",
     "web3": "rag_web3",
     "blockchain": "rag_web3",
+    "divers": "rag_divers",
     "default": "rag_education",
 }
 
@@ -168,10 +173,35 @@ class PreparedBatch:
     metadatas: list[dict[str, str]]
     modality: str
 
+
+@dataclass
+class DriveTaskProgress:
+    """Suivi de progression pour une ingestion Google Drive."""
+    task_id: str
+    folder_id: str
+    status: str = "pending"  # pending, scanning, ingesting, done, error
+    total_files: int = 0
+    processed_files: int = 0
+    added_chunks: int = 0
+    skipped_files: int = 0
+    error_files: int = 0
+    current_file: str = ""
+    target_collection: str = ""
+    file_results: list[dict[str, Any]] = field(default_factory=list)
+    error_message: str = ""
+    started_at: float = 0.0
+    finished_at: float = 0.0
+
+
+# In-memory store for drive task progress (thread-safe via GIL for simple dict ops)
+_drive_tasks: dict[str, DriveTaskProgress] = {}
+_drive_tasks_lock = threading.Lock()
+
 app = FastAPI(title="RAG Ingestor API")
 app.include_router(admin_api.router)
 
-sync_manager = DriveSyncManager()
+_DRIVE_SYNC_DB = os.getenv("DRIVE_SYNC_DB_PATH", "/data/drive_sync_state.db")
+sync_manager = DriveSyncManager(db_path=_DRIVE_SYNC_DB)
 
 
 @app.middleware("http")
@@ -249,6 +279,7 @@ class DeduplicationCheckRequest(BaseModel):
     """Requête de vérification de doublons avant ingestion."""
     sources: list[str] = Field(description="Liste de source_path ou URLs à vérifier")
     section: str = Field(default="education", description="Section pour cibler la bonne collection")
+    collection: str = Field(default="", description="Collection explicite à utiliser pour la vérification")
 
 
 class SearchRequest(BaseModel):
@@ -274,7 +305,9 @@ class SearchRequest(BaseModel):
 def normalize_metadata(d: dict) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for key, value in d.items():
-        if value in (None, ""):
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, dict)) and not value:
             continue
         normalized[str(key).strip().lower().replace(" ", "_")] = str(value)
     return normalized
@@ -282,6 +315,14 @@ def normalize_metadata(d: dict) -> dict[str, str]:
 
 def get_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def get_content_fingerprint(texts: Sequence[str]) -> str:
+    parts = [(text or "").strip() for text in texts]
+    normalized = [part for part in parts if part]
+    if not normalized:
+        return ""
+    return hashlib.sha256("\n\n".join(normalized).encode("utf-8")).hexdigest()
 
 
 def _resolve_local_path(raw_path: str) -> Path:
@@ -692,8 +733,9 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
         try:
             _lazy = getattr(loader, "lazy_load", None)
             if callable(_lazy):
-                _iter = _lazy()
-                for _d in _iter if hasattr(_iter, "__iter__") else []:
+                _result = _lazy()
+                _iterable: list[Any] = list(_result) if hasattr(_result, "__iter__") else []  # type: ignore[arg-type]
+                for _d in _iterable:
                     try:
                         if _d and getattr(_d, "page_content", "").strip():
                             docs.append(_d)
@@ -755,6 +797,7 @@ def _prepare_chunks_for_chroma(
     req: IngestRequest,
     docs: list[Document],
     splitter: Optional[RecursiveCharacterTextSplitter] = None,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> PreparedBatch:
     splitter = splitter or RecursiveCharacterTextSplitter(
         chunk_size=INGEST_CHUNK_SIZE, chunk_overlap=INGEST_CHUNK_OVERLAP
@@ -765,6 +808,7 @@ def _prepare_chunks_for_chroma(
     metadatas: list[dict[str, str]] = []
     modality = "text"
     seen_ids: set[str] = set()
+    chunk_number = 0
 
     for chunk in chunks:
         text = (chunk.page_content or "").strip()
@@ -775,13 +819,16 @@ def _prepare_chunks_for_chroma(
             continue
         seen_ids.add(content_hash)
         chunk_modality = (chunk.metadata or {}).get("modality", "text")
-        metadata = {
+        metadata: dict[str, Any] = {
             "sha256": content_hash,
             "source_type": req.source_type,
             "source": req.source,
             "modality": chunk_modality,
+            "chunk_index": str(chunk_number),
         }
         metadata.update(chunk.metadata or {})
+        if extra_metadata:
+            metadata.update(extra_metadata)
         metadata.update(req.metadata_hints or {})
         normalized = normalize_metadata(metadata)
 
@@ -789,6 +836,7 @@ def _prepare_chunks_for_chroma(
         documents.append(text)
         metadatas.append(normalized)
         modality = normalized.get("modality", modality)
+        chunk_number += 1
 
     if not ids:
         modality = "text"
@@ -868,6 +916,27 @@ def _index_batch(
         _record_ingest_outcome(req_source_type, modality_label, "empty")
         return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
 
+    dedup_ids: list[str] = []
+    dedup_documents: list[str] = []
+    dedup_metadatas: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    batch_skipped = 0
+    for chunk_id, document, metadata in zip(prepared.ids, prepared.documents, prepared.metadatas, strict=False):
+        if chunk_id in seen_ids:
+            batch_skipped += 1
+            continue
+        seen_ids.add(chunk_id)
+        dedup_ids.append(chunk_id)
+        dedup_documents.append(document)
+        dedup_metadatas.append(metadata)
+
+    prepared = PreparedBatch(
+        ids=dedup_ids,
+        documents=dedup_documents,
+        metadatas=dedup_metadatas,
+        modality=prepared.modality,
+    )
+
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(
@@ -881,7 +950,7 @@ def _index_batch(
         if not to_add_idx:
             _record_ingest_metrics(True)
             _record_ingest_outcome(req_source_type, modality_label, "skipped")
-            return {"status": "ok", "added": 0, "skipped": len(prepared.ids)}
+            return {"status": "ok", "added": 0, "skipped": len(existing_ids) + batch_skipped, "collection": target_collection}
 
         emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
         docs_to_add = [prepared.documents[i] for i in to_add_idx]
@@ -921,7 +990,8 @@ def _index_batch(
         return {
             "status": "ok",
             "added": len(ids_to_add),
-            "skipped": len(existing_ids),
+            "skipped": (len(prepared.ids) - len(ids_to_add)) + batch_skipped,
+            "collection": target_collection,
         }
     except HTTPException as exc:
         _record_ingest_metrics(False)
@@ -935,13 +1005,46 @@ def _index_batch(
         ) from exc
 
 
-def background_drive_ingest(folder_id: str, metadata: dict):
-    logger.info(f"Starting background drive ingest for folder {folder_id}")
+def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> None:
+    """Ingestion Google Drive en arrière-plan avec suivi de progression."""
+    task = _drive_tasks.get(task_id)
+    if not task:
+        logger.error(f"Drive task {task_id} not found in store")
+        return
+
+    task.status = "scanning"
+    task.started_at = time.time()
+    target_col = resolve_collection_name(section=metadata.get("section"), collection=metadata.get("collection"))
+    task.target_collection = target_col
+
+    logger.info(f"[{task_id}] Starting drive ingest for folder {folder_id} → {target_col}")
+
     try:
+        # Vérification d'accès explicite avant de démarrer — lève PermissionError si le SA n'a pas accès
+        try:
+            sync_manager.verify_folder_access(folder_id)
+        except PermissionError as e:
+            logger.error(f"[{task_id}] Drive access denied: {e}")
+            task.status = "error"
+            task.error_message = str(e)
+            task.finished_at = time.time()
+            return
+        except Exception as e:
+            logger.error(f"[{task_id}] Drive access check failed: {e}")
+            task.status = "error"
+            task.error_message = f"Erreur vérification accès Drive: {e}"
+            task.finished_at = time.time()
+            return
+
         updates = sync_manager.list_updates(folder_id)
         if not updates:
-            logger.info("Aucune mise à jour pour le dossier Drive.")
+            logger.info(f"[{task_id}] Aucune mise à jour pour le dossier Drive.")
+            task.status = "done"
+            task.finished_at = time.time()
             return
+
+        task.total_files = len(updates)
+        task.status = "ingesting"
 
         # Setup credentials once
         loader_kwargs_base: dict[str, Any] = {}
@@ -961,7 +1064,7 @@ def background_drive_ingest(folder_id: str, metadata: dict):
             default_credentials = Path.home() / ".credentials" / "credentials.json"
             if default_credentials.exists():
                 loader_kwargs_base["credentials_path"] = default_credentials
-        
+
         token_path = Path(GOOGLE_DRIVE_TOKEN_PATH)
         try:
             token_path.parent.mkdir(parents=True, exist_ok=True)
@@ -970,49 +1073,221 @@ def background_drive_ingest(folder_id: str, metadata: dict):
         loader_kwargs_base["token_path"] = token_path
 
         for file_meta in updates:
+            fid = file_meta.get("id", "?")
+            fname = file_meta.get("name", "?")
+            mime_type = str(file_meta.get("mimeType") or "")
+            task.current_file = fname
+
+            fname_lower = fname.lower()
+            unsupported_exts = (
+                ".webm", ".mkv", ".mp4", ".avi", ".mov", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
+                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".tif", ".tiff", ".ico",
+                ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+                ".ppt", ".pptx", ".pps", ".ppsx", ".doc", ".php",
+                ".html", ".htm", ".txt",
+            )
+            unsupported_mimes = (
+                "video/", "audio/", "image/",
+                "application/zip", "application/x-zip", "application/x-zip-compressed",
+                "application/x-rar", "application/vnd.rar", "application/x-7z-compressed",
+                "application/vnd.ms-powerpoint",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+                "text/html",
+            )
+            if mime_type.startswith(unsupported_mimes) or fname_lower.endswith(unsupported_exts):
+                logger.info(f"[{task_id}] Skipping unsupported Drive file {fid} ({fname}) [{mime_type}]")
+                task.skipped_files += 1
+                task.processed_files += 1
+                task.file_results.append({
+                    "name": fname,
+                    "status": "unsupported",
+                    "added": 0,
+                    "skipped": 1,
+                    "detail": f"Type Google Drive non supporté pour ce flux: {mime_type or fname}",
+                })
+                continue
+
             try:
-                fid = file_meta.get("id")
-                logger.info(f"Processing file {fid} ({file_meta.get('name')})")
-                
+                logger.info(f"[{task_id}] Processing file {fid} ({fname})")
+
                 # Load specific file
                 kwargs = loader_kwargs_base.copy()
                 kwargs["file_ids"] = [fid]
-                
+
                 try:
                     loader = GoogleDriveLoader(**kwargs)
                     docs = loader.load()
                 except Exception as e:
-                    logger.warning(f"Failed to load file {fid}: {e}")
-                    continue
-                
-                if not docs:
-                    logger.warning(f"No content loaded for file {fid}")
+                    error_detail = str(e)
+                    logger.warning(f"[{task_id}] Failed to load file {fid}: {error_detail}")
+                    task.processed_files += 1
+                    invalid_markers = (
+                        "EOF marker not found",
+                        "cannot find",
+                        "trailer",
+                        "malformed",
+                        "invalid pdf",
+                        "file is not a pdf",
+                    )
+                    if any(marker in error_detail.lower() for marker in [m.lower() for m in invalid_markers]):
+                        task.skipped_files += 1
+                        task.file_results.append({
+                            "name": fname,
+                            "status": "invalid",
+                            "added": 0,
+                            "skipped": 1,
+                            "detail": error_detail,
+                        })
+                    else:
+                        task.error_files += 1
+                        task.file_results.append({"name": fname, "status": "error", "detail": error_detail})
                     continue
 
-                # Prepare chunks
+                if not docs:
+                    logger.warning(f"[{task_id}] No content loaded for file {fid}")
+                    task.skipped_files += 1
+                    task.processed_files += 1
+                    task.file_results.append({"name": fname, "status": "empty", "added": 0})
+                    continue
+
+                content_fingerprint = get_content_fingerprint([(doc.page_content or "") for doc in docs])
+                if sync_manager.is_unchanged(file_meta, content_fingerprint):
+                    logger.info(f"[{task_id}] Skipping unchanged file {fid} ({fname})")
+                    task.skipped_files += 1
+                    task.processed_files += 1
+                    task.file_results.append({
+                        "name": fname,
+                        "status": "duplicate",
+                        "added": 0,
+                        "skipped": 1,
+                        "detail": "Contenu inchangé (empreinte identique).",
+                    })
+                    continue
+
+                # Prepare chunks — inject Drive-specific metadata per file
                 req = IngestRequest(
-                    sourceType="gdrive_folder", 
-                    sourceUrl=folder_id, 
-                    metadata=metadata
+                    sourceType="gdrive_folder",
+                    sourceUrl=folder_id,
+                    metadata=metadata,
                 )
-                prepared = _prepare_chunks_for_chroma(req, docs)
-                
+                drive_extra: dict[str, Any] = {
+                    "drive_file_id": fid,
+                    "drive_file_name": fname,
+                    "drive_folder_id": folder_id,
+                    "mime_type": mime_type,
+                }
+                prepared = _prepare_chunks_for_chroma(req, docs, extra_metadata=drive_extra)
+
+                if not prepared.ids:
+                    task.skipped_files += 1
+                    task.processed_files += 1
+                    task.file_results.append({"name": fname, "status": "empty", "added": 0})
+                    continue
+
                 # Index
                 try:
-                    _index_batch(prepared, "gdrive_folder", "text")
+                    result = _index_batch(prepared, "gdrive_folder", "text", collection_name=target_col)
+                    added = result.get("added", 0)
+                    skipped = result.get("skipped", 0)
+                    task.added_chunks += added
+                    if added == 0 and skipped > 0:
+                        task.skipped_files += 1
+                        task.file_results.append({"name": fname, "status": "duplicate", "added": 0, "skipped": skipped})
+                    else:
+                        task.file_results.append({"name": fname, "status": "ok", "added": added, "skipped": skipped})
                 except Exception as e:
-                    logger.error(f"Indexing failed for {fid}: {e}")
+                    logger.error(f"[{task_id}] Indexing failed for {fid}: {e}")
+                    task.error_files += 1
+                    task.file_results.append({"name": fname, "status": "error", "detail": str(e)})
+                    task.processed_files += 1
                     continue
-                
+
                 # Mark as ingested
-                sync_manager.mark_as_ingested(file_meta)
-                
+                sync_manager.mark_as_ingested(file_meta, content_fingerprint=content_fingerprint)
+
             except Exception as e:
-                logger.error(f"Error processing file {file_meta.get('id')}: {e}")
-                continue
-                
+                logger.error(f"[{task_id}] Error processing file {fid}: {e}")
+                task.error_files += 1
+                task.file_results.append({"name": fname, "status": "error", "detail": str(e)})
+
+            task.processed_files += 1
+
+        task.status = "done"
+        task.current_file = ""
+        task.finished_at = time.time()
+        logger.info(
+            f"[{task_id}] Drive ingest done: {task.processed_files}/{task.total_files} files, "
+            f"{task.added_chunks} chunks added → {target_col}"
+        )
+
     except Exception as e:
-        logger.error(f"Background ingest failed: {e}")
+        logger.error(f"[{task_id}] Background ingest failed: {e}")
+        task.status = "error"
+        task.error_message = str(e)
+        task.finished_at = time.time()
+
+
+@app.post("/ingest/drive")
+def ingest_drive(
+    req: DriveIngestRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+):
+    """Lance une ingestion Google Drive et retourne un task_id pour suivi de progression."""
+    _enforce_security(request, req)
+
+    task_id = uuid.uuid4().hex[:12]
+    target_col = resolve_collection_name(section=req.metadata.get("section"), collection=req.metadata.get("collection"))
+    task = DriveTaskProgress(task_id=task_id, folder_id=req.folder_id, target_collection=target_col)
+
+    with _drive_tasks_lock:
+        _drive_tasks[task_id] = task
+
+    background_tasks.add_task(background_drive_ingest, req.folder_id, req.metadata, task_id)
+
+    return {
+        "status": "accepted",
+        "task_id": task_id,
+        "target_collection": target_col,
+        "message": f"Ingestion Drive démarrée (tâche {task_id})",
+    }
+
+
+@app.get("/ingest/drive/status/{task_id}")
+def drive_ingest_status(task_id: str, request: Request) -> dict[str, Any]:
+    """Retourne la progression d'une ingestion Google Drive."""
+    _enforce_security(request, None)
+
+    task = _drive_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Tâche {task_id} introuvable")
+
+    elapsed = 0.0
+    if task.started_at > 0:
+        end = task.finished_at if task.finished_at > 0 else time.time()
+        elapsed = round(end - task.started_at, 1)
+
+    progress_pct = 0
+    if task.total_files > 0:
+        progress_pct = round((task.processed_files / task.total_files) * 100)
+
+    return {
+        "task_id": task.task_id,
+        "folder_id": task.folder_id,
+        "status": task.status,
+        "target_collection": task.target_collection,
+        "total_files": task.total_files,
+        "processed_files": task.processed_files,
+        "added_chunks": task.added_chunks,
+        "skipped_files": task.skipped_files,
+        "error_files": task.error_files,
+        "current_file": task.current_file,
+        "progress_pct": progress_pct,
+        "elapsed_seconds": elapsed,
+        "error_message": task.error_message,
+        "file_results": task.file_results,
+    }
 
 
 @app.post("/ingest")
@@ -1058,21 +1333,8 @@ def ingest_data(
         _record_ingest_outcome(req.source_type, modality_label, "empty")
         return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
 
-    target_col = resolve_collection_name(section=req.metadata_hints.get("section"))
+    target_col = resolve_collection_name(section=req.metadata_hints.get("section"), collection=req.metadata_hints.get("collection"))
     return _index_batch(prepared, req.source_type, modality_label, collection_name=target_col)
-
-
-@app.post("/ingest/drive")
-def ingest_drive(
-    req: DriveIngestRequest,
-    background_tasks: BackgroundTasks,
-    request: Request,
-):
-    # Reuse security check
-    _enforce_security(request, req)
-    
-    background_tasks.add_task(background_drive_ingest, req.folder_id, req.metadata)
-    return {"status": "accepted", "message": "Ingestion Drive démarrée en arrière-plan"}
 
 
 @app.post("/ingest/urls")
@@ -1090,6 +1352,8 @@ def ingest_urls(
     results: list[dict[str, Any]] = []
     total_added = 0
     total_skipped = 0
+    total_errors = 0
+    total_errors = 0
 
     for url in req.urls:
         url = url.strip()
@@ -1110,7 +1374,7 @@ def ingest_urls(
                 results.append({"url": url, "status": "empty", "added": 0, "skipped": 0})
                 continue
 
-            target_col = resolve_collection_name(section=req.metadata_hints.get("section"))
+            target_col = resolve_collection_name(section=req.metadata_hints.get("section"), collection=req.metadata_hints.get("collection"))
             result = _index_batch(prepared, "url", prepared.modality or "text", collection_name=target_col)
             added = result.get("added", 0)
             skipped = result.get("skipped", 0)
@@ -1157,6 +1421,7 @@ async def ingest_upload_files(
     results: list[dict[str, Any]] = []
     total_added = 0
     total_skipped = 0
+    total_errors = 0
 
     for file in files:
         fname = file.filename or "upload.bin"
@@ -1172,19 +1437,21 @@ async def ingest_upload_files(
             file_hash = hashlib.sha256(content).hexdigest()
 
             # Vérifier doublon : même hash déjà présent dans ChromaDB
-            target_col = resolve_collection_name(section=hints.get("section"))
+            target_col = resolve_collection_name(section=hints.get("section"), collection=hints.get("collection"))
             client = get_chroma_client()
             collection = client.get_or_create_collection(
                 name=target_col, metadata={"hnsw:space": "cosine"}
             )
-            existing = collection.get(where={"sha256": file_hash}, limit=1)
+            existing = collection.get(where={"file_hash": file_hash}) or {}
             existing_ids = existing.get("ids", []) if existing else []
             if existing_ids:
-                total_skipped += 1
+                skipped = len(existing_ids)
+                total_skipped += skipped
                 results.append({
                     "filename": fname,
                     "status": "duplicate",
-                    "detail": "Fichier déjà ingéré (même hash SHA256).",
+                    "skipped": skipped,
+                    "detail": "Fichier déjà ingéré (même empreinte de fichier).",
                 })
                 try:
                     dest.unlink()
@@ -1222,15 +1489,15 @@ async def ingest_upload_files(
             else:
                 docs = _load_source_documents(sub_req)
                 if not docs:
-                    results.append({"filename": fname, "status": "empty", "added": 0})
+                    results.append({"filename": fname, "status": "empty", "added": 0, "skipped": 0})
                     continue
                 prepared = _prepare_chunks_for_chroma(sub_req, docs)
 
             if not prepared.ids:
-                results.append({"filename": fname, "status": "empty", "added": 0})
+                results.append({"filename": fname, "status": "empty", "added": 0, "skipped": 0})
                 continue
 
-            target_col = resolve_collection_name(section=hints.get("section"))
+            target_col = resolve_collection_name(section=hints.get("section"), collection=hints.get("collection"))
             result = _index_batch(prepared, detected_type, prepared.modality or "text", collection_name=target_col)
             added = result.get("added", 0)
             skipped = result.get("skipped", 0)
@@ -1244,8 +1511,10 @@ async def ingest_upload_files(
                 "source_type": detected_type,
             })
         except HTTPException as exc:
+            total_errors += 1
             results.append({"filename": fname, "status": "error", "detail": exc.detail})
         except Exception as exc:
+            total_errors += 1
             logger.exception("Upload ingestion failed for %s", fname)
             results.append({"filename": fname, "status": "error", "detail": str(exc)})
 
@@ -1254,6 +1523,7 @@ async def ingest_upload_files(
         "total_files": len(files),
         "total_added": total_added,
         "total_skipped": total_skipped,
+        "total_errors": total_errors,
         "results": results,
     }
 
@@ -1266,7 +1536,7 @@ def check_duplicates(
     """Vérifie si des sources ont déjà été ingérées pour éviter les doublons."""
     _enforce_security(request, req)
 
-    target_col = resolve_collection_name(section=req.section)
+    target_col = resolve_collection_name(section=req.section, collection=req.collection)
     client = get_chroma_client()
     collection = client.get_or_create_collection(
         name=target_col, metadata={"hnsw:space": "cosine"}
