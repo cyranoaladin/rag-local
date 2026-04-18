@@ -1,9 +1,11 @@
-# Fichier: /srv/rag/ingestor/api.py
+# Fichier: src/ingestor/api.py
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib.util
 import ipaddress
+import json
 import logging
 import mimetypes
 import os
@@ -23,8 +25,10 @@ import docx
 import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
 from langchain_core.documents import Document
@@ -64,7 +68,25 @@ CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-COLLECTION_NAME = "ressources_pedagogiques_terminale"
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_education")
+
+# Multi-collection routing by section
+COLLECTION_MAP: dict[str, str] = {
+    "education": os.getenv("COLLECTION_EDUCATION", "rag_education"),
+    "web3": os.getenv("COLLECTION_WEB3", "rag_web3"),
+    "blockchain": os.getenv("COLLECTION_WEB3", "rag_web3"),
+}
+
+
+def resolve_collection_name(
+    section: str | None = None, collection: str | None = None,
+) -> str:
+    """Resolve target ChromaDB collection from section or explicit name."""
+    if collection:
+        return collection.strip()
+    key = (section or "").strip().lower()
+    return COLLECTION_MAP.get(key, COLLECTION_NAME)
+
 CHROMA_REQUEST_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", "30"))
 OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "30"))
 MAX_REMOTE_BYTES = int(os.getenv("MAX_REMOTE_BYTES", str(10 * 1024 * 1024)))
@@ -77,8 +99,8 @@ URL_SCHEMES_ALLOWED = {"http", "https"}
 INGEST_CHUNK_SIZE = int(os.getenv("INGEST_CHUNK_SIZE", "1000"))
 INGEST_CHUNK_OVERLAP = int(os.getenv("INGEST_CHUNK_OVERLAP", "150"))
 METRICS_ENABLED = ingest_metrics.METRICS_ENABLED
-MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "false").lower() == "true"
-MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
+MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "true").lower() == "true"
+MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "1800"))
 MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
 MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
 
@@ -99,12 +121,82 @@ class PreparedBatch:
     metadatas: list[dict[str, str]]
     modality: str
 
+
+MEDIA_SOURCE_TYPES = frozenset({"video", "image", "audio"})
+
+
+def _dedupe_prepared_batch(prepared: PreparedBatch) -> tuple[PreparedBatch, int]:
+    seen_ids: set[str] = set()
+    ids: list[str] = []
+    documents: list[str] = []
+    metadatas: list[dict[str, str]] = []
+    skipped = 0
+
+    for chunk_id, document, metadata in zip(
+        prepared.ids, prepared.documents, prepared.metadatas, strict=False
+    ):
+        if chunk_id in seen_ids:
+            skipped += 1
+            continue
+        seen_ids.add(chunk_id)
+        ids.append(chunk_id)
+        documents.append(document)
+        metadatas.append(metadata)
+
+    return PreparedBatch(ids=ids, documents=documents, metadatas=metadatas, modality=prepared.modality), skipped
+
+
+def _validate_upload_mode(source_type: str, mode: str) -> None:
+    normalized_source_type = (source_type or "").strip().lower()
+    normalized_mode = (mode or "text").strip().lower() or "text"
+    if normalized_source_type not in MEDIA_SOURCE_TYPES:
+        return
+    if normalized_mode != "multimodal":
+        raise HTTPException(
+            status_code=400,
+            detail="Ce type de fichier nécessite mode=multimodal.",
+        )
+    if not MULTIMODAL_ENABLED:
+        raise HTTPException(status_code=400, detail="Multimodal ingest disabled")
+
 app = FastAPI(title="RAG Ingestor API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(
+    request: Request, exc: RequestValidationError,
+) -> JSONResponse:
+    """Return a clearer error when the JSON body cannot be parsed.
+
+    This commonly happens when filenames with special Unicode characters
+    (emojis, supplementary-plane chars) cause encoding issues in the
+    request body.
+    """
+    logger.warning("Request validation error on %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "error",
+            "detail": "Erreur de validation du corps de la requête. "
+            "Vérifiez que les noms de fichiers ne contiennent pas "
+            "de caractères spéciaux (emojis, guillemets, etc.).",
+            "errors": [str(e) for e in exc.errors()[:5]],
+        },
+    )
 
 
 @app.middleware("http")
 async def _metrics_middleware(request, call_next):
     start = time.perf_counter()
+    code = 500
     try:
         response = await call_next(request)
         code = getattr(response, "status_code", 500)
@@ -141,7 +233,7 @@ def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
 
 class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video"] = Field(
+    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video", "auto", "image", "audio"] = Field(
         alias="sourceType",
         validation_alias=AliasChoices("source_type", "sourceType"),
     )
@@ -171,13 +263,15 @@ def get_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _resolve_local_path(raw_path: str) -> Path:
+def _resolve_local_path(raw_path: str, *, allow_tmp: bool = False) -> Path:
     candidate = Path(raw_path)
     if not candidate.is_absolute():
         candidate = (LOCAL_SOURCE_ROOT / candidate).resolve()
     else:
         candidate = candidate.resolve()
-    if not ALLOW_UNRESTRICTED_LOCAL and not str(candidate).startswith(str(LOCAL_SOURCE_ROOT)):
+    in_allowed_root = str(candidate).startswith(str(LOCAL_SOURCE_ROOT))
+    in_tmp = allow_tmp and str(candidate).startswith("/tmp/")
+    if not ALLOW_UNRESTRICTED_LOCAL and not in_allowed_root and not in_tmp:
         raise HTTPException(
             status_code=400, detail="Chemin local en dehors de la zone autorisée")
     if not candidate.exists():
@@ -221,13 +315,28 @@ def _ip_allowed(ip_str: str, allowlist: str | None) -> bool:
     return False
 
 
+def _extract_bearer_token(headers: Any) -> str | None:
+    """Extract token from Authorization: Bearer <token> header."""
+    auth = headers.get("Authorization") or headers.get("authorization") or ""
+    if auth.startswith("Bearer "):
+        return auth[7:].strip() or None
+    return None
+
+
 def _enforce_security(request: Any, _req: Any) -> None:
     headers = getattr(request, "headers", {}) or {}
     token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
-    if token_env:
-        header_token = headers.get("X-API-Token") or headers.get("x-api-token")
-        if header_token != token_env:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not token_env:
+        logger.error("INGESTOR_API_TOKEN is not configured — rejecting request")
+        raise HTTPException(status_code=503, detail="API token not configured on server")
+
+    header_token = (
+        headers.get("X-API-Token")
+        or headers.get("x-api-token")
+        or _extract_bearer_token(headers)
+    )
+    if not header_token or not hmac.compare_digest(header_token, token_env):
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
     allowlist = os.getenv("INGESTOR_IP_ALLOWLIST")
     if allowlist and not _ip_allowed(_get_client_ip(request), allowlist):
@@ -459,19 +568,42 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
         loader = GoogleDriveLoader(folder_id=req.source, recursive=True)
         return loader.load()
     if req.source_type == "pdf":
-        path = _resolve_local_path(req.source)
+        path = _resolve_local_path(req.source, allow_tmp=True)
         return PyPDFLoader(str(path)).load()
     if req.source_type == "docx":
-        path = _resolve_local_path(req.source)
+        path = _resolve_local_path(req.source, allow_tmp=True)
         return load_docx(str(path))
     if req.source_type in {"markdown", "md"}:
-        path = _resolve_local_path(req.source)
+        path = _resolve_local_path(req.source, allow_tmp=True)
         return load_markdown(path)
-    if req.source_type == "video":
+    if req.source_type in {"video", "image", "audio"}:
         raise HTTPException(
             status_code=400,
-            detail="Ingestion vidéo disponible uniquement en mode multimodal (mode=multimodal).",
+            detail="Ce type de source nécessite le mode multimodal (mode=multimodal).",
         )
+    if req.source_type == "auto":
+        ext = Path(req.source).suffix.lower()
+        if ext == ".pdf":
+            path = _resolve_local_path(req.source, allow_tmp=True)
+            return PyPDFLoader(str(path)).load()
+        if ext == ".docx":
+            path = _resolve_local_path(req.source, allow_tmp=True)
+            return load_docx(str(path))
+        if ext in {".md", ".markdown"}:
+            path = _resolve_local_path(req.source, allow_tmp=True)
+            return load_markdown(path)
+        if ext in {".txt", ".csv", ".json", ".xml", ".html", ".htm"}:
+            path = _resolve_local_path(req.source, allow_tmp=True)
+            text = path.read_text(encoding="utf-8", errors="ignore").strip()
+            if not text:
+                return []
+            return [Document(page_content=text, metadata={"source": str(path)})]
+        # Fallback: try reading as text
+        path = _resolve_local_path(req.source, allow_tmp=True)
+        text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        if text:
+            return [Document(page_content=text, metadata={"source": str(path)})]
+        return []
     raise HTTPException(status_code=400, detail=f"source_type non géré: {req.source_type}")
 
 
@@ -552,16 +684,50 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
     return PreparedBatch(ids=ids, documents=documents, metadatas=metadatas, modality=dominant)
 
 
+_AV_MIME_FALLBACK: dict[str, str] = {
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".flv": "video/x-flv",
+    ".mpg": "video/mpeg",
+    ".mpeg": "video/mpeg",
+    ".ogv": "video/ogg",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".aac": "audio/aac",
+    ".m4a": "audio/mp4",
+    ".wma": "audio/x-ms-wma",
+}
+
+
+def _guess_mime(filename: str) -> str:
+    """Guess MIME type from filename, with fallback for AV formats.
+
+    Uses only the file extension to avoid issues with special Unicode characters
+    in filenames that can confuse mimetypes.guess_type.
+    """
+    ext = Path(filename).suffix.lower()
+    fallback = _AV_MIME_FALLBACK.get(ext)
+    if fallback:
+        return fallback
+    mime, _ = mimetypes.guess_type(f"file{ext}")
+    return mime or "application/octet-stream"
+
+
 def _prepare_multimodal_ingest(req: IngestRequest) -> PreparedBatch:
     if not MULTIMODAL_ENABLED:
         raise HTTPException(status_code=400, detail="Multimodal ingest disabled")
     path = _resolve_local_path(req.source)
-    mime, _ = mimetypes.guess_type(path.name)
+    mime = _guess_mime(path.name)
     with path.open("rb") as handle:
         chunk_iter = parse_multimodal(
             handle,
             filename=path.name,
-            mime=mime or "application/octet-stream",
+            mime=mime,
             timeout_s=MM_PARSER_TIMEOUT,
             max_chars_per_chunk=MM_MAX_CHARS_PER_CHUNK,
             cache_dir=MM_CACHE_DIR,
@@ -577,9 +743,15 @@ def ingest_data(
     req: IngestRequest,
     request: Request,
     mode: str = Query(default="text"),
+    section: str = Query(default=""),
+    collection: str = Query(default=""),
 ):
     modality_label = "unknown"
     mode_normalized = (mode or "text").strip().lower() or "text"
+    target_col = resolve_collection_name(
+        section=section or req.metadata_hints.get("section"),
+        collection=collection or req.metadata_hints.get("collection"),
+    )
 
     try:
         _enforce_security(request, req)
@@ -596,7 +768,7 @@ def ingest_data(
                 _record_ingest_metrics(True)
                 modality_label = "text"
                 _record_ingest_outcome(req.source_type, modality_label, "empty")
-                return {"status": "ok", "message": "Aucun document chargé."}
+                return {"status": "ok", "message": "Aucun document chargé.", "collection": target_col}
             prepared = _prepare_chunks_for_chroma(req, docs)
         else:
             raise HTTPException(status_code=400, detail="Mode d'ingestion non supporté")
@@ -608,27 +780,34 @@ def ingest_data(
     except Exception as exc:
         _record_ingest_metrics(False)
         _record_ingest_outcome(req.source_type, modality_label, "error")
-        raise HTTPException(status_code=500, detail=f"Erreur de chargement: {exc}") from exc
+        logger.exception("Erreur de chargement source")
+        raise HTTPException(status_code=500, detail="Erreur de chargement du document source") from exc
 
     if not prepared.ids:
         _record_ingest_metrics(True)
         _record_ingest_outcome(req.source_type, modality_label, "empty")
-        return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
+        return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion.", "collection": target_col}
+    prepared, batch_skipped = _dedupe_prepared_batch(prepared)
 
     try:
         client = get_chroma_client()
-        collection = client.get_or_create_collection(
-            name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
+        collection_obj = client.get_or_create_collection(
+            name=target_col, metadata={"hnsw:space": "cosine"}
         )
 
-        existing = collection.get(ids=prepared.ids) or {}
+        existing = collection_obj.get(ids=prepared.ids) or {}
         existing_ids = set(existing.get("ids", []))
 
         to_add_idx = [i for i, chunk_id in enumerate(prepared.ids) if chunk_id not in existing_ids]
         if not to_add_idx:
             _record_ingest_metrics(True)
             _record_ingest_outcome(req.source_type, modality_label, "skipped")
-            return {"status": "ok", "added": 0, "skipped": len(prepared.ids)}
+            return {
+                "status": "ok",
+                "added": 0,
+                "skipped": len(existing_ids) + batch_skipped,
+                "collection": target_col,
+            }
 
         emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
         docs_to_add = [prepared.documents[i] for i in to_add_idx]
@@ -644,20 +823,17 @@ def ingest_data(
                 )
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
-                        "Pull the model or adjust EMBED_MODEL before retrying."
-                    ),
+                    detail=f"Modèle d'embedding '{EMBED_MODEL}' non disponible. Vérifiez la configuration.",
                 ) from exc
             logger.exception("Embedding provider raised ValueError")
-            raise
-        except Exception:  # pragma: no cover - defensive logging
+            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
+        except Exception as exc:
             logger.exception("Unexpected failure while requesting embeddings")
-            raise
+            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
 
         meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
         embeddings_seq = cast(list[Sequence[float]], embs_to_add)
-        collection.add(
+        collection_obj.add(
             documents=docs_to_add,
             ids=ids_to_add,
             metadatas=meta_mappings,
@@ -668,7 +844,8 @@ def ingest_data(
         return {
             "status": "ok",
             "added": len(ids_to_add),
-            "skipped": len(existing_ids),
+            "skipped": (len(prepared.ids) - len(ids_to_add)) + batch_skipped,
+            "collection": target_col,
         }
     except HTTPException as exc:
         _record_ingest_metrics(False)
@@ -677,19 +854,459 @@ def ingest_data(
     except Exception as exc:
         _record_ingest_metrics(False)
         _record_ingest_outcome(req.source_type, modality_label, "error")
-        raise HTTPException(
-            status_code=500, detail=f"Erreur d'ingestion dans ChromaDB: {exc}"
-        ) from exc
+        logger.exception("Erreur d'ingestion ChromaDB")
+        raise HTTPException(status_code=500, detail="Erreur d'indexation dans la base vectorielle") from exc
+
+
+@app.post("/ingest/upload")
+def ingest_upload(
+    request: Request,
+    file: UploadFile = File(...),  # noqa: B008
+    source_type: str = Form(default="auto"),
+    mode: str = Form(default="multimodal"),
+    metadata: str = Form(default="{}"),
+    section: str = Form(default=""),
+    collection: str = Form(default=""),
+):
+    """Ingest a file uploaded via multipart form data.
+
+    This endpoint avoids JSON body encoding issues for filenames
+    with special Unicode characters (emojis, accented chars, etc.).
+    """
+    try:
+        _enforce_security(request, None)
+    except HTTPException:
+        raise
+
+    filename = file.filename or "upload"
+    mime = _guess_mime(filename)
+    modality_label = "unknown"
+
+    try:
+        hints = json.loads(metadata) if metadata else {}
+    except (ValueError, TypeError):
+        hints = {}
+
+    target_col = resolve_collection_name(
+        section=section or hints.get("section"),
+        collection=collection or hints.get("collection"),
+    )
+
+    # Determine source_type from extension if auto
+    if source_type == "auto":
+        ext = Path(filename).suffix.lower()
+        if ext in {".pdf"}:
+            source_type = "pdf"
+        elif ext in {".docx"}:
+            source_type = "docx"
+        elif ext in {".md", ".markdown"}:
+            source_type = "markdown"
+        elif ext in {".mp4", ".webm", ".mkv", ".mov", ".avi", ".mp3", ".wav", ".ogg", ".flac",
+                     ".aac", ".m4a", ".wma"}:
+            source_type = "video"
+        elif ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}:
+            source_type = "image"
+        elif ext in {".txt", ".csv", ".json", ".xml", ".html", ".htm"}:
+            source_type = "auto"
+        else:
+            source_type = "auto"
+
+    _validate_upload_mode(source_type, mode)
+
+    # Write uploaded file to temp, then process
+    suffix = Path(filename).suffix or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir="/tmp") as tmp:
+        content = file.file.read()
+        file_hash = hashlib.sha256(content).hexdigest()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        ingest_hints = {
+            **hints,
+            "file_hash": file_hash,
+            "original_filename": filename,
+        }
+        client = get_chroma_client()
+        collection_obj = client.get_or_create_collection(
+            name=target_col, metadata={"hnsw:space": "cosine"}
+        )
+        existing_file = collection_obj.get(where={"file_hash": file_hash}) or {}
+        existing_file_ids = set(existing_file.get("ids", []))
+        if existing_file_ids:
+            _record_ingest_metrics(True)
+            _record_ingest_outcome(source_type, modality_label, "skipped")
+            return {
+                "status": "ok",
+                "added": 0,
+                "skipped": len(existing_file_ids),
+                "filename": filename,
+                "collection": target_col,
+            }
+        req = IngestRequest.model_validate({
+            "source_type": source_type,
+            "source": tmp_path,
+            "hints": ingest_hints,
+        })
+        mode_normalized = (mode or "multimodal").strip().lower()
+
+        if mode_normalized == "multimodal" or source_type in MEDIA_SOURCE_TYPES:
+            with open(tmp_path, "rb") as handle:
+                chunk_iter = parse_multimodal(
+                    handle,
+                    filename=filename,
+                    mime=mime,
+                    timeout_s=MM_PARSER_TIMEOUT,
+                    max_chars_per_chunk=MM_MAX_CHARS_PER_CHUNK,
+                    cache_dir=MM_CACHE_DIR,
+                )
+                chunk_list = list(chunk_iter)
+            prepared = _prepare_multimodal_chunks(req, chunk_list)
+        else:
+            docs = _load_source_documents(req)
+            if not docs:
+                return {"status": "ok", "message": "Aucun document chargé.", "filename": filename, "collection": target_col}
+            prepared = _prepare_chunks_for_chroma(req, docs)
+
+        modality_label = prepared.modality or "unknown"
+
+        if not prepared.ids:
+            _record_ingest_metrics(True)
+            _record_ingest_outcome(source_type, modality_label, "empty")
+            return {"status": "ok", "message": "Aucun contenu éligible.", "filename": filename, "collection": target_col}
+        prepared, batch_skipped = _dedupe_prepared_batch(prepared)
+
+        existing = collection_obj.get(ids=prepared.ids) or {}
+        existing_ids = set(existing.get("ids", []))
+
+        to_add_idx = [i for i, cid in enumerate(prepared.ids) if cid not in existing_ids]
+
+        if not to_add_idx:
+            _record_ingest_metrics(True)
+            _record_ingest_outcome(source_type, modality_label, "skipped")
+            return {
+                "status": "ok",
+                "added": 0,
+                "skipped": len(existing_ids) + batch_skipped,
+                "filename": filename,
+                "collection": target_col,
+            }
+
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        docs_to_add = [prepared.documents[i] for i in to_add_idx]
+        ids_to_add = [prepared.ids[i] for i in to_add_idx]
+        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
+        try:
+            embs_to_add = emb.embed_documents(docs_to_add)
+        except ValueError as exc:
+            message = str(exc)
+            if "HTTP code: 404" in message:
+                logger.warning(
+                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Modèle d'embedding '{EMBED_MODEL}' non disponible. Vérifiez la configuration.",
+                ) from exc
+            logger.exception("Embedding provider raised ValueError during upload")
+            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
+        except Exception as exc:
+            logger.exception("Unexpected failure while requesting embeddings during upload")
+            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
+
+        meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
+        embeddings_seq = cast(list[Sequence[float]], embs_to_add)
+        collection_obj.add(
+            documents=docs_to_add,
+            ids=ids_to_add,
+            metadatas=meta_mappings,
+            embeddings=embeddings_seq,
+        )
+        _record_ingest_metrics(True)
+        _record_ingest_outcome(source_type, modality_label, "success")
+        return {
+            "status": "ok",
+            "added": len(ids_to_add),
+            "skipped": (len(prepared.ids) - len(ids_to_add)) + batch_skipped,
+            "filename": filename,
+            "collection": target_col,
+        }
+    except HTTPException:
+        _record_ingest_metrics(False)
+        raise
+    except Exception as exc:
+        _record_ingest_metrics(False)
+        _record_ingest_outcome(source_type, modality_label, "error")
+        logger.exception("Erreur d'ingestion upload pour %s", filename)
+        raise HTTPException(status_code=500, detail="Erreur d'ingestion du fichier uploadé") from exc
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 @app.get("/health")
 def health_check():
+    """Public health check — no auth required."""
     return {"status": "healthy"}
 
 
 @app.get("/metrics")
-def metrics() -> Response:
+def metrics(request: Request) -> Response:
+    """Prometheus metrics — protected by auth."""
+    _enforce_security(request, None)
     if not ingest_metrics.METRICS_ENABLED:
         raise HTTPException(status_code=404, detail="Metrics disabled")
     body = ingest_metrics.generate_latest(METRIC_REGISTRY)
     return Response(body, media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/collections")
+def list_collections(request: Request) -> dict[str, Any]:
+    """List all ChromaDB collections with document counts."""
+    _enforce_security(request, None)
+    try:
+        client = get_chroma_client()
+        collections_raw = client.list_collections()
+        result = []
+        for col in collections_raw:
+            name = col.name if hasattr(col, "name") else str(col)
+            try:
+                c = client.get_collection(name)
+                count = c.count()
+            except Exception:
+                count = 0
+            result.append({"name": name, "count": count})
+        return {"collections": result, "total": len(result)}
+    except Exception as exc:
+        logger.exception("Error listing collections")
+        raise HTTPException(status_code=500, detail="Erreur listing collections") from exc
+
+
+@app.get("/stats/{collection_name}")
+def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
+    """Get statistics for a specific collection."""
+    _enforce_security(request, None)
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(
+            name=collection_name, metadata={"hnsw:space": "cosine"}
+        )
+        count = collection.count()
+        sample_size = min(count, 100)
+        sample = collection.peek(limit=sample_size) if count > 0 else {}
+        metadatas = sample.get("metadatas", []) if sample else []
+
+        unique_matieres: set[str] = set()
+        unique_niveaux: set[str] = set()
+        unique_groupes: set[str] = set()
+        unique_types: set[str] = set()
+        for m in metadatas:
+            if m.get("matiere"):
+                unique_matieres.add(m["matiere"])
+            if m.get("niveau"):
+                unique_niveaux.add(m["niveau"])
+            if m.get("groupe"):
+                unique_groupes.add(m["groupe"])
+            if m.get("type_ressource"):
+                unique_types.add(m["type_ressource"])
+
+        return {
+            "collection": collection_name,
+            "doc_count": count,
+            "embed_model": EMBED_MODEL,
+            "matieres": sorted(unique_matieres),
+            "niveaux": sorted(unique_niveaux),
+            "groupes": sorted(unique_groupes),
+            "types_ressource": sorted(unique_types),
+        }
+    except Exception as exc:
+        logger.exception("Error getting stats for %s", collection_name)
+        raise HTTPException(status_code=500, detail="Erreur stats collection") from exc
+
+
+class SearchRequest(BaseModel):
+    """Search request model with metadata filters."""
+    model_config = ConfigDict(extra="ignore")
+    q: str
+    k: int = Field(default=6, ge=1, le=50)
+    section: str | None = None
+    collection: str | None = None
+    filters: dict[str, Any] | None = None
+    include_documents: bool = True
+    score_threshold: float | None = Field(default=None, ge=0.0)
+
+
+@app.post("/search")
+def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
+    """Semantic search with optional metadata filters."""
+    _enforce_security(request, payload)
+
+    target_col = resolve_collection_name(section=payload.section, collection=payload.collection)
+
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=target_col, metadata={"hnsw:space": "cosine"})
+    except Exception as exc:
+        logger.exception("Chroma client error during search")
+        raise HTTPException(status_code=500, detail="Erreur de connexion à la base vectorielle") from exc
+
+    try:
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        q_vec = emb.embed_query(payload.q)
+    except ValueError as exc:
+        message = str(exc)
+        if "HTTP code: 404" in message:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Embedding model '{EMBED_MODEL}' is not available. Pull the model or adjust EMBED_MODEL.",
+            ) from exc
+        logger.exception("Embedding error during search")
+        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
+    except Exception as exc:
+        logger.exception("Unexpected embedding failure during search")
+        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
+
+    # Build metadata filters for ChromaDB
+    where: dict[str, Any] = {}
+    if payload.filters:
+        conditions = []
+        for fk, fv in payload.filters.items():
+            if fv is not None and fv != "" and fv != "Tous":
+                conditions.append({str(fk): fv})
+        if len(conditions) == 1:
+            where = conditions[0]
+        elif len(conditions) > 1:
+            where = {"$and": conditions}
+
+    try:
+        n_results = max(1, min(int(payload.k), 50))
+        query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": n_results}
+        if where:
+            query_kwargs["where"] = where
+        results = collection.query(**query_kwargs)
+    except Exception as exc:
+        logger.exception("Chroma query error")
+        raise HTTPException(status_code=500, detail="Erreur de recherche") from exc
+
+    documents = results.get("documents", [[]])[0] if results.get("documents") else []
+    metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] if results.get("distances") else []
+
+    hits: list[dict[str, Any]] = []
+    for idx, doc_id in enumerate(ids):
+        distance = distances[idx] if distances and idx < len(distances) else None
+        if (
+            payload.score_threshold is not None
+            and distance is not None
+            and float(distance) > payload.score_threshold
+        ):
+            continue
+        item: dict[str, Any] = {"id": doc_id, "metadata": metadatas[idx] if idx < len(metadatas) else {}}
+        if payload.include_documents and idx < len(documents):
+            item["document"] = documents[idx]
+        if distance is not None:
+            item["score"] = distance
+        hits.append(item)
+
+    _record_ingest_outcome("search", "text", "success")
+    return {
+        "query": payload.q,
+        "collection": target_col,
+        "k": n_results,
+        "returned": len(hits),
+        "filters_applied": where,
+        "score_threshold": payload.score_threshold,
+        "hits": hits,
+    }
+
+
+class RagQueryFilters(BaseModel):
+    domain: str | None = None
+    document_id: str | None = None
+    tags: list[str] | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class RagQuery(BaseModel):
+    query: str
+    filters: RagQueryFilters | None = None
+    top_k: int = Field(default=6, ge=1, le=50)
+    collection: str = Field(default=COLLECTION_NAME)
+
+
+@app.post("/rag/query")
+def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
+    """RAG query with domain/tags/metadata filters."""
+    _enforce_security(request, payload)
+
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(name=payload.collection, metadata={"hnsw:space": "cosine"})
+    except Exception as exc:
+        logger.exception("Chroma client error during rag/query")
+        raise HTTPException(status_code=500, detail="Erreur de connexion à la base vectorielle") from exc
+
+    try:
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        q_vec = emb.embed_query(payload.query)
+    except ValueError as exc:
+        message = str(exc)
+        if "HTTP code: 404" in message:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Embedding model '{EMBED_MODEL}' is not available. Pull the model or adjust EMBED_MODEL.",
+            ) from exc
+        logger.exception("Embedding error during rag/query")
+        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
+    except Exception as exc:
+        logger.exception("Unexpected embedding failure during rag/query")
+        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
+
+    where: dict[str, Any] = {}
+    if payload.filters:
+        f = payload.filters
+        if f.domain:
+            where["domain"] = f.domain
+        if f.document_id:
+            where["document_id"] = f.document_id
+        if f.tags:
+            where["tags"] = {"$in": f.tags}
+        if f.metadata:
+            for k, v in f.metadata.items():
+                if v is not None and v != "":
+                    where[str(k)] = v
+
+    try:
+        n_results = max(1, min(int(payload.top_k), 50))
+        query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": n_results}
+        if where:
+            query_kwargs["where"] = where
+        results = collection.query(**query_kwargs)
+    except Exception as exc:
+        logger.exception("Chroma query error during rag/query")
+        raise HTTPException(status_code=500, detail="Erreur de recherche") from exc
+
+    documents = results.get("documents", [[]])[0] if results.get("documents") else []
+    metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    ids = results.get("ids", [[]])[0] if results.get("ids") else []
+    distances = results.get("distances", [[]])[0] if results.get("distances") else []
+
+    hits: list[dict[str, Any]] = []
+    for idx, doc_id in enumerate(ids):
+        item: dict[str, Any] = {"id": doc_id, "metadata": metadatas[idx] if idx < len(metadatas) else {}}
+        if idx < len(documents):
+            item["document"] = documents[idx]
+        if distances and idx < len(distances) and distances[idx] is not None:
+            item["score"] = distances[idx]
+        hits.append(item)
+
+    return {
+        "query": payload.query,
+        "collection": payload.collection,
+        "k": n_results,
+        "filters": where,
+        "hits": hits,
+    }

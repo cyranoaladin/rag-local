@@ -201,3 +201,123 @@ def test_load_docx_prefers_unstructured(monkeypatch: pytest.MonkeyPatch, tmp_pat
     assert doc.metadata["page_number"] == "2"
     assert doc.metadata["source"] == target.name
     assert doc.metadata["mime_type"] == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def test_search_filters_hits_by_score_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="search-token")
+
+    class FakeCollection:
+        def query(self, **_kwargs):
+            return {
+                "documents": [["bon hit", "mauvais hit"]],
+                "metadatas": [[{"source": "a.pdf"}, {"source": "b.pdf"}]],
+                "ids": [["hit-a", "hit-b"]],
+                "distances": [[0.12, 0.81]],
+            }
+
+    class FakeClient:
+        def get_or_create_collection(self, *_args, **_kwargs):
+            return FakeCollection()
+
+    class FakeEmbeddings:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def embed_query(self, _query):
+            return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr(api, "get_chroma_client", lambda: FakeClient())
+    monkeypatch.setattr(api, "TimedOllamaEmbeddings", FakeEmbeddings)
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/search",
+        headers={"X-API-Token": "search-token"},
+        json={
+            "q": "suites",
+            "k": 5,
+            "score_threshold": 0.5,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [hit["id"] for hit in payload["hits"]] == ["hit-a"]
+    assert payload["hits"][0]["document"] == "bon hit"
+
+
+def test_search_omits_documents_when_not_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="search-token")
+
+    class FakeCollection:
+        def query(self, **_kwargs):
+            return {
+                "documents": [["contenu"]],
+                "metadatas": [[{"source": "a.pdf"}]],
+                "ids": [["hit-a"]],
+                "distances": [[0.12]],
+            }
+
+    class FakeClient:
+        def get_or_create_collection(self, *_args, **_kwargs):
+            return FakeCollection()
+
+    class FakeEmbeddings:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def embed_query(self, _query):
+            return [0.1, 0.2, 0.3]
+
+    monkeypatch.setattr(api, "get_chroma_client", lambda: FakeClient())
+    monkeypatch.setattr(api, "TimedOllamaEmbeddings", FakeEmbeddings)
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/search",
+        headers={"X-API-Token": "search-token"},
+        json={
+            "q": "suites",
+            "k": 5,
+            "include_documents": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["hits"] == [
+        {
+            "id": "hit-a",
+            "metadata": {"source": "a.pdf"},
+            "score": 0.12,
+        }
+    ]
+
+
+def test_upload_media_requires_explicit_multimodal_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="upload-token")
+
+    class FakeCollection:
+        def get(self, **_kwargs):
+            return {"ids": []}
+
+    class FakeClient:
+        def get_or_create_collection(self, *_args, **_kwargs):
+            return FakeCollection()
+
+    def fail_if_multimodal_called(*_args, **_kwargs):
+        raise AssertionError("parse_multimodal must not be called for mode=text uploads")
+
+    monkeypatch.setattr(api, "get_chroma_client", lambda: FakeClient())
+    monkeypatch.setattr(api, "parse_multimodal", fail_if_multimodal_called)
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/ingest/upload",
+        headers={"X-API-Token": "upload-token"},
+        data={"mode": "text"},
+        files={"file": ("cours.webm", b"fake-webm-content", "video/webm")},
+    )
+
+    assert response.status_code == 400
+    assert "multimodal" in response.json()["detail"].lower()
