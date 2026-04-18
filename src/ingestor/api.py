@@ -419,6 +419,13 @@ def _enforce_security(request: Any, _req: Any) -> None:
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
+def _require_api_token_configured() -> str:
+    token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
+    if not token_env:
+        raise HTTPException(status_code=503, detail="Ingestor API token not configured")
+    return token_env
+
+
 def get_chroma_client() -> Any:
     timeout_seconds = max(1, int(CHROMA_REQUEST_TIMEOUT))
     settings = Settings(
@@ -1347,6 +1354,7 @@ def ingest_drive(
     request: Request,
 ):
     """Lance une ingestion Google Drive et retourne un task_id pour suivi de progression."""
+    _require_api_token_configured()
     _enforce_security(request, req)
 
     task_id = uuid.uuid4().hex[:12]
@@ -1369,6 +1377,7 @@ def ingest_drive(
 @app.get("/ingest/drive/status/{task_id}")
 def drive_ingest_status(task_id: str, request: Request) -> dict[str, Any]:
     """Retourne la progression d'une ingestion Google Drive."""
+    _require_api_token_configured()
     _enforce_security(request, None)
 
     task = _drive_tasks.get(task_id)
@@ -1412,6 +1421,7 @@ def ingest_data(
     mode_normalized = (mode or "text").strip().lower() or "text"
 
     try:
+        _require_api_token_configured()
         _enforce_security(request, req)
     except HTTPException as exc:
         _record_ingest_outcome(req.source_type, modality_label, f"http_{exc.status_code}")
@@ -1456,6 +1466,7 @@ def ingest_urls(
     mode: str = Query(default="text"),
 ) -> dict[str, Any]:
     """Ingestion par lot d'URLs — vérifie les doublons avant ingestion."""
+    _require_api_token_configured()
     _enforce_security(request, req)
 
     if not req.urls:
@@ -1516,6 +1527,7 @@ async def ingest_upload_files(
     import json as _json
     import uuid as _uuid
 
+    _require_api_token_configured()
     _enforce_security(request, None)
 
     try:
@@ -1644,6 +1656,7 @@ def check_duplicates(
     request: Request,
 ) -> dict[str, Any]:
     """Vérifie si des sources ont déjà été ingérées pour éviter les doublons."""
+    _require_api_token_configured()
     _enforce_security(request, req)
 
     target_col = resolve_collection_name(section=req.section, collection=req.collection)
@@ -1682,6 +1695,8 @@ def health_check():
 @app.get("/collections")
 def list_collections(request: Request) -> dict[str, Any]:
     """List all ChromaDB collections with document counts and metadata."""
+    _require_api_token_configured()
+    _enforce_security(request, None)
     try:
         client = get_chroma_client()
         collections_raw = client.list_collections()
@@ -1702,6 +1717,8 @@ def list_collections(request: Request) -> dict[str, Any]:
 @app.get("/stats/{collection_name}")
 def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
     """Get statistics for a specific collection."""
+    _require_api_token_configured()
+    _enforce_security(request, None)
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(
@@ -1768,7 +1785,8 @@ def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
 
 
 @app.get("/metrics")
-def metrics() -> Response:
+def metrics(request: Request) -> Response:
+    _ = request
     if not ingest_metrics.METRICS_ENABLED:
         raise HTTPException(status_code=404, detail="Metrics disabled")
     body = ingest_metrics.generate_latest(METRIC_REGISTRY)
@@ -1778,6 +1796,7 @@ def metrics() -> Response:
 @app.post("/search")
 def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
     # AuthN/AuthZ identical to ingestion
+    _require_api_token_configured()
     _enforce_security(request, payload)
 
     # Resolve collection from section or explicit name
@@ -1884,6 +1903,7 @@ class RagQuery(BaseModel):
 @app.post("/rag/query")
 def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
     # AuthN/AuthZ identical to ingestion
+    _require_api_token_configured()
     _enforce_security(request, payload)
 
     # Prepare chroma collection

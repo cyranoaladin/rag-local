@@ -19,8 +19,7 @@ jobs:
         run: make lint || ruff check .
       - name: Typecheck
         run: make typecheck || mypy src
-      - name: Tests (coverage ≥ 80%)
+      - name: Unit tests
         env:
           PYTHONPATH: src
-        run: |
-          python -m pytest -q -m "not integration" --cov=src/ingestor --cov-report=term-missing --cov-fail-under=80
+        run: make test
