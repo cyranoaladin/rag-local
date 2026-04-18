@@ -1,0 +1,279 @@
+# Prometheus Alerting Rules for RAG Local
+# Author: Alaeddine BEN RHOUMA
+# Date: March 2026
+#
+# These rules monitor the RAG ingestor service and trigger alerts
+# based on availability, latency, error rates, and resource usage.
+
+groups:
+  # ─────────────────────────────────────────────────────────────
+  # RAG Ingestor Alerts
+  # ─────────────────────────────────────────────────────────────
+  - name: rag_ingestor
+    interval: 30s
+    rules:
+      # ─── Availability ────────────────────────────────────────
+      - alert: RAGIngestorDown
+        expr: up{job="ingestor"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: rag-ingestor
+        annotations:
+          summary: "RAG Ingestor is down"
+          description: "The RAG ingestor service ({{ $labels.instance }}) has been unreachable for more than 2 minutes."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      - alert: RAGIngestorNotHealthy
+        expr: probe_success{job="ingestor-health"} == 0
+        for: 1m
+        labels:
+          severity: warning
+          service: rag-ingestor
+        annotations:
+          summary: "RAG Ingestor health check failing"
+          description: "Health endpoint /health is not responding successfully for {{ $labels.instance }}."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Error Rates ─────────────────────────────────────────
+      - alert: RAGHighIngestionFailureRate
+        expr: |
+          (
+            sum(rate(rag_local_ingest_failure_total[5m]))
+            /
+            (sum(rate(rag_local_ingest_success_total[5m])) + sum(rate(rag_local_ingest_failure_total[5m])))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: rag-ingestor
+        annotations:
+          summary: "High ingestion failure rate"
+          description: "More than 10% of ingestion requests are failing (current rate: {{ $value | humanizePercentage }})."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      - alert: RAGCriticalIngestionFailureRate
+        expr: |
+          (
+            sum(rate(rag_local_ingest_failure_total[5m]))
+            /
+            (sum(rate(rag_local_ingest_success_total[5m])) + sum(rate(rag_local_ingest_failure_total[5m])))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          service: rag-ingestor
+        annotations:
+          summary: "Critical ingestion failure rate"
+          description: "More than 50% of ingestion requests are failing (current rate: {{ $value | humanizePercentage }})."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Latency ─────────────────────────────────────────────
+      - alert: RAGHighIngestionLatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(rag_local_ingest_latency_seconds_bucket[5m])) by (le)
+          ) > 4
+        for: 5m
+        labels:
+          severity: warning
+          service: rag-ingestor
+        annotations:
+          summary: "High ingestion latency (P99)"
+          description: "99th percentile ingestion latency is above 4 seconds (current: {{ $value | humanize }}s)."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      - alert: RAGVeryHighIngestionLatencyP99
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(rag_local_ingest_latency_seconds_bucket[5m])) by (le)
+          ) > 10
+        for: 5m
+        labels:
+          severity: critical
+          service: rag-ingestor
+        annotations:
+          summary: "Very high ingestion latency (P99)"
+          description: "99th percentile ingestion latency is above 10 seconds (current: {{ $value | humanize }}s)."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Request Rate Anomalies ──────────────────────────────
+      - alert: RAGLowIngestionRate
+        expr: sum(rate(rag_local_ingest_requests_total[1h])) < 0.01
+        for: 2h
+        labels:
+          severity: info
+          service: rag-ingestor
+        annotations:
+          summary: "Very low ingestion rate"
+          description: "Ingestion rate is unusually low (< 1 request per 2 hours). This may be expected during maintenance windows."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Multimodal Parser ───────────────────────────────────
+      - alert: RAGMultimodalParseFailures
+        expr: sum(rate(rag_local_mm_parse_failures_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: rag-ingestor
+        annotations:
+          summary: "Multimodal parser failures"
+          description: "Multimodal parsing is failing at a rate of {{ $value | humanize }} errors per second."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Security ────────────────────────────────────────────
+      - alert: RAGSecurityViolations
+        expr: sum(rate(rag_local_security_violations_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+          service: rag-ingestor
+        annotations:
+          summary: "Security violations detected"
+          description: "{{ $value }} security violations detected in the last 5 minutes (unauthorized access attempts)."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+
+  # ─────────────────────────────────────────────────────────────
+  # RAG Infrastructure Alerts
+  # ─────────────────────────────────────────────────────────────
+  - name: rag_infrastructure
+    interval: 30s
+    rules:
+      # ─── ChromaDB ────────────────────────────────────────────
+      - alert: RAGChromaDBDown
+        expr: up{job="chroma"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: rag-chromadb
+        annotations:
+          summary: "ChromaDB is down"
+          description: "ChromaDB vector store ({{ $labels.instance }}) has been unreachable for more than 2 minutes."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Ollama ──────────────────────────────────────────────
+      - alert: RAGOllamaDown
+        expr: up{job="ollama"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: rag-ollama
+        annotations:
+          summary: "Ollama is down"
+          description: "Ollama embedding service ({{ $labels.instance }}) has been unreachable for more than 2 minutes."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      - alert: RAGOllamaModelMissing
+        expr: ollama_model_info == 0
+        for: 5m
+        labels:
+          severity: warning
+          service: rag-ollama
+        annotations:
+          summary: "Ollama model not loaded"
+          description: "Required embedding model is not loaded in Ollama."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── UI (Streamlit) ──────────────────────────────────────
+      - alert: RAGUIDown
+        expr: up{job="ui"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: rag-ui
+        annotations:
+          summary: "RAG UI is down"
+          description: "Streamlit UI service ({{ $labels.instance }}) has been unreachable for more than 2 minutes."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+
+  # ─────────────────────────────────────────────────────────────
+  # RAG v2 Alerts (pgvector, Redis, Celery)
+  # ─────────────────────────────────────────────────────────────
+  - name: rag_v2
+    interval: 30s
+    rules:
+      # ─── pgvector ────────────────────────────────────────────
+      - alert: RAGPgvectorDown
+        expr: up{job="pgvector"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: rag-pgvector
+        annotations:
+          summary: "pgvector is down"
+          description: "PostgreSQL/pgvector database ({{ $labels.instance }}) has been unreachable for more than 2 minutes."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      - alert: RAGPgvectorHighConnections
+        expr: |
+          (
+            sum(rate(pg_stat_activity_count[5m]))
+            /
+            pg_settings_max_connections
+          ) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: rag-pgvector
+        annotations:
+          summary: "pgvector connection pool near capacity"
+          description: "Database connection usage is above 80% (current: {{ $value | humanizePercentage }})."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Redis ───────────────────────────────────────────────
+      - alert: RAGRedisDown
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: rag-redis
+        annotations:
+          summary: "Redis is down"
+          description: "Redis cache/queue service ({{ $labels.instance }}) has been unreachable for more than 1 minute."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      - alert: RAGRedisHighMemoryUsage
+        expr: |
+          (
+            redis_memory_used_bytes
+            /
+            redis_maxmemory
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          service: rag-redis
+        annotations:
+          summary: "Redis memory usage high"
+          description: "Redis memory usage is above 90% of maxmemory (current: {{ $value | humanizePercentage }})."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      # ─── Celery Workers ──────────────────────────────────────
+      - alert: RAGCeleryWorkerDown
+        expr: up{job="celery-worker"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: rag-celery
+        annotations:
+          summary: "Celery worker is down"
+          description: "Celery worker ({{ $labels.instance }}) has been unreachable for more than 2 minutes."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"
+
+      - alert: RAGCeleryTaskFailureRate
+        expr: |
+          (
+            sum(rate(celery_task_failed_total[5m]))
+            /
+            (sum(rate(celery_task_succeeded_total[5m])) + sum(rate(celery_task_failed_total[5m])))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: rag-celery
+        annotations:
+          summary: "High Celery task failure rate"
+          description: "More than 10% of Celery tasks are failing (current rate: {{ $value | humanizePercentage }})."
+          runbook_url: "https://github.com/alaeddine/rag-local/blob/main/TROUBLESHOOTING.md"

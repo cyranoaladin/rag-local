@@ -1,0 +1,4 @@
+services:
+  chroma:
+    healthcheck:
+      disable: true

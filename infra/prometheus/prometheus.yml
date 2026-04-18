@@ -2,6 +2,17 @@ global:
   scrape_interval: 30s
   evaluation_interval: 30s
 
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+      # Configure alertmanager when available:
+      # - targets:
+      #   - alertmanager:9093
+
 scrape_configs:
   - job_name: prometheus
     static_configs:
@@ -15,3 +26,52 @@ scrape_configs:
       - source_labels: [__address__]
         target_label: instance
         replacement: ingestor
+
+  - job_name: chroma
+    static_configs:
+      - targets: ["chroma:8000"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: chroma
+
+  - job_name: ollama
+    static_configs:
+      - targets: ["ollama:11434"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: ollama
+
+  - job_name: ui
+    static_configs:
+      - targets: ["ui:8501"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: ui
+
+  # v2 services (uncomment when using pgvector architecture)
+  # - job_name: pgvector
+  #   static_configs:
+  #     - targets: ["pgvector:5432"]
+  #   relabel_configs:
+  #     - source_labels: [__address__]
+  #       target_label: instance
+  #       replacement: pgvector
+
+  # - job_name: redis
+  #   static_configs:
+  #     - targets: ["redis:6379"]
+  #   relabel_configs:
+  #     - source_labels: [__address__]
+  #       target_label: instance
+  #       replacement: redis
+
+  # - job_name: celery-worker
+  #   static_configs:
+  #     - targets: ["worker:8002"]
+  #   relabel_configs:
+  #     - source_labels: [__address__]
+  #       target_label: instance
+  #       replacement: celery-worker

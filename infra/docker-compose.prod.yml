@@ -1,0 +1,138 @@
+networks:
+  rag_net:
+    driver: bridge
+
+volumes:
+  rag_chroma_data:
+  rag_ollama_data:
+  rag_prometheus_data:
+  rag_admin_data:
+
+services:
+  chroma:
+    image: chromadb/chroma:1.1.1
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=FALSE
+    volumes:
+      - rag_chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:8000/api/v2/heartbeat || curl -fsS http://localhost:8000/api/v1/heartbeat || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:0.3.13
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+    volumes:
+      - rag_ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD","ollama","list"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'
+          memory: 24G
+
+  ingestor:
+    build: ./ingestor
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - TZ=${TZ}
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=${CHROMA_PORT}
+      - OLLAMA_URL=http://ollama:${OLLAMA_PORT}
+      - EMBED_MODEL=${EMBED_MODEL}
+      - SMALL_LLM=${SMALL_LLM}
+      - LOCAL_SOURCE_ROOT=/data/uploads
+      - METRICS_ENABLED=${METRICS_ENABLED:-true}
+      - MULTIMODAL_ENABLED=${MULTIMODAL_ENABLED:-false}
+      - INGESTOR_API_TOKEN=${INGESTOR_API_TOKEN}
+      - INGESTOR_IP_ALLOWLIST=${INGESTOR_IP_ALLOWLIST:-}
+      - GOOGLE_APPLICATION_CREDENTIALS=/creds/gdrive-sa.json
+      - GOOGLE_DRIVE_TOKEN_PATH=/tmp/google-drive-token.json
+      - CHROMA_REQUEST_TIMEOUT=${CHROMA_REQUEST_TIMEOUT:-30}
+      - OLLAMA_REQUEST_TIMEOUT=${OLLAMA_REQUEST_TIMEOUT:-60}
+      - XDG_CACHE_HOME=/tmp
+      - ADMIN_DB_PATH=/data/catalog.sqlite
+      - INGESTOR_PORT=${INGESTOR_PORT}
+      - GDRIVE_MAX_DOCS=${GDRIVE_MAX_DOCS:-200}
+      - ADMIN_INGEST_TIMEOUT_SECONDS=${ADMIN_INGEST_TIMEOUT_SECONDS:-1800}
+    volumes:
+      - ./creds:/creds:ro
+      - /srv/rag-data:/data/uploads:rw
+      - rag_admin_data:/data
+    command: uvicorn api:app --host 0.0.0.0 --port ${INGESTOR_PORT}
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp", "/var/tmp"]
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:${INGESTOR_PORT}/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    ports:
+      - "127.0.0.1:${NGINX_API_PORT:-8001}:${INGESTOR_PORT}"
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 8G
+
+
+  ui:
+    build: ./ui
+    restart: unless-stopped
+    networks: [rag_net]
+    environment:
+      - TZ=${TZ}
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=${CHROMA_PORT}
+      - INGEST_API_BASE=http://ingestor:${INGESTOR_PORT}
+      - INGEST_API_TOKEN=${INGESTOR_API_TOKEN}
+      - INGEST_AUTH_HEADER=Authorization
+      - UI_INGEST_AUTH_BEARER_PREFIX=true
+    ports:
+      - "127.0.0.1:${NGINX_UI_PORT}:${STREAMLIT_PORT}"
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp", "/var/tmp"]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 2G
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    restart: unless-stopped
+    networks: [rag_net]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=2d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - rag_prometheus_data:/prometheus
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-19090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

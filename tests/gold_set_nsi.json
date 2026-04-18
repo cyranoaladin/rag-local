@@ -1,0 +1,67 @@
+{
+  "tenant": "nsi",
+  "version": "1.0",
+  "description": "Gold set d'évaluation RAG pour les ressources NSI Terminale",
+  "questions": [
+    {
+      "id": "q001",
+      "question": "Qu'est-ce que la complexité algorithmique en notation Big-O ?",
+      "relevant_keywords": ["complexité", "Big-O", "O(n)", "algorithme"],
+      "expected_sources_contain": ["NSI", "algorithme", "complexité"]
+    },
+    {
+      "id": "q002",
+      "question": "Comment fonctionne le tri par insertion ?",
+      "relevant_keywords": ["tri", "insertion", "tableau", "comparaison"],
+      "expected_sources_contain": ["tri", "algorithme"]
+    },
+    {
+      "id": "q003",
+      "question": "Quelle est la différence entre une liste et un tuple en Python ?",
+      "relevant_keywords": ["liste", "tuple", "mutable", "Python"],
+      "expected_sources_contain": ["Python", "structure"]
+    },
+    {
+      "id": "q004",
+      "question": "Qu'est-ce qu'une structure de données de type pile (stack) ?",
+      "relevant_keywords": ["pile", "stack", "LIFO", "push", "pop"],
+      "expected_sources_contain": ["structure", "données"]
+    },
+    {
+      "id": "q005",
+      "question": "Comment fonctionne le protocole TCP/IP ?",
+      "relevant_keywords": ["TCP", "IP", "réseau", "protocole", "paquets"],
+      "expected_sources_contain": ["réseau", "TCP"]
+    },
+    {
+      "id": "q006",
+      "question": "Qu'est-ce que la récursivité en programmation ?",
+      "relevant_keywords": ["récursivité", "récursif", "appel", "base"],
+      "expected_sources_contain": ["récursivité", "programmation"]
+    },
+    {
+      "id": "q007",
+      "question": "Comment fonctionne un arbre binaire de recherche ?",
+      "relevant_keywords": ["arbre", "binaire", "recherche", "noeud", "feuille"],
+      "expected_sources_contain": ["arbre", "structure"]
+    },
+    {
+      "id": "q008",
+      "question": "Qu'est-ce que le SQL et comment l'utiliser pour interroger une base de données ?",
+      "relevant_keywords": ["SQL", "SELECT", "base de données", "requête"],
+      "expected_sources_contain": ["SQL", "base"]
+    },
+    {
+      "id": "q009",
+      "question": "Comment fonctionne le chiffrement RSA ?",
+      "relevant_keywords": ["RSA", "chiffrement", "clé publique", "clé privée"],
+      "expected_sources_contain": ["chiffrement", "sécurité"]
+    },
+    {
+      "id": "q010",
+      "question": "Qu'est-ce qu'un graphe et comment le parcourir en largeur (BFS) ?",
+      "relevant_keywords": ["graphe", "BFS", "parcours", "largeur", "file"],
+      "expected_sources_contain": ["graphe", "parcours"]
+    }
+  ]
+}

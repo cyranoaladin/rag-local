@@ -1,5 +1,6 @@
 [tool.ruff]
 line-length = 100
+# Keep global target at py311 for most modules
 target-version = "py311"
 extend-exclude = ["build", "dist", ".venv", "infra/creds", "n8n/workflows/examples"]
 fix = false
@@ -9,15 +10,43 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]  # longueur de ligne gérée pragmatiquement
 preview = false
 
+# Some ingestor modules must remain Python 3.9–compatible at runtime.
+# Per-file ignores prevent pyupgrade suggestions that would break py39
+# and suppress import reordering warnings for intentional dynamic imports.
+[tool.ruff.lint.per-file-ignores]
+"src/ingestor/api.py" = ["I001", "UP007", "UP017"]
+"src/ingestor/admin_api.py" = ["UP007"]
+"src/ingestor/catalog.py" = ["UP017"]
+
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
 warn_unused_configs = true
-disallow_untyped_defs = false
+warn_return_any = true
+warn_unreachable = true
+disallow_untyped_defs = false  # Progressivement activé par module
+disallow_incomplete_defs = false
+check_untyped_defs = true
+disallow_any_generics = false
+no_implicit_optional = true
+strict_optional = true
 exclude = "(^\\.venv/|^infra/creds/|^n8n/workflows/)"
 disable_error_code = ["import-untyped"]
+
+# Modules avec typage strict (à étendre progressivement)
+[[tool.mypy.overrides]]
+module = [
+    "src.ingestor.audit_logger",
+    "src.ingestor.metrics",
+    "src.ingestor.database",
+    "src.ingestor.embedding_service",
+    "src.ingestor.hybrid_search",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
 
 [tool.pylint.main]
 py-version = "3.11"

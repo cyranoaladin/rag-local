@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Generator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -97,7 +97,8 @@ class DummyTimedEmbeddings:
 def _cosine_distance(vector_a: Sequence[float], vector_b: Sequence[float]) -> float:
     if not vector_a or not vector_b:
         return 1.0
-    numerator = sum(x * y for x, y in zip(vector_a, vector_b))
+    # Python 3.9 compatibility: zip(strict=...) not available
+    numerator = sum(x * y for x, y in zip(vector_a, vector_b, strict=False))
     denominator = math.sqrt(sum(x * x for x in vector_a)) * math.sqrt(sum(y * y for y in vector_b))
     if denominator == 0:
         return 1.0

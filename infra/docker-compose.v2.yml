@@ -1,0 +1,318 @@
+networks:
+  rag_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  rag_pgvector_data:
+  rag_redis_data:
+  rag_ollama_data:
+  rag_prometheus_data:
+
+services:
+
+  # ════════════════════════════════════════
+  # POSTGRES + PGVECTOR (remplace ChromaDB)
+  # ════════════════════════════════════════
+  pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: rag_pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGVECTOR_DB:-ragdb}
+      POSTGRES_USER: ${PGVECTOR_USER:-raguser}
+      POSTGRES_PASSWORD: ${PGVECTOR_PASSWORD:?PGVECTOR_PASSWORD requis}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - rag_pgvector_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    ports:
+      - "127.0.0.1:${PGVECTOR_PORT:-5435}:5432"
+    networks: [rag_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGVECTOR_USER:-raguser} -d ${PGVECTOR_DB:-ragdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  # ════════════════════════════════════════
+  # REDIS (cache embeddings + queue Celery)
+  # ════════════════════════════════════════
+  redis:
+    image: redis:7-alpine
+    container_name: rag_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD requis}
+      --maxmemory 1gb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - rag_redis_data:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6381}:6379"
+    networks: [rag_net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt: [no-new-privileges:true]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1536M
+
+  # ════════════════════════════════════════
+  # OLLAMA (embeddings + LLM local)
+  # ════════════════════════════════════════
+  ollama:
+    image: ollama/ollama:latest
+    container_name: rag_ollama
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=0.0.0.0:11434
+    volumes:
+      - rag_ollama_data:/root/.ollama
+    ports:
+      - "127.0.0.1:${OLLAMA_PORT:-11435}:11434"
+    networks: [rag_net]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags | grep -q 'models'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "6.0"
+          memory: 24G
+
+  # ════════════════════════════════════════
+  # RAG API (FastAPI — coeur du service)
+  # ════════════════════════════════════════
+  ingestor:
+    build:
+      context: ../src/ingestor
+      dockerfile: Dockerfile
+      args:
+        PYTHON_VERSION: "3.11"
+    container_name: rag_ingestor
+    restart: unless-stopped
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-UTC}
+      # Vector store
+      DATABASE_URL: "postgresql+asyncpg://${PGVECTOR_USER:-raguser}:${PGVECTOR_PASSWORD}@pgvector:5432/${PGVECTOR_DB:-ragdb}"
+      DATABASE_URL_SYNC: "postgresql://${PGVECTOR_USER:-raguser}:${PGVECTOR_PASSWORD}@pgvector:5432/${PGVECTOR_DB:-ragdb}"
+      # Redis
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      REDIS_CACHE_URL: "redis://:${REDIS_PASSWORD}@redis:6379/1"
+      # Embeddings
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      OLLAMA_URL: "http://ollama:11434"
+      EMBED_MODEL: "${EMBED_MODEL:-nomic-embed-text:v1.5}"
+      EMBED_DIM: "${EMBED_DIM:-768}"
+      EMBED_CACHE_TTL: "${EMBED_CACHE_TTL:-86400}"
+      # Reranking
+      RERANKER_MODEL: "${RERANKER_MODEL:-cross-encoder/ms-marco-MiniLM-L-6-v2}"
+      RERANKER_TOP_N: "${RERANKER_TOP_N:-5}"
+      # Security
+      API_SECRET_KEY: "${API_SECRET_KEY:?API_SECRET_KEY requis}"
+      INGESTOR_API_TOKEN: "${API_SECRET_KEY}"
+      ALLOWED_TENANTS: "${ALLOWED_TENANTS:-nsi,nexus,mfai,web3}"
+      IP_ALLOWLIST: "${IP_ALLOWLIST:-}"
+      # Performance
+      WORKERS: "${INGESTOR_WORKERS:-4}"
+      MAX_CHUNK_SIZE: "${MAX_CHUNK_SIZE:-1000}"
+      CHUNK_OVERLAP: "${CHUNK_OVERLAP:-200}"
+      SEARCH_DEFAULT_K: "${SEARCH_DEFAULT_K:-10}"
+      HYBRID_ALPHA: "${HYBRID_ALPHA:-0.7}"
+      # Existing compat
+      LOCAL_SOURCE_ROOT: /data/uploads
+      GOOGLE_APPLICATION_CREDENTIALS: /creds/gdrive-sa.json
+      USER_AGENT: ${USER_AGENT:-rag-local-ingestor/2.0}
+      MAX_REMOTE_BYTES: ${MAX_REMOTE_BYTES:-26214400}
+      MULTIMODAL_ENABLED: ${MULTIMODAL_ENABLED:-true}
+      MM_PARSER_TIMEOUT: ${MM_PARSER_TIMEOUT:-30}
+      MM_MAX_CHARS_PER_CHUNK: ${MM_MAX_CHARS_PER_CHUNK:-1200}
+      MM_CACHE_DIR: ${MM_CACHE_DIR:-/data/mm-cache}
+      METRICS_ENABLED: "true"
+      XDG_CACHE_HOME: /tmp
+    volumes:
+      - ./creds:/creds:ro
+      - ./data/uploads:/data/uploads:rw
+    ports:
+      - "127.0.0.1:${INGESTOR_PORT:-8001}:8001"
+    networks: [rag_net]
+    command: uvicorn api:app --host 0.0.0.0 --port 8001 --workers ${INGESTOR_WORKERS:-4}
+    read_only: true
+    tmpfs: ["/tmp", "/app/.cache", "/var/tmp"]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health | grep -q 'ok'"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 8G
+
+  # ════════════════════════════════════════
+  # CELERY WORKER (ingestion async)
+  # ════════════════════════════════════════
+  worker:
+    build:
+      context: ../src/ingestor
+      dockerfile: Dockerfile
+    container_name: rag_worker
+    command: celery -A tasks worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-2}
+    restart: unless-stopped
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-UTC}
+      DATABASE_URL: "postgresql+asyncpg://${PGVECTOR_USER:-raguser}:${PGVECTOR_PASSWORD}@pgvector:5432/${PGVECTOR_DB:-ragdb}"
+      DATABASE_URL_SYNC: "postgresql://${PGVECTOR_USER:-raguser}:${PGVECTOR_PASSWORD}@pgvector:5432/${PGVECTOR_DB:-ragdb}"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+      REDIS_CACHE_URL: "redis://:${REDIS_PASSWORD}@redis:6379/1"
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      OLLAMA_URL: "http://ollama:11434"
+      EMBED_MODEL: "${EMBED_MODEL:-nomic-embed-text:v1.5}"
+      EMBED_DIM: "${EMBED_DIM:-768}"
+      API_SECRET_KEY: "${API_SECRET_KEY}"
+      LOCAL_SOURCE_ROOT: /data/uploads
+      MAX_REMOTE_BYTES: ${MAX_REMOTE_BYTES:-26214400}
+      MAX_CHUNK_SIZE: "${MAX_CHUNK_SIZE:-1000}"
+      CHUNK_OVERLAP: "${CHUNK_OVERLAP:-200}"
+      METRICS_ENABLED: "true"
+      XDG_CACHE_HOME: /tmp
+    volumes:
+      - ./data/uploads:/data/uploads:rw
+    networks: [rag_net]
+    security_opt: [no-new-privileges:true]
+    tmpfs: ["/tmp", "/app/.cache", "/var/tmp"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+  # ════════════════════════════════════════
+  # UI STREAMLIT (dashboard)
+  # ════════════════════════════════════════
+  ui:
+    build:
+      context: ../src/ui
+      dockerfile: Dockerfile
+    container_name: rag_ui
+    restart: unless-stopped
+    depends_on:
+      ingestor:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-UTC}
+      RAG_API_URL: "http://ingestor:8001"
+      RAG_API_TOKEN: "${API_SECRET_KEY}"
+      STREAMLIT_SERVER_HEADLESS: "true"
+      XDG_CACHE_HOME: /tmp
+    ports:
+      - "127.0.0.1:${UI_PORT:-8502}:8501"
+    networks: [rag_net]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /root/.streamlit
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+
+  # ════════════════════════════════════════
+  # PROMETHEUS
+  # ════════════════════════════════════════
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: rag_prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - rag_prometheus_data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-19091}:9090"
+    networks: [rag_net]
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M

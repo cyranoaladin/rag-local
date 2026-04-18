@@ -1,36 +1,46 @@
-# UI (Streamlit) reverse proxy — HTTP only (Certbot gérera HTTPS)
+# UI (Streamlit) reverse proxy — TLS with Basic Auth
 server {
   listen 80;
-  server_name ${RAG_EXTERNAL_DOMAIN};
+  server_name ${RAG_UI_EXTERNAL_DOMAIN};
+  location ^~ /.well-known/acme-challenge/ { root /var/www/certbot; }
+  location / { return 301 https://$host$request_uri; }
+}
+
+server {
+  listen 443 ssl http2;
+  server_name ${RAG_UI_EXTERNAL_DOMAIN};
+
+  ssl_certificate /etc/letsencrypt/live/${RAG_UI_EXTERNAL_DOMAIN}/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/${RAG_UI_EXTERNAL_DOMAIN}/privkey.pem;
+  include /etc/letsencrypt/options-ssl-nginx.conf;
+  ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+  auth_basic "Restricted";
+  auth_basic_user_file /etc/nginx/.htpasswd-rag-ui;
+
   client_max_body_size ${NGINX_CLIENT_MAX_BODY_SIZE};
 
-  # Autoriser les challenges ACME sur le filesystem local
-  location ^~ /.well-known/acme-challenge/ {
-    root /var/www/html;
-  }
-
-  # --- Security headers ---
+  # Security headers
   add_header X-Content-Type-Options "nosniff" always;
   add_header Referrer-Policy "no-referrer" always;
   add_header X-Frame-Options "SAMEORIGIN" always;
   add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
-  add_header Content-Security-Policy "default-src 'self'; img-src 'self' data:; frame-ancestors 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';" always;
-  # À activer après génération du certificat HTTPS :
-  # add_header Strict-Transport-Security "max-age=63072000" always;
+  add_header Content-Security-Policy "default-src 'self' 'unsafe-inline' 'unsafe-eval'; frame-ancestors 'none'; base-uri 'self'; form-action 'self';" always;
+  
+  # HSTS (uncomment after TLS is verified in production)
+  # Recommended: test with max-age=300 (5 min) first, then increase to 63072000 (2 years)
+  # add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
 
   proxy_connect_timeout 5s;
   proxy_buffering off;
 
   location / {
-    ${UI_BASIC_AUTH_DIRECTIVE}
-    ${UI_BASIC_AUTH_USER_FILE_DIRECTIVE}
-
-  proxy_pass http://${NGINX_UI_UPSTREAM};
-    proxy_set_header Host $$host;
-    proxy_set_header X-Real-IP $$remote_addr;
-    proxy_set_header X-Forwarded-Proto $$scheme;
-    proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Host $$host;
+    proxy_pass http://${NGINX_UI_UPSTREAM};
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $host;
     proxy_read_timeout 120s;
     proxy_send_timeout 120s;
     send_timeout 120s;

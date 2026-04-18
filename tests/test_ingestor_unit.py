@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -164,6 +165,12 @@ def test_metrics_counter_updates(monkeypatch: pytest.MonkeyPatch) -> None:
     assert failure_child._value.get() == 1
 
 
+def test_admin_router_registered(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="admin-token")
+    registered_paths = {route.path for route in api.app.routes}
+    assert any(path.startswith("/admin") for path in registered_paths)
+
+
 def test_load_docx_prefers_unstructured(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     api = reload_api(monkeypatch, token=None)
     target = tmp_path / "sample.docx"
@@ -294,7 +301,9 @@ def test_search_omits_documents_when_not_requested(monkeypatch: pytest.MonkeyPat
     ]
 
 
-def test_upload_media_requires_explicit_multimodal_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_upload_media_requires_explicit_multimodal_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     api = reload_api(monkeypatch, token="upload-token")
 
     class FakeCollection:
@@ -310,14 +319,17 @@ def test_upload_media_requires_explicit_multimodal_mode(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(api, "get_chroma_client", lambda: FakeClient())
     monkeypatch.setattr(api, "parse_multimodal", fail_if_multimodal_called)
+    monkeypatch.setenv("ADMIN_UPLOAD_DIR", str(tmp_path))
 
     client = TestClient(api.app)
     response = client.post(
-        "/ingest/upload",
+        "/ingest/upload-files?mode=text",
         headers={"X-API-Token": "upload-token"},
-        data={"mode": "text"},
-        files={"file": ("cours.webm", b"fake-webm-content", "video/webm")},
+        files={"files": ("cours.webm", b"fake-webm-content", "video/webm")},
     )
 
-    assert response.status_code == 400
-    assert "multimodal" in response.json()["detail"].lower()
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_errors"] == 1
+    assert body["results"][0]["status"] == "error"
+    assert "multimodal" in body["results"][0]["detail"].lower()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import inspect as _inspect
 import io
 import json
 import os
@@ -18,6 +19,7 @@ from typing import Any, BinaryIO
 __all__ = [
     "Chunk",
     "parse_multimodal",
+    "iter_chunks",
 ]
 
 
@@ -38,7 +40,18 @@ def _metrics() -> ModuleType:
     raise ImportError("Unable to load metrics module")
 
 
-@dataclass(slots=True)
+# Python 3.9 compatibility: dataclass(slots=...) not available before 3.10
+if "slots" in _inspect.signature(dataclass).parameters:
+    _DATACLASS_DECORATOR = dataclass
+    _DATACLASS_KW = {"slots": True}
+else:  # pragma: no cover - runtime on older Python
+    def _dataclass_compat(*d_args, **d_kwargs):
+        d_kwargs.pop("slots", None)
+        return dataclass(*d_args, **d_kwargs)
+    _DATACLASS_DECORATOR = _dataclass_compat
+    _DATACLASS_KW = {}
+
+@_DATACLASS_DECORATOR(**_DATACLASS_KW)
 class Chunk:
     """Represents a multimodal payload emitted by the parser."""
 
@@ -79,7 +92,7 @@ class Chunk:
         blob_data = payload.get("blob_b64")
         blob = base64.b64decode(blob_data) if isinstance(blob_data, str) else None
         metadata = payload.get("metadata") or {}
-        return cls(
+        return cls(  # type: ignore[call-arg]
             modality=str(payload.get("modality", "unknown")),
             text=payload.get("text"),
             blob=blob,
@@ -147,7 +160,7 @@ def parse_multimodal(
 
         emitted: list[dict[str, Any]] = []
         for idx, snippet in enumerate(chunks, start=0):
-            chunk = Chunk(
+            chunk = Chunk(  # type: ignore[call-arg]
                 modality="text",
                 text=snippet,
                 metadata={
@@ -166,6 +179,13 @@ def parse_multimodal(
         _persist_cache(cache_root, raw_bytes, metadata["source_mtime"], emitted)
 
 
+# Legacy compatibility alias (maintains old import path expected by tests and
+# external automation). The implementation now simply delegates to
+# parse_multimodal while keeping the streaming contract unchanged.
+def iter_chunks(*args, **kwargs):
+    return parse_multimodal(*args, **kwargs)
+
+
 def _read_payload(stream: BinaryIO, timeout_s: float) -> tuple[bytes, bool]:
     if timeout_s is not None and timeout_s <= 0:
         _rewind(stream)
@@ -178,7 +198,7 @@ def _read_payload(stream: BinaryIO, timeout_s: float) -> tuple[bytes, bool]:
         chunk = stream.read(8192)
         if not chunk:
             break
-        if not isinstance(chunk, bytes | bytearray):
+        if not isinstance(chunk, (bytes, bytearray)):  # noqa: UP038 - keep Py3.9-compatible isinstance tuple
             chunk = bytes(chunk)
         parts.append(bytes(chunk))
     duration = time.perf_counter() - start
@@ -214,10 +234,74 @@ def _decode_to_text(payload: bytes, mime: str) -> str:
     if not payload:
         return ""
     mime_lower = (mime or "").lower()
-    if mime_lower.startswith("text/"):
+
+    # Text-based formats: decode directly
+    if mime_lower.startswith("text/") or mime_lower in {"application/json", "application/xml"}:
         return payload.decode("utf-8", errors="ignore")
-    if mime_lower in {"application/json", "application/xml"}:
-        return payload.decode("utf-8", errors="ignore")
+
+    # Images: OCR via pytesseract
+    if mime_lower.startswith("image/"):
+        try:
+            import pytesseract
+            from PIL import Image
+            img = Image.open(io.BytesIO(payload))
+            # Try French first, fallback to English
+            try:
+                text = pytesseract.image_to_string(img, lang="fra+eng")
+            except Exception:
+                text = pytesseract.image_to_string(img, lang="eng")
+            return (text or "").strip()
+        except ImportError:
+            pass  # pytesseract not installed, fall through
+        except Exception:
+            pass
+
+    # PDFs: extract text via pdfplumber or pypdf
+    if mime_lower == "application/pdf":
+        try:
+            import pdfplumber
+            text_parts: list[str] = []
+            with pdfplumber.open(io.BytesIO(payload)) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text_parts.append(page_text)
+            return "\n".join(text_parts)
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        # Fallback to pypdf
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(payload))
+            return "\n".join(
+                (page.extract_text() or "") for page in reader.pages
+            )
+        except Exception:
+            pass
+
+    # Audio: try whisper transcription if available
+    if mime_lower.startswith("audio/") or mime_lower.startswith("video/"):
+        try:
+            import whisper
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
+                tmp.write(payload)
+                tmp_path = tmp.name
+            model = whisper.load_model("base")
+            result = model.transcribe(tmp_path, language="fr")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return (result.get("text", "") or "").strip()
+        except ImportError:
+            pass  # whisper not installed
+        except Exception:
+            pass
+
+    # Fallback: try decoding as UTF-8
     return payload.decode("utf-8", errors="ignore")
 
 
@@ -229,7 +313,7 @@ def _split_text(text: str, max_chars: int) -> Iterable[str]:
 
 
 def _emit_blob_chunks(payload: bytes, metadata: dict[str, Any], metrics_module: ModuleType) -> Iterator[Chunk]:
-    chunk = Chunk(
+    chunk = Chunk(  # type: ignore[call-arg]
         modality="other",
         blob=payload,
         metadata={

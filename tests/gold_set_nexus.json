@@ -1,0 +1,37 @@
+{
+  "tenant": "nexus",
+  "version": "1.0",
+  "description": "Gold set d'évaluation RAG pour Nexus Project (parcours éducatifs)",
+  "questions": [
+    {
+      "id": "q001",
+      "question": "Comment créer un parcours personnalisé pour un élève ?",
+      "relevant_keywords": ["parcours", "personnalisé", "élève", "création"],
+      "expected_sources_contain": ["parcours", "élève"]
+    },
+    {
+      "id": "q002",
+      "question": "Quels sont les rôles disponibles dans le système (étudiant, parent, coach) ?",
+      "relevant_keywords": ["rôle", "étudiant", "parent", "coach", "admin"],
+      "expected_sources_contain": ["rôle", "utilisateur"]
+    },
+    {
+      "id": "q003",
+      "question": "Comment fonctionne le système d'évaluation des compétences ?",
+      "relevant_keywords": ["évaluation", "compétence", "note", "progression"],
+      "expected_sources_contain": ["évaluation", "compétence"]
+    },
+    {
+      "id": "q004",
+      "question": "Comment configurer les notifications pour les parents ?",
+      "relevant_keywords": ["notification", "parent", "alerte", "suivi"],
+      "expected_sources_contain": ["notification", "parent"]
+    },
+    {
+      "id": "q005",
+      "question": "Quelles sont les matières disponibles dans le programme de Terminale ?",
+      "relevant_keywords": ["matière", "programme", "Terminale", "NSI"],
+      "expected_sources_contain": ["matière", "programme"]
+    }
+  ]
+}

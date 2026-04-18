@@ -1,3 +1,10 @@
+#
+# Ce workflow appelle le script infra/scripts/smoke.sh qui :
+# - Attend jusqu'à 2 minutes que tous les services soient healthy (60 tentatives)
+# - Affiche automatiquement tous les logs, l'état réseau, docker ps, inspect, etc. en cas d'échec
+# - Permet un diagnostic immédiat en cas de problème CI
+# Voir CI_ROBUSTESSE.md pour plus de détails.
+
 name: CI Smoke (Compose)
 
 'on':
@@ -58,10 +65,10 @@ jobs:
             --env-file infra/.env.ci \
             up -d --build
 
-      - name: Wait for ingestor health
+      - name: Wait for ingestor health (container-internal)
         run: |
           for i in $(seq 1 60); do
-            code=$(curl -sS -o /dev/null -w "%{http_code}" http://127.0.0.1:18001/health || true)
+            code=$(docker compose -f infra/docker-compose.yml -f infra/docker-compose.smoke.override.yml --env-file infra/.env.ci exec -T ingestor curl -sS -o /dev/null -w "%{http_code}" http://localhost:8001/health || true)
             if [ "${code}" = "200" ]; then echo "health OK"; break; fi
             sleep 2
             if [ "$i" = "60" ]; then echo "health timeout"; exit 1; fi

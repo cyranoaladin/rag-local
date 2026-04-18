@@ -1,49 +1,53 @@
-# Fichier: src/ingestor/api.py
+
 from __future__ import annotations
 
 import hashlib
-import hmac
+import importlib
 import importlib.util
 import ipaddress
-import json
 import logging
 import mimetypes
 import os
 import socket
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+import uuid
+from collections.abc import Mapping, Sequence, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 from urllib.parse import urlparse
 
 import chromadb
-import docx
+import pdfplumber
 import requests
 from bs4 import BeautifulSoup
 from chromadb.config import Settings
-from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.embeddings import OllamaEmbeddings
-from langchain_core.documents import Document
 from langchain_google_community import GoogleDriveLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 try:
-    from .mm_adapter import Chunk, parse_multimodal
+    from .drive_sync import DriveSyncManager
 except ImportError:
-    # Allow running when the module is executed as a top-level script (e.g. inside Docker).
-    from mm_adapter import Chunk, parse_multimodal  # type: ignore[no-redef]
+    from drive_sync import DriveSyncManager
 
+if TYPE_CHECKING:
+    from langchain.schema import Document
+else:
+    try:
+        from langchain.schema import Document
+    except ImportError:
+        Document = Any  # fallback for type checking
 
+# --- Metrics module loader ---
 def _load_metrics_module() -> ModuleType:
     module_name = "src.ingestor.metrics"
     existing = sys.modules.get(module_name)
@@ -60,7 +64,6 @@ def _load_metrics_module() -> ModuleType:
         return module
     raise ImportError("Unable to load metrics module")
 
-
 ingest_metrics: ModuleType = _load_metrics_module()
 
 # --- Configuration ---
@@ -70,22 +73,30 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "rag_education")
 
-# Multi-collection routing by section
+# ── Multi-collection architecture ──────────────────────────────────
+# Collections are organized by major section:
+#   - rag_education        : all education resources (filtered by matiere/niveau/groupe via metadata)
+#   - rag_francais_premiere: dedicated Français Première corpus
+#   - rag_maths_premiere   : dedicated Mathématiques Première corpus (spécialité)
+#   - rag_web3             : blockchain, DeFi, NFT, Solana, etc.
+#   - rag_divers           : miscellaneous resources, always queried in "all" searches
+# Within each collection, metadata filters provide fine-grained retrieval.
 COLLECTION_MAP: dict[str, str] = {
-    "education": os.getenv("COLLECTION_EDUCATION", "rag_education"),
-    "web3": os.getenv("COLLECTION_WEB3", "rag_web3"),
-    "blockchain": os.getenv("COLLECTION_WEB3", "rag_web3"),
+    "education": "rag_education",
+    "web3": "rag_web3",
+    "blockchain": "rag_web3",
+    "divers": "rag_divers",
+    "maths_premiere": "rag_maths_premiere",
+    "default": "rag_education",
 }
 
 
-def resolve_collection_name(
-    section: str | None = None, collection: str | None = None,
-) -> str:
-    """Resolve target ChromaDB collection from section or explicit name."""
-    if collection:
+def resolve_collection_name(section: str | None = None, collection: str | None = None) -> str:
+    """Resolve the ChromaDB collection name from section or explicit collection name."""
+    if collection and collection.strip():
         return collection.strip()
-    key = (section or "").strip().lower()
-    return COLLECTION_MAP.get(key, COLLECTION_NAME)
+    sec = (section or "default").strip().lower()
+    return COLLECTION_MAP.get(sec, COLLECTION_MAP["default"])
 
 CHROMA_REQUEST_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", "30"))
 OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "30"))
@@ -99,10 +110,12 @@ URL_SCHEMES_ALLOWED = {"http", "https"}
 INGEST_CHUNK_SIZE = int(os.getenv("INGEST_CHUNK_SIZE", "1000"))
 INGEST_CHUNK_OVERLAP = int(os.getenv("INGEST_CHUNK_OVERLAP", "150"))
 METRICS_ENABLED = ingest_metrics.METRICS_ENABLED
-MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "true").lower() == "true"
-MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "1800"))
+MULTIMODAL_ENABLED = os.getenv("MULTIMODAL_ENABLED", "false").lower() == "true"
+MM_PARSER_TIMEOUT = float(os.getenv("MM_PARSER_TIMEOUT", "30"))
 MM_MAX_CHARS_PER_CHUNK = int(os.getenv("MM_MAX_CHARS_PER_CHUNK", "1200"))
 MM_CACHE_DIR = os.getenv("MM_CACHE_DIR", "/data/mm-cache")
+GOOGLE_DRIVE_TOKEN_PATH = os.getenv("GOOGLE_DRIVE_TOKEN_PATH", "/tmp/google-drive-token.json")
+GDRIVE_MAX_DOCS = int(os.getenv("GDRIVE_MAX_DOCS", "0"))
 
 # Keep metrics isolated per module import to avoid duplicate registration in tests.
 METRIC_REGISTRY = ingest_metrics.REGISTRY
@@ -113,6 +126,50 @@ ingest_requests_total = ingest_metrics.ingest_requests_total
 
 logger = logging.getLogger(__name__)
 
+MEDIA_SOURCE_TYPES = frozenset({"video", "image", "audio"})
+
+# Multimodal adapter: default to safe stubs, then try to override with real impl
+class Chunk:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:  # pragma: no cover - stub
+        self.text: str = ""
+        self.modality: str = "unknown"
+        self.metadata: dict[str, Any] = {}
+
+    def as_text(self) -> str:  # pragma: no cover - stub
+        return getattr(self, "text", "")
+
+
+def _parse_multimodal_stub(*args: Any, **kwargs: Any) -> Any:  # pragma: no cover - stub
+    raise RuntimeError("Multimodal parser not available on this runtime")
+
+# Assign stub by default; successful import below will override this name
+parse_multimodal: Callable[..., Any] = _parse_multimodal_stub
+
+# Try package-relative import first, then fallback to local module path
+_mm_mod: Optional[ModuleType] = None
+try:
+    from . import mm_adapter as _pkg_mm  # prefer package-relative when available
+    _mm_mod = _pkg_mm
+except Exception:  # pragma: no cover - import fallback
+    try:
+        _mm_mod = importlib.import_module("mm_adapter")
+    except Exception:
+        _mm_mod = None
+
+if _mm_mod is not None:
+    parse_multimodal = getattr(_mm_mod, "parse_multimodal", parse_multimodal)
+
+# Import admin_api from the same package; support both package and script execution
+try:
+    from . import admin_api as _admin_api_module
+except Exception:  # pragma: no cover - flexible fallback
+    try:
+        _admin_api_module = importlib.import_module("ingestor.admin_api")
+    except Exception:
+        _admin_api_module = importlib.import_module("admin_api")
+
+admin_api = _admin_api_module
+
 
 @dataclass
 class PreparedBatch:
@@ -122,75 +179,34 @@ class PreparedBatch:
     modality: str
 
 
-MEDIA_SOURCE_TYPES = frozenset({"video", "image", "audio"})
+@dataclass
+class DriveTaskProgress:
+    """Suivi de progression pour une ingestion Google Drive."""
+    task_id: str
+    folder_id: str
+    status: str = "pending"  # pending, scanning, ingesting, done, error
+    total_files: int = 0
+    processed_files: int = 0
+    added_chunks: int = 0
+    skipped_files: int = 0
+    error_files: int = 0
+    current_file: str = ""
+    target_collection: str = ""
+    file_results: list[dict[str, Any]] = field(default_factory=list)
+    error_message: str = ""
+    started_at: float = 0.0
+    finished_at: float = 0.0
 
 
-def _dedupe_prepared_batch(prepared: PreparedBatch) -> tuple[PreparedBatch, int]:
-    seen_ids: set[str] = set()
-    ids: list[str] = []
-    documents: list[str] = []
-    metadatas: list[dict[str, str]] = []
-    skipped = 0
-
-    for chunk_id, document, metadata in zip(
-        prepared.ids, prepared.documents, prepared.metadatas, strict=False
-    ):
-        if chunk_id in seen_ids:
-            skipped += 1
-            continue
-        seen_ids.add(chunk_id)
-        ids.append(chunk_id)
-        documents.append(document)
-        metadatas.append(metadata)
-
-    return PreparedBatch(ids=ids, documents=documents, metadatas=metadatas, modality=prepared.modality), skipped
-
-
-def _validate_upload_mode(source_type: str, mode: str) -> None:
-    normalized_source_type = (source_type or "").strip().lower()
-    normalized_mode = (mode or "text").strip().lower() or "text"
-    if normalized_source_type not in MEDIA_SOURCE_TYPES:
-        return
-    if normalized_mode != "multimodal":
-        raise HTTPException(
-            status_code=400,
-            detail="Ce type de fichier nécessite mode=multimodal.",
-        )
-    if not MULTIMODAL_ENABLED:
-        raise HTTPException(status_code=400, detail="Multimodal ingest disabled")
+# In-memory store for drive task progress (thread-safe via GIL for simple dict ops)
+_drive_tasks: dict[str, DriveTaskProgress] = {}
+_drive_tasks_lock = threading.Lock()
 
 app = FastAPI(title="RAG Ingestor API")
+app.include_router(admin_api.router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-@app.exception_handler(RequestValidationError)
-async def _validation_exception_handler(
-    request: Request, exc: RequestValidationError,
-) -> JSONResponse:
-    """Return a clearer error when the JSON body cannot be parsed.
-
-    This commonly happens when filenames with special Unicode characters
-    (emojis, supplementary-plane chars) cause encoding issues in the
-    request body.
-    """
-    logger.warning("Request validation error on %s: %s", request.url.path, exc)
-    return JSONResponse(
-        status_code=422,
-        content={
-            "status": "error",
-            "detail": "Erreur de validation du corps de la requête. "
-            "Vérifiez que les noms de fichiers ne contiennent pas "
-            "de caractères spéciaux (emojis, guillemets, etc.).",
-            "errors": [str(e) for e in exc.errors()[:5]],
-        },
-    )
+_DRIVE_SYNC_DB = os.getenv("DRIVE_SYNC_DB_PATH", "/data/drive_sync_state.db")
+sync_manager = DriveSyncManager(db_path=_DRIVE_SYNC_DB)
 
 
 @app.middleware("http")
@@ -233,7 +249,7 @@ def _record_ingest_outcome(source: str, modality: str, status: str) -> None:
 
 class IngestRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
-    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video", "auto", "image", "audio"] = Field(
+    source_type: Literal["url", "gdrive_folder", "pdf", "docx", "markdown", "md", "video", "image", "audio", "auto"] = Field(
         alias="sourceType",
         validation_alias=AliasChoices("source_type", "sourceType"),
     )
@@ -247,13 +263,71 @@ class IngestRequest(BaseModel):
         validation_alias=AliasChoices("hints", "metadata"),
     )
 
+
+class DriveIngestRequest(BaseModel):
+    folder_id: str
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class UrlBatchRequest(BaseModel):
+    """Requête d'ingestion par lot d'URLs."""
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    urls: list[str] = Field(description="Liste d'URLs à ingérer")
+    metadata_hints: dict[str, str] = Field(
+        default_factory=dict,
+        alias="metadata",
+        validation_alias=AliasChoices("hints", "metadata"),
+    )
+
+
+class DeduplicationCheckRequest(BaseModel):
+    """Requête de vérification de doublons avant ingestion."""
+    sources: list[str] = Field(description="Liste de source_path ou URLs à vérifier")
+    section: str = Field(default="education", description="Section pour cibler la bonne collection")
+    collection: str = Field(default="", description="Collection explicite à utiliser pour la vérification")
+
+
+class SearchRequest(BaseModel):
+    q: str = Field(description="Query text")
+    k: int = Field(default=6, ge=1, le=50, description="Number of results")
+    include_documents: bool = Field(default=True, description="Include full text in hits")
+    score_threshold: float | None = Field(default=None, ge=0.0, description="Maximum accepted Chroma distance")
+    collection: str = Field(
+        default="",
+        description="Target collection name (overrides section-based routing)",
+    )
+    section: str = Field(
+        default="education",
+        description="Section (education, web3) — used to route to the correct collection",
+    )
+    filters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Metadata filters (matiere, niveau, groupe, type_ressource, etc.)",
+    )
+
+
+def _validate_upload_mode(source_type: str, mode: str) -> None:
+    normalized_source_type = (source_type or "").strip().lower()
+    normalized_mode = (mode or "text").strip().lower() or "text"
+    if normalized_source_type not in MEDIA_SOURCE_TYPES:
+        return
+    if normalized_mode != "multimodal":
+        raise HTTPException(
+            status_code=400,
+            detail="Ce type de fichier nécessite mode=multimodal.",
+        )
+    if not MULTIMODAL_ENABLED:
+        raise HTTPException(status_code=400, detail="Multimodal ingest disabled")
+
 # --- Utilitaires ---
 
 
 def normalize_metadata(d: dict) -> dict[str, str]:
     normalized: dict[str, str] = {}
     for key, value in d.items():
-        if value in (None, ""):
+        if value is None or value == "":
+            continue
+        if isinstance(value, (list, dict)) and not value:
             continue
         normalized[str(key).strip().lower().replace(" ", "_")] = str(value)
     return normalized
@@ -263,15 +337,21 @@ def get_content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _resolve_local_path(raw_path: str, *, allow_tmp: bool = False) -> Path:
+def get_content_fingerprint(texts: Sequence[str]) -> str:
+    parts = [(text or "").strip() for text in texts]
+    normalized = [part for part in parts if part]
+    if not normalized:
+        return ""
+    return hashlib.sha256("\n\n".join(normalized).encode("utf-8")).hexdigest()
+
+
+def _resolve_local_path(raw_path: str) -> Path:
     candidate = Path(raw_path)
     if not candidate.is_absolute():
         candidate = (LOCAL_SOURCE_ROOT / candidate).resolve()
     else:
         candidate = candidate.resolve()
-    in_allowed_root = str(candidate).startswith(str(LOCAL_SOURCE_ROOT))
-    in_tmp = allow_tmp and str(candidate).startswith("/tmp/")
-    if not ALLOW_UNRESTRICTED_LOCAL and not in_allowed_root and not in_tmp:
+    if not ALLOW_UNRESTRICTED_LOCAL and not str(candidate).startswith(str(LOCAL_SOURCE_ROOT)):
         raise HTTPException(
             status_code=400, detail="Chemin local en dehors de la zone autorisée")
     if not candidate.exists():
@@ -315,28 +395,22 @@ def _ip_allowed(ip_str: str, allowlist: str | None) -> bool:
     return False
 
 
-def _extract_bearer_token(headers: Any) -> str | None:
-    """Extract token from Authorization: Bearer <token> header."""
-    auth = headers.get("Authorization") or headers.get("authorization") or ""
-    if auth.startswith("Bearer "):
-        return auth[7:].strip() or None
-    return None
-
-
 def _enforce_security(request: Any, _req: Any) -> None:
     headers = getattr(request, "headers", {}) or {}
     token_env = os.getenv("INGESTOR_API_TOKEN") or os.getenv("INGEST_AUTH_TOKEN")
-    if not token_env:
-        logger.error("INGESTOR_API_TOKEN is not configured — rejecting request")
-        raise HTTPException(status_code=503, detail="API token not configured on server")
-
-    header_token = (
-        headers.get("X-API-Token")
-        or headers.get("x-api-token")
-        or _extract_bearer_token(headers)
-    )
-    if not header_token or not hmac.compare_digest(header_token, token_env):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if token_env:
+        # Try X-API-Token first, then Authorization (Bearer or raw)
+        header_token = headers.get("X-API-Token") or headers.get("x-api-token")
+        if not header_token:
+            auth = headers.get("Authorization") or headers.get("authorization")
+            if isinstance(auth, str) and auth.strip():
+                value = auth.strip()
+                if value.lower().startswith("bearer "):
+                    header_token = value.split(" ", 1)[1].strip()
+                else:
+                    header_token = value
+        if header_token != token_env:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
     allowlist = os.getenv("INGESTOR_IP_ALLOWLIST")
     if allowlist and not _ip_allowed(_get_client_ip(request), allowlist):
@@ -357,6 +431,7 @@ def get_chroma_client() -> Any:
 
 
 def _load_docx_basic(file_path: str) -> list[Document]:
+    import docx
     try:
         d = docx.Document(file_path)
     except Exception as e:
@@ -486,8 +561,9 @@ def _validate_remote_url(url: str) -> None:
 
 def _download_to_temp(url: str, suffix: str) -> Path:
     _validate_remote_url(url)
+    headers = {"User-Agent": os.getenv("USER_AGENT", "rag-local-ingestor/1.0")}
     try:
-        with requests.get(url, timeout=30, stream=True) as response:
+        with requests.get(url, timeout=30, stream=True, headers=headers) as response:
             response.raise_for_status()
             total = 0
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
@@ -509,8 +585,9 @@ def _download_to_temp(url: str, suffix: str) -> Path:
 
 def _fetch_remote_text(url: str) -> tuple[str, str]:
     _validate_remote_url(url)
+    headers = {"User-Agent": os.getenv("USER_AGENT", "rag-local-ingestor/1.0")}
     try:
-        with requests.get(url, timeout=30, allow_redirects=True, stream=True) as response:
+        with requests.get(url, timeout=30, allow_redirects=True, stream=True, headers=headers) as response:
             if response.history:
                 for hop in response.history:
                     _validate_remote_url(hop.url)
@@ -565,52 +642,182 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
     if req.source_type == "url":
         return load_from_url(req.source)
     if req.source_type == "gdrive_folder":
-        loader = GoogleDriveLoader(folder_id=req.source, recursive=True)
-        return loader.load()
+        loader_kwargs: dict[str, Any] = {"folder_id": req.source, "recursive": True}
+        loader_kwargs["supports_all_drives"] = True
+        loader_kwargs["export_mime_types"] = {
+            "application/vnd.google-apps.document": "text/plain",
+            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.presentation": "text/plain",
+        }
+        service_account_raw = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if service_account_raw:
+            service_account_path = Path(service_account_raw)
+            if not service_account_path.exists():
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Configuration Google Drive invalide: le fichier de clé de service "
+                        "spécifié par GOOGLE_APPLICATION_CREDENTIALS est introuvable."
+                    ),
+                )
+            loader_kwargs["service_account_key"] = service_account_path
+            loader_kwargs["credentials_path"] = service_account_path
+        else:
+            default_credentials = Path.home() / ".credentials" / "credentials.json"
+            if default_credentials.exists():
+                loader_kwargs["credentials_path"] = default_credentials
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Identification Google Drive manquante: définissez GOOGLE_APPLICATION_CREDENTIALS "
+                        "ou placez un credentials.json valide dans ~/.credentials/."
+                    ),
+                )
+
+        token_path = Path(GOOGLE_DRIVE_TOKEN_PATH)
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:  # pragma: no cover - defensive guard
+            raise HTTPException(
+                status_code=500,
+                detail=f"Impossible de préparer le répertoire du token Google Drive: {exc}",
+            ) from exc
+        loader_kwargs["token_path"] = token_path
+
+        # Fast path: when a limiter is configured, pre-list a few file ids and load only those.
+        limit = int(GDRIVE_MAX_DOCS)
+        file_ids: list[str] = []
+        if limit > 0:
+            try:
+                # Import inside the branch to avoid hard dependency at import time.
+                from google.oauth2 import service_account as _sa
+                from googleapiclient.discovery import build as _build
+                creds = _sa.Credentials.from_service_account_file(str(loader_kwargs.get("credentials_path", service_account_raw)))
+                svc = _build("drive", "v3", credentials=creds, cache_discovery=False)
+
+                def _list_children(parent_id: str, q_extra: str, page_size: int = 10) -> list[dict[str, Any]]:
+                    q = f"'{parent_id}' in parents and trashed=false {q_extra}"
+                    resp = svc.files().list(
+                        q=q,
+                        pageSize=page_size,
+                        fields="files(id,name,mimeType)",
+                        includeItemsFromAllDrives=True,
+                        supportsAllDrives=True,
+                    ).execute()
+                    return list(resp.get("files", []))
+
+                # Shallow BFS up to depth 2 to find up to `limit` non-folder files quickly.
+                queue: list[tuple[str, int]] = [(req.source, 0)]
+                seen: set[str] = {req.source}
+                while queue and len(file_ids) < limit:
+                    current, depth = queue.pop(0)
+                    try:
+                        files = _list_children(current, "and mimeType != 'application/vnd.google-apps.folder'", page_size=max(5, limit))
+                        for f in files:
+                            if len(file_ids) >= limit:
+                                break
+                            fid = str(f.get("id", "") or "")
+                            if fid:
+                                file_ids.append(fid)
+                        if len(file_ids) >= limit or depth >= 2:
+                            continue
+                        subs = _list_children(current, "and mimeType = 'application/vnd.google-apps.folder'", page_size=5)
+                        for sf in subs:
+                            sid = str(sf.get("id", "") or "")
+                            if sid and sid not in seen:
+                                seen.add(sid)
+                                queue.append((sid, depth + 1))
+                    except Exception:
+                        # Ignore listing errors at this stage; we'll fall back to loader recursion.
+                        continue
+
+                if file_ids:
+                    # Switch to file_ids mode for faster, bounded loading
+                    loader_kwargs.pop("folder_id", None)
+                    loader_kwargs.pop("recursive", None)
+                    loader_kwargs["file_ids"] = file_ids
+            except Exception:
+                # non-fatal; proceed with regular folder traversal
+                pass
+
+        try:
+            loader = GoogleDriveLoader(**loader_kwargs)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Configuration Google Drive invalide: {exc}",
+            ) from exc
+
+        docs: list[Document] = []
+        try:
+            _lazy = getattr(loader, "lazy_load", None)
+            if callable(_lazy):
+                _result = _lazy()
+                _iterable: list[Any] = list(_result) if hasattr(_result, "__iter__") else []  # type: ignore[arg-type]
+                for _d in _iterable:
+                    try:
+                        if _d and getattr(_d, "page_content", "").strip():
+                            docs.append(_d)
+                            if limit > 0 and len(docs) >= limit:
+                                break
+                    except Exception:
+                        continue
+            else:
+                docs = loader.load()
+                if limit > 0 and len(docs) > limit:
+                    docs = docs[:limit]
+        except Exception as _e:
+            try:
+                docs = []
+                for _d in loader.lazy_load():
+                    try:
+                        if _d and getattr(_d, "page_content", "").strip():
+                            docs.append(_d)
+                            if limit > 0 and len(docs) >= limit:
+                                break
+                    except Exception:
+                        continue
+            except Exception as _e2:
+                raise HTTPException(status_code=500, detail=f"Echec chargement Google Drive: {_e2}") from _e2
+        # Ne pas échouer si aucun document lisible: laissez l'API retourner added:0
+        return docs
     if req.source_type == "pdf":
-        path = _resolve_local_path(req.source, allow_tmp=True)
+        path = _resolve_local_path(req.source)
         return PyPDFLoader(str(path)).load()
     if req.source_type == "docx":
-        path = _resolve_local_path(req.source, allow_tmp=True)
+        path = _resolve_local_path(req.source)
         return load_docx(str(path))
     if req.source_type in {"markdown", "md"}:
-        path = _resolve_local_path(req.source, allow_tmp=True)
+        path = _resolve_local_path(req.source)
         return load_markdown(path)
     if req.source_type in {"video", "image", "audio"}:
         raise HTTPException(
             status_code=400,
-            detail="Ce type de source nécessite le mode multimodal (mode=multimodal).",
+            detail=(
+                f"Ingestion {req.source_type} disponible uniquement en mode multimodal "
+                "(mode=multimodal). Utilisez /ingest/upload-files pour un traitement automatique."
+            ),
         )
     if req.source_type == "auto":
-        ext = Path(req.source).suffix.lower()
+        path = _resolve_local_path(req.source)
+        ext = path.suffix.lower()
         if ext == ".pdf":
-            path = _resolve_local_path(req.source, allow_tmp=True)
             return PyPDFLoader(str(path)).load()
-        if ext == ".docx":
-            path = _resolve_local_path(req.source, allow_tmp=True)
+        if ext in {".docx", ".doc"}:
             return load_docx(str(path))
-        if ext in {".md", ".markdown"}:
-            path = _resolve_local_path(req.source, allow_tmp=True)
+        if ext in {".md", ".markdown", ".txt", ".csv", ".html", ".htm"}:
             return load_markdown(path)
-        if ext in {".txt", ".csv", ".json", ".xml", ".html", ".htm"}:
-            path = _resolve_local_path(req.source, allow_tmp=True)
-            text = path.read_text(encoding="utf-8", errors="ignore").strip()
-            if not text:
-                return []
-            return [Document(page_content=text, metadata={"source": str(path)})]
-        # Fallback: try reading as text
-        path = _resolve_local_path(req.source, allow_tmp=True)
-        text = path.read_text(encoding="utf-8", errors="ignore").strip()
-        if text:
-            return [Document(page_content=text, metadata={"source": str(path)})]
-        return []
+        # Default: try as text
+        return load_markdown(path)
     raise HTTPException(status_code=400, detail=f"source_type non géré: {req.source_type}")
 
 
 def _prepare_chunks_for_chroma(
     req: IngestRequest,
     docs: list[Document],
-    splitter: RecursiveCharacterTextSplitter | None = None,
+    splitter: Optional[RecursiveCharacterTextSplitter] = None,
+    extra_metadata: dict[str, Any] | None = None,
 ) -> PreparedBatch:
     splitter = splitter or RecursiveCharacterTextSplitter(
         chunk_size=INGEST_CHUNK_SIZE, chunk_overlap=INGEST_CHUNK_OVERLAP
@@ -620,20 +827,28 @@ def _prepare_chunks_for_chroma(
     documents: list[str] = []
     metadatas: list[dict[str, str]] = []
     modality = "text"
+    seen_ids: set[str] = set()
+    chunk_number = 0
 
     for chunk in chunks:
         text = (chunk.page_content or "").strip()
         if not text:
             continue
         content_hash = get_content_hash(text)
+        if content_hash in seen_ids:
+            continue
+        seen_ids.add(content_hash)
         chunk_modality = (chunk.metadata or {}).get("modality", "text")
-        metadata = {
+        metadata: dict[str, Any] = {
             "sha256": content_hash,
             "source_type": req.source_type,
             "source": req.source,
             "modality": chunk_modality,
+            "chunk_index": str(chunk_number),
         }
         metadata.update(chunk.metadata or {})
+        if extra_metadata:
+            metadata.update(extra_metadata)
         metadata.update(req.metadata_hints or {})
         normalized = normalize_metadata(metadata)
 
@@ -641,6 +856,7 @@ def _prepare_chunks_for_chroma(
         documents.append(text)
         metadatas.append(normalized)
         modality = normalized.get("modality", modality)
+        chunk_number += 1
 
     if not ids:
         modality = "text"
@@ -652,6 +868,7 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
     documents: list[str] = []
     metadatas: list[dict[str, str]] = []
     modality_counts: dict[str, int] = {}
+    seen_ids: set[str] = set()
 
     for chunk in chunks:
         text = chunk.as_text() if hasattr(chunk, "as_text") else (chunk.text or "")
@@ -659,6 +876,9 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
         if not text:
             continue
         content_hash = get_content_hash(text)
+        if content_hash in seen_ids:
+            continue
+        seen_ids.add(content_hash)
         chunk_modality = (chunk.modality or "unknown").strip().lower() or "unknown"
         metadata: dict[str, Any] = {
             "sha256": content_hash,
@@ -684,50 +904,16 @@ def _prepare_multimodal_chunks(req: IngestRequest, chunks: list[Chunk]) -> Prepa
     return PreparedBatch(ids=ids, documents=documents, metadatas=metadatas, modality=dominant)
 
 
-_AV_MIME_FALLBACK: dict[str, str] = {
-    ".mkv": "video/x-matroska",
-    ".webm": "video/webm",
-    ".mp4": "video/mp4",
-    ".mov": "video/quicktime",
-    ".avi": "video/x-msvideo",
-    ".flv": "video/x-flv",
-    ".mpg": "video/mpeg",
-    ".mpeg": "video/mpeg",
-    ".ogv": "video/ogg",
-    ".mp3": "audio/mpeg",
-    ".wav": "audio/wav",
-    ".ogg": "audio/ogg",
-    ".flac": "audio/flac",
-    ".aac": "audio/aac",
-    ".m4a": "audio/mp4",
-    ".wma": "audio/x-ms-wma",
-}
-
-
-def _guess_mime(filename: str) -> str:
-    """Guess MIME type from filename, with fallback for AV formats.
-
-    Uses only the file extension to avoid issues with special Unicode characters
-    in filenames that can confuse mimetypes.guess_type.
-    """
-    ext = Path(filename).suffix.lower()
-    fallback = _AV_MIME_FALLBACK.get(ext)
-    if fallback:
-        return fallback
-    mime, _ = mimetypes.guess_type(f"file{ext}")
-    return mime or "application/octet-stream"
-
-
 def _prepare_multimodal_ingest(req: IngestRequest) -> PreparedBatch:
     if not MULTIMODAL_ENABLED:
         raise HTTPException(status_code=400, detail="Multimodal ingest disabled")
     path = _resolve_local_path(req.source)
-    mime = _guess_mime(path.name)
+    mime, _ = mimetypes.guess_type(path.name)
     with path.open("rb") as handle:
         chunk_iter = parse_multimodal(
             handle,
             filename=path.name,
-            mime=mime,
+            mime=mime or "application/octet-stream",
             timeout_s=MM_PARSER_TIMEOUT,
             max_chars_per_chunk=MM_MAX_CHARS_PER_CHUNK,
             cache_dir=MM_CACHE_DIR,
@@ -738,20 +924,489 @@ def _prepare_multimodal_ingest(req: IngestRequest) -> PreparedBatch:
 # --- Endpoint ---
 
 
+def _index_batch(
+    prepared: PreparedBatch,
+    req_source_type: str,
+    modality_label: str,
+    collection_name: str | None = None,
+) -> dict[str, Any]:
+    target_collection = collection_name or COLLECTION_NAME
+    if not prepared.ids:
+        _record_ingest_metrics(True)
+        _record_ingest_outcome(req_source_type, modality_label, "empty")
+        return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
+
+    dedup_ids: list[str] = []
+    dedup_documents: list[str] = []
+    dedup_metadatas: list[dict[str, str]] = []
+    seen_ids: set[str] = set()
+    batch_skipped = 0
+    for chunk_id, document, metadata in zip(prepared.ids, prepared.documents, prepared.metadatas, strict=False):
+        if chunk_id in seen_ids:
+            batch_skipped += 1
+            continue
+        seen_ids.add(chunk_id)
+        dedup_ids.append(chunk_id)
+        dedup_documents.append(document)
+        dedup_metadatas.append(metadata)
+
+    prepared = PreparedBatch(
+        ids=dedup_ids,
+        documents=dedup_documents,
+        metadatas=dedup_metadatas,
+        modality=prepared.modality,
+    )
+
+    try:
+        client = get_chroma_client()
+        collection = client.get_or_create_collection(
+            name=target_collection, metadata={"hnsw:space": "cosine"}
+        )
+
+        existing = collection.get(ids=prepared.ids) or {}
+        existing_ids = set(existing.get("ids", []))
+
+        to_add_idx = [i for i, chunk_id in enumerate(prepared.ids) if chunk_id not in existing_ids]
+        if not to_add_idx:
+            _record_ingest_metrics(True)
+            _record_ingest_outcome(req_source_type, modality_label, "skipped")
+            return {"status": "ok", "added": 0, "skipped": len(existing_ids) + batch_skipped, "collection": target_collection}
+
+        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
+        docs_to_add = [prepared.documents[i] for i in to_add_idx]
+        ids_to_add = [prepared.ids[i] for i in to_add_idx]
+        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
+        try:
+            embs_to_add = emb.embed_documents(docs_to_add)
+        except ValueError as exc:
+            message = str(exc)
+            if "HTTP code: 404" in message:
+                logger.warning(
+                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                        "Pull the model or adjust EMBED_MODEL before retrying."
+                    ),
+                ) from exc
+            logger.exception("Embedding provider raised ValueError")
+            raise
+        except Exception:  # pragma: no cover - defensive logging
+            logger.exception("Unexpected failure while requesting embeddings")
+            raise
+
+        meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
+        embeddings_seq = cast(list[Sequence[float]], embs_to_add)
+        collection.add(
+            documents=docs_to_add,
+            ids=ids_to_add,
+            metadatas=meta_mappings,
+            embeddings=embeddings_seq,
+        )
+        _record_ingest_metrics(True)
+        _record_ingest_outcome(req_source_type, modality_label, "success")
+        return {
+            "status": "ok",
+            "added": len(ids_to_add),
+            "skipped": (len(prepared.ids) - len(ids_to_add)) + batch_skipped,
+            "collection": target_collection,
+        }
+    except HTTPException as exc:
+        _record_ingest_metrics(False)
+        _record_ingest_outcome(req_source_type, modality_label, f"http_{exc.status_code}")
+        raise
+    except Exception as exc:
+        _record_ingest_metrics(False)
+        _record_ingest_outcome(req_source_type, modality_label, "error")
+        raise HTTPException(
+            status_code=500, detail=f"Erreur d'ingestion dans ChromaDB: {exc}"
+        ) from exc
+
+
+def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> None:
+    """Ingestion Google Drive en arrière-plan avec suivi de progression."""
+    task = _drive_tasks.get(task_id)
+    if not task:
+        logger.error(f"Drive task {task_id} not found in store")
+        return
+
+    task.status = "scanning"
+    task.started_at = time.time()
+    target_col = resolve_collection_name(section=metadata.get("section"), collection=metadata.get("collection"))
+    task.target_collection = target_col
+
+    logger.info(f"[{task_id}] Starting drive ingest for folder {folder_id} → {target_col}")
+
+    try:
+        # Vérification d'accès explicite avant de démarrer — lève PermissionError si le SA n'a pas accès
+        try:
+            sync_manager.verify_folder_access(folder_id)
+        except PermissionError as e:
+            logger.error(f"[{task_id}] Drive access denied: {e}")
+            task.status = "error"
+            task.error_message = str(e)
+            task.finished_at = time.time()
+            return
+        except Exception as e:
+            logger.error(f"[{task_id}] Drive access check failed: {e}")
+            task.status = "error"
+            task.error_message = f"Erreur vérification accès Drive: {e}"
+            task.finished_at = time.time()
+            return
+
+        updates = sync_manager.list_updates(folder_id)
+        if not updates:
+            logger.info(f"[{task_id}] Aucune mise à jour pour le dossier Drive.")
+            task.status = "done"
+            task.finished_at = time.time()
+            return
+
+        task.total_files = len(updates)
+        task.status = "ingesting"
+
+        # Setup credentials once
+        loader_kwargs_base: dict[str, Any] = {}
+        loader_kwargs_base["supports_all_drives"] = True
+        loader_kwargs_base["export_mime_types"] = {
+            "application/vnd.google-apps.document": "text/plain",
+            "application/vnd.google-apps.spreadsheet": "text/csv",
+            "application/vnd.google-apps.presentation": "text/plain",
+        }
+        service_account_raw = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        if service_account_raw:
+            service_account_path = Path(service_account_raw)
+            if service_account_path.exists():
+                loader_kwargs_base["service_account_key"] = service_account_path
+                loader_kwargs_base["credentials_path"] = service_account_path
+        else:
+            default_credentials = Path.home() / ".credentials" / "credentials.json"
+            if default_credentials.exists():
+                loader_kwargs_base["credentials_path"] = default_credentials
+
+        token_path = Path(GOOGLE_DRIVE_TOKEN_PATH)
+        try:
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        loader_kwargs_base["token_path"] = token_path
+
+        for file_meta in updates:
+            fid = file_meta.get("id", "?")
+            fname = file_meta.get("name", "?")
+            mime_type = str(file_meta.get("mimeType") or "")
+            task.current_file = fname
+
+            fname_lower = fname.lower()
+            unsupported_exts = (
+                ".webm", ".mkv", ".mp4", ".avi", ".mov", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac",
+                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".tif", ".tiff", ".ico",
+                ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+                ".ppt", ".pptx", ".pps", ".ppsx", ".php",
+                ".html", ".htm", ".txt",
+                # LaTeX auxiliary/compiled files
+                ".out", ".snm", ".aux", ".log", ".toc", ".bbl", ".blg", ".nav", ".vrb", ".fls", ".fdb_latexmk",
+                # PostScript (incompatible avec pypdf)
+                ".ps", ".eps",
+            )
+            unsupported_mimes = (
+                "video/", "audio/", "image/",
+                "application/zip", "application/x-zip", "application/x-zip-compressed",
+                "application/x-gzip", "application/gzip", "application/x-tar",
+                "application/x-rar", "application/vnd.rar", "application/x-7z-compressed",
+                "application/vnd.ms-powerpoint",
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
+                "text/html",
+                "application/postscript",
+            )
+            if mime_type.startswith(unsupported_mimes) or fname_lower.endswith(unsupported_exts):
+                logger.info(f"[{task_id}] Skipping unsupported Drive file {fid} ({fname}) [{mime_type}]")
+                task.skipped_files += 1
+                task.processed_files += 1
+                task.file_results.append({
+                    "name": fname,
+                    "status": "unsupported",
+                    "added": 0,
+                    "skipped": 1,
+                    "detail": f"Type Google Drive non supporté pour ce flux: {mime_type or fname}",
+                })
+                continue
+
+            # .doc ancien → conversion libreoffice avant chargement
+            is_legacy_doc = fname_lower.endswith(".doc") or mime_type == "application/msword"
+
+            try:
+                logger.info(f"[{task_id}] Processing file {fid} ({fname})")
+
+                # Cas 1 : Google Docs/Sheets/Slides → export texte natif via Drive API
+                google_workspace_export: dict[str, str] = {
+                    "application/vnd.google-apps.document": "text/plain",
+                    "application/vnd.google-apps.spreadsheet": "text/csv",
+                    "application/vnd.google-apps.presentation": "text/plain",
+                }
+                docs: list[Any] = []
+                if mime_type in google_workspace_export:
+                    try:
+                        from google.oauth2 import service_account as _sa
+                        from googleapiclient.discovery import build as _build
+                        from langchain.schema import Document as _Doc
+                        _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+                        _creds = _sa.Credentials.from_service_account_file(
+                            _creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+                        )
+                        _svc = _build("drive", "v3", credentials=_creds, cache_discovery=False)
+                        export_mime = google_workspace_export[mime_type]
+                        content_bytes = _svc.files().export(
+                            fileId=fid, mimeType=export_mime
+                        ).execute()
+                        text = content_bytes.decode("utf-8", errors="replace") if isinstance(content_bytes, bytes) else str(content_bytes)
+                        if text.strip():
+                            docs = [_Doc(page_content=text, metadata={"source": fname})]
+                        logger.info(f"[{task_id}] Google Workspace export OK: {fname} ({export_mime})")
+                    except Exception as _e:
+                        logger.warning(f"[{task_id}] Google Workspace export failed for {fid}: {_e}")
+                        # Fallback: tenter GoogleDriveLoader
+                        docs = []
+
+                # Cas 2 : .doc ancien → libreoffice → .docx → python-docx
+                elif is_legacy_doc:
+                    try:
+                        from google.oauth2 import service_account as _sa
+                        from googleapiclient.discovery import build as _build
+                        import subprocess
+                        _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+                        _creds = _sa.Credentials.from_service_account_file(
+                            _creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+                        )
+                        _svc = _build("drive", "v3", credentials=_creds, cache_discovery=False)
+                        content_bytes = _svc.files().get_media(fileId=fid).execute()
+                        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False, dir="/tmp") as tf:
+                            tf.write(content_bytes)
+                            tmp_doc = tf.name
+                        result = subprocess.run(
+                            ["libreoffice", "--headless", "--convert-to", "docx", "--outdir", "/tmp", tmp_doc],
+                            capture_output=True, timeout=60
+                        )
+                        tmp_docx = tmp_doc.replace(".doc", ".docx")
+                        if result.returncode == 0 and Path(tmp_docx).exists():
+                            docs = load_docx(tmp_docx)
+                            Path(tmp_doc).unlink(missing_ok=True)
+                            Path(tmp_docx).unlink(missing_ok=True)
+                            logger.info(f"[{task_id}] .doc converted via libreoffice: {fname}")
+                        else:
+                            Path(tmp_doc).unlink(missing_ok=True)
+                            raise RuntimeError(f"libreoffice conversion failed: {result.stderr.decode()[:200]}")
+                    except Exception as _e:
+                        logger.warning(f"[{task_id}] .doc conversion failed for {fid}: {_e}")
+                        docs = []
+
+                # Cas 3 : chargement standard via GoogleDriveLoader
+                if not docs and mime_type not in google_workspace_export and not is_legacy_doc:
+                    kwargs = loader_kwargs_base.copy()
+                    kwargs["file_ids"] = [fid]
+                    try:
+                        loader = GoogleDriveLoader(**kwargs)
+                        docs = loader.load()
+                    except Exception as e:
+                        error_detail = str(e)
+                        # Fallback pdfplumber pour PDFs corrompus (EOF marker not found)
+                        pdf_error_markers = ("eof marker", "startxref", "cannot read an empty", "trailer", "malformed pdf", "invalid pdf", "file is not a pdf")
+                        if any(m in error_detail.lower() for m in pdf_error_markers):
+                            try:
+                                from google.oauth2 import service_account as _sa2
+                                from googleapiclient.discovery import build as _build2
+                                from langchain.schema import Document as _Doc2
+                                _creds_path2 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+                                _creds2 = _sa2.Credentials.from_service_account_file(
+                                    _creds_path2, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+                                )
+                                _svc2 = _build2("drive", "v3", credentials=_creds2, cache_discovery=False)
+                                pdf_bytes = _svc2.files().get_media(fileId=fid).execute()
+                                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir="/tmp") as tf2:
+                                    tf2.write(pdf_bytes)
+                                    tmp_pdf = tf2.name
+                                texts = []
+                                with pdfplumber.open(tmp_pdf) as pdf_doc:
+                                    for pg in pdf_doc.pages:
+                                        t = pg.extract_text()
+                                        if t and t.strip():
+                                            texts.append(t.strip())
+                                Path(tmp_pdf).unlink(missing_ok=True)
+                                if texts:
+                                    docs = [_Doc2(page_content="\n\n".join(texts), metadata={"source": fname})]
+                                    logger.info(f"[{task_id}] pdfplumber fallback OK: {fname} ({len(texts)} pages)")
+                                else:
+                                    raise RuntimeError("pdfplumber extracted no text")
+                            except Exception as _fe:
+                                logger.warning(f"[{task_id}] pdfplumber fallback failed for {fid}: {_fe}")
+                                error_detail2 = f"{error_detail} | pdfplumber: {_fe}"
+                                task.processed_files += 1
+                                task.skipped_files += 1
+                                task.file_results.append({"name": fname, "status": "invalid", "added": 0, "skipped": 1, "detail": error_detail2})
+                                continue
+                        else:
+                            logger.warning(f"[{task_id}] Failed to load file {fid}: {error_detail}")
+                            task.processed_files += 1
+                            task.error_files += 1
+                            task.file_results.append({"name": fname, "status": "error", "detail": error_detail})
+                            continue
+
+                if not docs:
+                    logger.warning(f"[{task_id}] No content loaded for file {fid}")
+                    task.skipped_files += 1
+                    task.processed_files += 1
+                    task.file_results.append({"name": fname, "status": "empty", "added": 0})
+                    continue
+
+                content_fingerprint = get_content_fingerprint([(doc.page_content or "") for doc in docs])
+                if sync_manager.is_unchanged(file_meta, content_fingerprint):
+                    logger.info(f"[{task_id}] Skipping unchanged file {fid} ({fname})")
+                    task.skipped_files += 1
+                    task.processed_files += 1
+                    task.file_results.append({
+                        "name": fname,
+                        "status": "duplicate",
+                        "added": 0,
+                        "skipped": 1,
+                        "detail": "Contenu inchangé (empreinte identique).",
+                    })
+                    continue
+
+                # Prepare chunks — inject Drive-specific metadata per file
+                req = IngestRequest(
+                    sourceType="gdrive_folder",
+                    sourceUrl=folder_id,
+                    metadata=metadata,
+                )
+                drive_extra: dict[str, Any] = {
+                    "drive_file_id": fid,
+                    "drive_file_name": fname,
+                    "drive_folder_id": folder_id,
+                    "mime_type": mime_type,
+                }
+                prepared = _prepare_chunks_for_chroma(req, docs, extra_metadata=drive_extra)
+
+                if not prepared.ids:
+                    task.skipped_files += 1
+                    task.processed_files += 1
+                    task.file_results.append({"name": fname, "status": "empty", "added": 0})
+                    continue
+
+                # Index
+                try:
+                    result = _index_batch(prepared, "gdrive_folder", "text", collection_name=target_col)
+                    added = result.get("added", 0)
+                    skipped = result.get("skipped", 0)
+                    task.added_chunks += added
+                    if added == 0 and skipped > 0:
+                        task.skipped_files += 1
+                        task.file_results.append({"name": fname, "status": "duplicate", "added": 0, "skipped": skipped})
+                    else:
+                        task.file_results.append({"name": fname, "status": "ok", "added": added, "skipped": skipped})
+                except Exception as e:
+                    logger.error(f"[{task_id}] Indexing failed for {fid}: {e}")
+                    task.error_files += 1
+                    task.file_results.append({"name": fname, "status": "error", "detail": str(e)})
+                    task.processed_files += 1
+                    continue
+
+                # Mark as ingested
+                sync_manager.mark_as_ingested(file_meta, content_fingerprint=content_fingerprint)
+
+            except Exception as e:
+                logger.error(f"[{task_id}] Error processing file {fid}: {e}")
+                task.error_files += 1
+                task.file_results.append({"name": fname, "status": "error", "detail": str(e)})
+
+            task.processed_files += 1
+
+        task.status = "done"
+        task.current_file = ""
+        task.finished_at = time.time()
+        logger.info(
+            f"[{task_id}] Drive ingest done: {task.processed_files}/{task.total_files} files, "
+            f"{task.added_chunks} chunks added → {target_col}"
+        )
+
+    except Exception as e:
+        logger.error(f"[{task_id}] Background ingest failed: {e}")
+        task.status = "error"
+        task.error_message = str(e)
+        task.finished_at = time.time()
+
+
+@app.post("/ingest/drive")
+def ingest_drive(
+    req: DriveIngestRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+):
+    """Lance une ingestion Google Drive et retourne un task_id pour suivi de progression."""
+    _enforce_security(request, req)
+
+    task_id = uuid.uuid4().hex[:12]
+    target_col = resolve_collection_name(section=req.metadata.get("section"), collection=req.metadata.get("collection"))
+    task = DriveTaskProgress(task_id=task_id, folder_id=req.folder_id, target_collection=target_col)
+
+    with _drive_tasks_lock:
+        _drive_tasks[task_id] = task
+
+    background_tasks.add_task(background_drive_ingest, req.folder_id, req.metadata, task_id)
+
+    return {
+        "status": "accepted",
+        "task_id": task_id,
+        "target_collection": target_col,
+        "message": f"Ingestion Drive démarrée (tâche {task_id})",
+    }
+
+
+@app.get("/ingest/drive/status/{task_id}")
+def drive_ingest_status(task_id: str, request: Request) -> dict[str, Any]:
+    """Retourne la progression d'une ingestion Google Drive."""
+    _enforce_security(request, None)
+
+    task = _drive_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"Tâche {task_id} introuvable")
+
+    elapsed = 0.0
+    if task.started_at > 0:
+        end = task.finished_at if task.finished_at > 0 else time.time()
+        elapsed = round(end - task.started_at, 1)
+
+    progress_pct = 0
+    if task.total_files > 0:
+        progress_pct = round((task.processed_files / task.total_files) * 100)
+
+    return {
+        "task_id": task.task_id,
+        "folder_id": task.folder_id,
+        "status": task.status,
+        "target_collection": task.target_collection,
+        "total_files": task.total_files,
+        "processed_files": task.processed_files,
+        "added_chunks": task.added_chunks,
+        "skipped_files": task.skipped_files,
+        "error_files": task.error_files,
+        "current_file": task.current_file,
+        "progress_pct": progress_pct,
+        "elapsed_seconds": elapsed,
+        "error_message": task.error_message,
+        "file_results": task.file_results,
+    }
+
+
 @app.post("/ingest")
 def ingest_data(
     req: IngestRequest,
     request: Request,
     mode: str = Query(default="text"),
-    section: str = Query(default=""),
-    collection: str = Query(default=""),
 ):
     modality_label = "unknown"
     mode_normalized = (mode or "text").strip().lower() or "text"
-    target_col = resolve_collection_name(
-        section=section or req.metadata_hints.get("section"),
-        collection=collection or req.metadata_hints.get("collection"),
-    )
 
     try:
         _enforce_security(request, req)
@@ -768,7 +1423,7 @@ def ingest_data(
                 _record_ingest_metrics(True)
                 modality_label = "text"
                 _record_ingest_outcome(req.source_type, modality_label, "empty")
-                return {"status": "ok", "message": "Aucun document chargé.", "collection": target_col}
+                return {"status": "ok", "message": "Aucun document chargé."}
             prepared = _prepare_chunks_for_chroma(req, docs)
         else:
             raise HTTPException(status_code=400, detail="Mode d'ingestion non supporté")
@@ -780,298 +1435,258 @@ def ingest_data(
     except Exception as exc:
         _record_ingest_metrics(False)
         _record_ingest_outcome(req.source_type, modality_label, "error")
-        logger.exception("Erreur de chargement source")
-        raise HTTPException(status_code=500, detail="Erreur de chargement du document source") from exc
+        raise HTTPException(status_code=500, detail=f"Erreur de chargement: {exc}") from exc
 
     if not prepared.ids:
         _record_ingest_metrics(True)
         _record_ingest_outcome(req.source_type, modality_label, "empty")
-        return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion.", "collection": target_col}
-    prepared, batch_skipped = _dedupe_prepared_batch(prepared)
+        return {"status": "ok", "message": "Aucun contenu éligible à l'ingestion."}
 
-    try:
-        client = get_chroma_client()
-        collection_obj = client.get_or_create_collection(
-            name=target_col, metadata={"hnsw:space": "cosine"}
-        )
-
-        existing = collection_obj.get(ids=prepared.ids) or {}
-        existing_ids = set(existing.get("ids", []))
-
-        to_add_idx = [i for i, chunk_id in enumerate(prepared.ids) if chunk_id not in existing_ids]
-        if not to_add_idx:
-            _record_ingest_metrics(True)
-            _record_ingest_outcome(req.source_type, modality_label, "skipped")
-            return {
-                "status": "ok",
-                "added": 0,
-                "skipped": len(existing_ids) + batch_skipped,
-                "collection": target_col,
-            }
-
-        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
-        docs_to_add = [prepared.documents[i] for i in to_add_idx]
-        ids_to_add = [prepared.ids[i] for i in to_add_idx]
-        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
-        try:
-            embs_to_add = emb.embed_documents(docs_to_add)
-        except ValueError as exc:
-            message = str(exc)
-            if "HTTP code: 404" in message:
-                logger.warning(
-                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Modèle d'embedding '{EMBED_MODEL}' non disponible. Vérifiez la configuration.",
-                ) from exc
-            logger.exception("Embedding provider raised ValueError")
-            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
-        except Exception as exc:
-            logger.exception("Unexpected failure while requesting embeddings")
-            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
-
-        meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
-        embeddings_seq = cast(list[Sequence[float]], embs_to_add)
-        collection_obj.add(
-            documents=docs_to_add,
-            ids=ids_to_add,
-            metadatas=meta_mappings,
-            embeddings=embeddings_seq,
-        )
-        _record_ingest_metrics(True)
-        _record_ingest_outcome(req.source_type, modality_label, "success")
-        return {
-            "status": "ok",
-            "added": len(ids_to_add),
-            "skipped": (len(prepared.ids) - len(ids_to_add)) + batch_skipped,
-            "collection": target_col,
-        }
-    except HTTPException as exc:
-        _record_ingest_metrics(False)
-        _record_ingest_outcome(req.source_type, modality_label, f"http_{exc.status_code}")
-        raise
-    except Exception as exc:
-        _record_ingest_metrics(False)
-        _record_ingest_outcome(req.source_type, modality_label, "error")
-        logger.exception("Erreur d'ingestion ChromaDB")
-        raise HTTPException(status_code=500, detail="Erreur d'indexation dans la base vectorielle") from exc
+    target_col = resolve_collection_name(section=req.metadata_hints.get("section"), collection=req.metadata_hints.get("collection"))
+    return _index_batch(prepared, req.source_type, modality_label, collection_name=target_col)
 
 
-@app.post("/ingest/upload")
-def ingest_upload(
+@app.post("/ingest/urls")
+def ingest_urls(
+    req: UrlBatchRequest,
     request: Request,
-    file: UploadFile = File(...),  # noqa: B008
-    source_type: str = Form(default="auto"),
-    mode: str = Form(default="multimodal"),
-    metadata: str = Form(default="{}"),
-    section: str = Form(default=""),
-    collection: str = Form(default=""),
-):
-    """Ingest a file uploaded via multipart form data.
+    mode: str = Query(default="text"),
+) -> dict[str, Any]:
+    """Ingestion par lot d'URLs — vérifie les doublons avant ingestion."""
+    _enforce_security(request, req)
 
-    This endpoint avoids JSON body encoding issues for filenames
-    with special Unicode characters (emojis, accented chars, etc.).
-    """
+    if not req.urls:
+        raise HTTPException(status_code=400, detail="La liste d'URLs est vide.")
+
+    results: list[dict[str, Any]] = []
+    total_added = 0
+    total_skipped = 0
+    total_errors = 0
+    total_errors = 0
+
+    for url in req.urls:
+        url = url.strip()
+        if not url:
+            continue
+        try:
+            # Vérifier doublon par content hash
+            sub_req = IngestRequest(
+                sourceType="url", sourceUrl=url, metadata=req.metadata_hints
+            )
+            docs = load_from_url(url)
+            if not docs:
+                results.append({"url": url, "status": "empty", "added": 0, "skipped": 0})
+                continue
+
+            prepared = _prepare_chunks_for_chroma(sub_req, docs)
+            if not prepared.ids:
+                results.append({"url": url, "status": "empty", "added": 0, "skipped": 0})
+                continue
+
+            target_col = resolve_collection_name(section=req.metadata_hints.get("section"), collection=req.metadata_hints.get("collection"))
+            result = _index_batch(prepared, "url", prepared.modality or "text", collection_name=target_col)
+            added = result.get("added", 0)
+            skipped = result.get("skipped", 0)
+            total_added += added
+            total_skipped += skipped
+            results.append({"url": url, "status": "ok", "added": added, "skipped": skipped})
+        except HTTPException as exc:
+            results.append({"url": url, "status": "error", "detail": exc.detail})
+        except Exception as exc:
+            results.append({"url": url, "status": "error", "detail": str(exc)})
+
+    return {
+        "status": "ok",
+        "total_urls": len(req.urls),
+        "total_added": total_added,
+        "total_skipped": total_skipped,
+        "results": results,
+    }
+
+
+@app.post("/ingest/upload-files")
+async def ingest_upload_files(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    metadata: str = Query(default="{}"),
+    mode: str = Query(default="text"),
+) -> dict[str, Any]:
+    """Upload et ingestion de plusieurs fichiers simultanément avec déduplication."""
+    import json as _json
+    import uuid as _uuid
+
+    _enforce_security(request, None)
+
     try:
-        _enforce_security(request, None)
-    except HTTPException:
-        raise
-
-    filename = file.filename or "upload"
-    mime = _guess_mime(filename)
-    modality_label = "unknown"
-
-    try:
-        hints = json.loads(metadata) if metadata else {}
-    except (ValueError, TypeError):
+        hints = _json.loads(metadata)
+        if not isinstance(hints, dict):
+            hints = {}
+    except Exception:
         hints = {}
 
-    target_col = resolve_collection_name(
-        section=section or hints.get("section"),
-        collection=collection or hints.get("collection"),
+    upload_dir = Path(os.getenv("ADMIN_UPLOAD_DIR", "/data/uploads"))
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list[dict[str, Any]] = []
+    total_added = 0
+    total_skipped = 0
+    total_errors = 0
+
+    for file in files:
+        fname = file.filename or "upload.bin"
+        safe_name = f"{_uuid.uuid4().hex}-{os.path.basename(fname)}"
+        dest = upload_dir / safe_name
+
+        try:
+            # Sauvegarder le fichier
+            content = await file.read()
+            dest.write_bytes(content)
+
+            # Calculer le hash pour déduplication
+            file_hash = hashlib.sha256(content).hexdigest()
+
+            # Vérifier doublon : même hash déjà présent dans ChromaDB
+            target_col = resolve_collection_name(section=hints.get("section"), collection=hints.get("collection"))
+            client = get_chroma_client()
+            collection = client.get_or_create_collection(
+                name=target_col, metadata={"hnsw:space": "cosine"}
+            )
+            existing = collection.get(where={"file_hash": file_hash}) or {}
+            existing_ids = existing.get("ids", []) if existing else []
+            if existing_ids:
+                skipped = len(existing_ids)
+                total_skipped += skipped
+                results.append({
+                    "filename": fname,
+                    "status": "duplicate",
+                    "skipped": skipped,
+                    "detail": "Fichier déjà ingéré (même empreinte de fichier).",
+                })
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                continue
+
+            # Déterminer le type de source
+            ext = dest.suffix.lower()
+            source_type_map: dict[str, str] = {
+                ".pdf": "pdf", ".docx": "docx", ".doc": "docx",
+                ".md": "markdown", ".markdown": "markdown",
+                ".txt": "markdown", ".csv": "markdown",
+                ".html": "url", ".htm": "url",
+                ".jpg": "image", ".jpeg": "image", ".png": "image",
+                ".gif": "image", ".bmp": "image", ".webp": "image",
+                ".mp3": "audio", ".wav": "audio", ".m4a": "audio", ".ogg": "audio",
+                ".flac": "audio", ".aac": "audio",
+                ".mp4": "video", ".avi": "video", ".mkv": "video", ".webm": "video", ".mov": "video",
+            }
+            detected_type = source_type_map.get(ext, "markdown")
+            _validate_upload_mode(detected_type, mode)
+
+            # Déterminer le mode d'ingestion
+            use_mode = mode
+
+            sub_req = IngestRequest(
+                sourceType=cast(Any, detected_type),
+                sourceUrl=str(dest),
+                metadata={**hints, "original_filename": fname, "file_hash": file_hash},
+            )
+
+            if use_mode == "multimodal" and MULTIMODAL_ENABLED:
+                prepared = _prepare_multimodal_ingest(sub_req)
+            else:
+                docs = _load_source_documents(sub_req)
+                if not docs:
+                    results.append({"filename": fname, "status": "empty", "added": 0, "skipped": 0})
+                    continue
+                prepared = _prepare_chunks_for_chroma(sub_req, docs)
+
+            if not prepared.ids:
+                results.append({"filename": fname, "status": "empty", "added": 0, "skipped": 0})
+                continue
+
+            target_col = resolve_collection_name(section=hints.get("section"), collection=hints.get("collection"))
+            result = _index_batch(prepared, detected_type, prepared.modality or "text", collection_name=target_col)
+            added = result.get("added", 0)
+            skipped = result.get("skipped", 0)
+            total_added += added
+            total_skipped += skipped
+            results.append({
+                "filename": fname,
+                "status": "ok",
+                "added": added,
+                "skipped": skipped,
+                "source_type": detected_type,
+            })
+        except HTTPException as exc:
+            total_errors += 1
+            results.append({"filename": fname, "status": "error", "detail": exc.detail})
+        except Exception as exc:
+            total_errors += 1
+            logger.exception("Upload ingestion failed for %s", fname)
+            results.append({"filename": fname, "status": "error", "detail": str(exc)})
+
+    return {
+        "status": "ok",
+        "total_files": len(files),
+        "total_added": total_added,
+        "total_skipped": total_skipped,
+        "total_errors": total_errors,
+        "results": results,
+    }
+
+
+@app.post("/ingest/check-duplicates")
+def check_duplicates(
+    req: DeduplicationCheckRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Vérifie si des sources ont déjà été ingérées pour éviter les doublons."""
+    _enforce_security(request, req)
+
+    target_col = resolve_collection_name(section=req.section, collection=req.collection)
+    client = get_chroma_client()
+    collection = client.get_or_create_collection(
+        name=target_col, metadata={"hnsw:space": "cosine"}
     )
 
-    # Determine source_type from extension if auto
-    if source_type == "auto":
-        ext = Path(filename).suffix.lower()
-        if ext in {".pdf"}:
-            source_type = "pdf"
-        elif ext in {".docx"}:
-            source_type = "docx"
-        elif ext in {".md", ".markdown"}:
-            source_type = "markdown"
-        elif ext in {".mp4", ".webm", ".mkv", ".mov", ".avi", ".mp3", ".wav", ".ogg", ".flac",
-                     ".aac", ".m4a", ".wma"}:
-            source_type = "video"
-        elif ext in {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}:
-            source_type = "image"
-        elif ext in {".txt", ".csv", ".json", ".xml", ".html", ".htm"}:
-            source_type = "auto"
-        else:
-            source_type = "auto"
-
-    _validate_upload_mode(source_type, mode)
-
-    # Write uploaded file to temp, then process
-    suffix = Path(filename).suffix or ".bin"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False, dir="/tmp") as tmp:
-        content = file.file.read()
-        file_hash = hashlib.sha256(content).hexdigest()
-        tmp.write(content)
-        tmp_path = tmp.name
-
-    try:
-        ingest_hints = {
-            **hints,
-            "file_hash": file_hash,
-            "original_filename": filename,
-        }
-        client = get_chroma_client()
-        collection_obj = client.get_or_create_collection(
-            name=target_col, metadata={"hnsw:space": "cosine"}
-        )
-        existing_file = collection_obj.get(where={"file_hash": file_hash}) or {}
-        existing_file_ids = set(existing_file.get("ids", []))
-        if existing_file_ids:
-            _record_ingest_metrics(True)
-            _record_ingest_outcome(source_type, modality_label, "skipped")
-            return {
-                "status": "ok",
-                "added": 0,
-                "skipped": len(existing_file_ids),
-                "filename": filename,
-                "collection": target_col,
-            }
-        req = IngestRequest.model_validate({
-            "source_type": source_type,
-            "source": tmp_path,
-            "hints": ingest_hints,
+    results: list[dict[str, Any]] = []
+    for source in req.sources:
+        source = source.strip()
+        if not source:
+            continue
+        # Vérifier par source path dans les métadonnées
+        try:
+            existing = collection.get(where={"source": source}, limit=1)
+            already_ingested = bool(existing and existing.get("ids"))
+        except Exception:
+            already_ingested = False
+        results.append({
+            "source": source,
+            "already_ingested": already_ingested,
         })
-        mode_normalized = (mode or "multimodal").strip().lower()
 
-        if mode_normalized == "multimodal" or source_type in MEDIA_SOURCE_TYPES:
-            with open(tmp_path, "rb") as handle:
-                chunk_iter = parse_multimodal(
-                    handle,
-                    filename=filename,
-                    mime=mime,
-                    timeout_s=MM_PARSER_TIMEOUT,
-                    max_chars_per_chunk=MM_MAX_CHARS_PER_CHUNK,
-                    cache_dir=MM_CACHE_DIR,
-                )
-                chunk_list = list(chunk_iter)
-            prepared = _prepare_multimodal_chunks(req, chunk_list)
-        else:
-            docs = _load_source_documents(req)
-            if not docs:
-                return {"status": "ok", "message": "Aucun document chargé.", "filename": filename, "collection": target_col}
-            prepared = _prepare_chunks_for_chroma(req, docs)
-
-        modality_label = prepared.modality or "unknown"
-
-        if not prepared.ids:
-            _record_ingest_metrics(True)
-            _record_ingest_outcome(source_type, modality_label, "empty")
-            return {"status": "ok", "message": "Aucun contenu éligible.", "filename": filename, "collection": target_col}
-        prepared, batch_skipped = _dedupe_prepared_batch(prepared)
-
-        existing = collection_obj.get(ids=prepared.ids) or {}
-        existing_ids = set(existing.get("ids", []))
-
-        to_add_idx = [i for i, cid in enumerate(prepared.ids) if cid not in existing_ids]
-
-        if not to_add_idx:
-            _record_ingest_metrics(True)
-            _record_ingest_outcome(source_type, modality_label, "skipped")
-            return {
-                "status": "ok",
-                "added": 0,
-                "skipped": len(existing_ids) + batch_skipped,
-                "filename": filename,
-                "collection": target_col,
-            }
-
-        emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
-        docs_to_add = [prepared.documents[i] for i in to_add_idx]
-        ids_to_add = [prepared.ids[i] for i in to_add_idx]
-        meta_to_add = [prepared.metadatas[i] for i in to_add_idx]
-        try:
-            embs_to_add = emb.embed_documents(docs_to_add)
-        except ValueError as exc:
-            message = str(exc)
-            if "HTTP code: 404" in message:
-                logger.warning(
-                    "Ollama embeddings endpoint returned 404 for model '%s'", EMBED_MODEL
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Modèle d'embedding '{EMBED_MODEL}' non disponible. Vérifiez la configuration.",
-                ) from exc
-            logger.exception("Embedding provider raised ValueError during upload")
-            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
-        except Exception as exc:
-            logger.exception("Unexpected failure while requesting embeddings during upload")
-            raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embeddings") from exc
-
-        meta_mappings = cast(list[Mapping[str, Any]], meta_to_add)
-        embeddings_seq = cast(list[Sequence[float]], embs_to_add)
-        collection_obj.add(
-            documents=docs_to_add,
-            ids=ids_to_add,
-            metadatas=meta_mappings,
-            embeddings=embeddings_seq,
-        )
-        _record_ingest_metrics(True)
-        _record_ingest_outcome(source_type, modality_label, "success")
-        return {
-            "status": "ok",
-            "added": len(ids_to_add),
-            "skipped": (len(prepared.ids) - len(ids_to_add)) + batch_skipped,
-            "filename": filename,
-            "collection": target_col,
-        }
-    except HTTPException:
-        _record_ingest_metrics(False)
-        raise
-    except Exception as exc:
-        _record_ingest_metrics(False)
-        _record_ingest_outcome(source_type, modality_label, "error")
-        logger.exception("Erreur d'ingestion upload pour %s", filename)
-        raise HTTPException(status_code=500, detail="Erreur d'ingestion du fichier uploadé") from exc
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    return {
+        "sources_checked": len(results),
+        "results": results,
+    }
 
 
 @app.get("/health")
 def health_check():
-    """Public health check — no auth required."""
     return {"status": "healthy"}
-
-
-@app.get("/metrics")
-def metrics(request: Request) -> Response:
-    """Prometheus metrics — protected by auth."""
-    _enforce_security(request, None)
-    if not ingest_metrics.METRICS_ENABLED:
-        raise HTTPException(status_code=404, detail="Metrics disabled")
-    body = ingest_metrics.generate_latest(METRIC_REGISTRY)
-    return Response(body, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/collections")
 def list_collections(request: Request) -> dict[str, Any]:
-    """List all ChromaDB collections with document counts."""
-    _enforce_security(request, None)
+    """List all ChromaDB collections with document counts and metadata."""
     try:
         client = get_chroma_client()
         collections_raw = client.list_collections()
         result = []
         for col in collections_raw:
-            name = col.name if hasattr(col, "name") else str(col)
+            name = col.name if hasattr(col, 'name') else str(col)
             try:
                 c = client.get_collection(name)
                 count = c.count()
@@ -1080,38 +1695,60 @@ def list_collections(request: Request) -> dict[str, Any]:
             result.append({"name": name, "count": count})
         return {"collections": result, "total": len(result)}
     except Exception as exc:
-        logger.exception("Error listing collections")
-        raise HTTPException(status_code=500, detail="Erreur listing collections") from exc
+        raise HTTPException(status_code=500, detail=f"Erreur listing collections: {exc}") from exc
 
 
 @app.get("/stats/{collection_name}")
 def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
     """Get statistics for a specific collection."""
-    _enforce_security(request, None)
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(
             name=collection_name, metadata={"hnsw:space": "cosine"}
         )
         count = collection.count()
-        sample_size = min(count, 100)
-        sample = collection.peek(limit=sample_size) if count > 0 else {}
-        metadatas = sample.get("metadatas", []) if sample else []
-
+        # Sample metadata across the full collection to extract unique field values.
+        # peek() only returns the first N rows (by insertion order) which may lack metadata.
+        # Strategy: fetch all IDs then sample up to 2000 evenly spread across the collection.
         unique_matieres: set[str] = set()
         unique_niveaux: set[str] = set()
         unique_groupes: set[str] = set()
         unique_types: set[str] = set()
-        for m in metadatas:
-            if m.get("matiere"):
-                unique_matieres.add(m["matiere"])
-            if m.get("niveau"):
-                unique_niveaux.add(m["niveau"])
-            if m.get("groupe"):
-                unique_groupes.add(m["groupe"])
-            if m.get("type_ressource"):
-                unique_types.add(m["type_ressource"])
-
+        if count > 0:
+            try:
+                # Stratégie multi-passes : on essaie d'abord un filtre sur source_type (chunks enrichis),
+                # puis un peek large en fallback. Ceci évite de charger tous les IDs (timeout sur >100k chunks).
+                _meta_sources: list[dict] = []
+                # Essayer plusieurs source_type connus pour trouver des chunks avec métadonnées riches.
+                # ChromaDB get() ne supporte pas $in — on enchaîne des requêtes exactes.
+                for _where in [
+                    {"source_type": "gdrive_folder"},
+                    {"source_type": "upload"},
+                    {"source_type": "url"},
+                    {"source_type": "pdf"},
+                ]:
+                    try:
+                        _r = collection.get(where=_where, limit=2000, include=["metadatas"])
+                        _found = _r.get("metadatas") or []
+                        _meta_sources.extend(_found)
+                        if len(_meta_sources) >= 2000:
+                            break
+                    except Exception:
+                        continue
+                if not _meta_sources:
+                    # Fallback peek
+                    _r2 = collection.peek(limit=500)
+                    _meta_sources = _r2.get("metadatas") or []
+                for m in _meta_sources:
+                    if not m:
+                        continue
+                    if m.get("matiere"): unique_matieres.add(m["matiere"])
+                    if m.get("niveau"): unique_niveaux.add(m["niveau"])
+                    if m.get("groupe"): unique_groupes.add(m["groupe"])
+                    if m.get("type_ressource"): unique_types.add(m["type_ressource"])
+            except Exception:
+                pass
+        
         return {
             "collection": collection_name,
             "doc_count": count,
@@ -1122,53 +1759,55 @@ def collection_stats(collection_name: str, request: Request) -> dict[str, Any]:
             "types_ressource": sorted(unique_types),
         }
     except Exception as exc:
-        logger.exception("Error getting stats for %s", collection_name)
-        raise HTTPException(status_code=500, detail="Erreur stats collection") from exc
+        raise HTTPException(status_code=500, detail=f"Erreur stats collection: {exc}") from exc
 
 
-class SearchRequest(BaseModel):
-    """Search request model with metadata filters."""
-    model_config = ConfigDict(extra="ignore")
-    q: str
-    k: int = Field(default=6, ge=1, le=50)
-    section: str | None = None
-    collection: str | None = None
-    filters: dict[str, Any] | None = None
-    include_documents: bool = True
-    score_threshold: float | None = Field(default=None, ge=0.0)
+@app.get("/metrics")
+def metrics() -> Response:
+    if not ingest_metrics.METRICS_ENABLED:
+        raise HTTPException(status_code=404, detail="Metrics disabled")
+    body = ingest_metrics.generate_latest(METRIC_REGISTRY)
+    return Response(body, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/search")
 def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
-    """Semantic search with optional metadata filters."""
+    # AuthN/AuthZ identical to ingestion
     _enforce_security(request, payload)
 
-    target_col = resolve_collection_name(section=payload.section, collection=payload.collection)
+    # Resolve collection from section or explicit name
+    target_col = resolve_collection_name(section=payload.section, collection=payload.collection or None)
 
+    # Prepare chroma collection
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(name=target_col, metadata={"hnsw:space": "cosine"})
-    except Exception as exc:
-        logger.exception("Chroma client error during search")
-        raise HTTPException(status_code=500, detail="Erreur de connexion à la base vectorielle") from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
 
+    # Compute query embedding using the same provider as indexing
     try:
         emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
         q_vec = emb.embed_query(payload.q)
     except ValueError as exc:
         message = str(exc)
         if "HTTP code: 404" in message:
+            logger.warning("Ollama embeddings endpoint returned 404 for model '%s' (search)", EMBED_MODEL)
             raise HTTPException(
                 status_code=503,
-                detail=f"Embedding model '{EMBED_MODEL}' is not available. Pull the model or adjust EMBED_MODEL.",
+                detail=(
+                    f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                    "Pull the model or adjust EMBED_MODEL before retrying."
+                ),
             ) from exc
-        logger.exception("Embedding error during search")
-        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
-    except Exception as exc:
-        logger.exception("Unexpected embedding failure during search")
-        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
+        logger.exception("Embedding provider raised ValueError during search")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {message}") from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure while requesting embeddings (search)")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {exc}") from exc
 
-    # Build metadata filters for ChromaDB
+    # Build metadata filters from payload.filters
+    # ChromaDB requires $and operator when multiple conditions are present
     where: dict[str, Any] = {}
     if payload.filters:
         conditions = []
@@ -1180,15 +1819,15 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
+    # Query by embedding
     try:
         n_results = max(1, min(int(payload.k), 50))
         query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": n_results}
         if where:
             query_kwargs["where"] = where
         results = collection.query(**query_kwargs)
-    except Exception as exc:
-        logger.exception("Chroma query error")
-        raise HTTPException(status_code=500, detail="Erreur de recherche") from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
 
     documents = results.get("documents", [[]])[0] if results.get("documents") else []
     metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
@@ -1211,7 +1850,7 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
             item["score"] = distance
         hits.append(item)
 
-    _record_ingest_outcome("search", "text", "success")
+    _record_ingest_outcome("search", "text", "success")  # reuse metric surface for visibility
     return {
         "query": payload.q,
         "collection": target_col,
@@ -1224,47 +1863,53 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
 
 
 class RagQueryFilters(BaseModel):
-    domain: str | None = None
-    document_id: str | None = None
-    tags: list[str] | None = None
-    metadata: dict[str, Any] | None = None
+    domain: Optional[str] = None
+    document_id: Optional[str] = None
+    tags: Optional[list[str]] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class RagQuery(BaseModel):
     query: str
-    filters: RagQueryFilters | None = None
+    filters: Optional[RagQueryFilters] = None
     top_k: int = Field(default=6, ge=1, le=50)
     collection: str = Field(default=COLLECTION_NAME)
 
 
 @app.post("/rag/query")
 def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
-    """RAG query with domain/tags/metadata filters."""
+    # AuthN/AuthZ identical to ingestion
     _enforce_security(request, payload)
 
+    # Prepare chroma collection
     try:
         client = get_chroma_client()
         collection = client.get_or_create_collection(name=payload.collection, metadata={"hnsw:space": "cosine"})
-    except Exception as exc:
-        logger.exception("Chroma client error during rag/query")
-        raise HTTPException(status_code=500, detail="Erreur de connexion à la base vectorielle") from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
 
+    # Compute query embedding using the same provider as indexing
     try:
         emb = TimedOllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_URL, request_timeout=OLLAMA_REQUEST_TIMEOUT)
         q_vec = emb.embed_query(payload.query)
     except ValueError as exc:
         message = str(exc)
         if "HTTP code: 404" in message:
+            logger.warning("Ollama embeddings endpoint returned 404 for model '%s' (rag/query)", EMBED_MODEL)
             raise HTTPException(
                 status_code=503,
-                detail=f"Embedding model '{EMBED_MODEL}' is not available. Pull the model or adjust EMBED_MODEL.",
+                detail=(
+                    f"Embedding model '{EMBED_MODEL}' is not available on the Ollama backend. "
+                    "Pull the model or adjust EMBED_MODEL before retrying."
+                ),
             ) from exc
-        logger.exception("Embedding error during rag/query")
-        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
-    except Exception as exc:
-        logger.exception("Unexpected embedding failure during rag/query")
-        raise HTTPException(status_code=500, detail="Erreur lors du calcul d'embedding") from exc
+        logger.exception("Embedding provider raised ValueError during rag/query")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {message}") from exc
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Unexpected failure while requesting embeddings (rag/query)")
+        raise HTTPException(status_code=500, detail=f"Embedding error: {exc}") from exc
 
+    # Build metadata filters (where)
     where: dict[str, Any] = {}
     if payload.filters:
         f = payload.filters
@@ -1275,19 +1920,20 @@ def rag_query(payload: RagQuery, request: Request) -> dict[str, Any]:
         if f.tags:
             where["tags"] = {"$in": f.tags}
         if f.metadata:
-            for k, v in f.metadata.items():
-                if v is not None and v != "":
-                    where[str(k)] = v
+            for k, v in (f.metadata or {}).items():
+                if v is None or v == "":
+                    continue
+                where[str(k)] = v
 
+    # Query by embedding with optional filters
     try:
         n_results = max(1, min(int(payload.top_k), 50))
         query_kwargs: dict[str, Any] = {"query_embeddings": [q_vec], "n_results": n_results}
         if where:
             query_kwargs["where"] = where
         results = collection.query(**query_kwargs)
-    except Exception as exc:
-        logger.exception("Chroma query error during rag/query")
-        raise HTTPException(status_code=500, detail="Erreur de recherche") from exc
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=f"Chroma query error: {exc}") from exc
 
     documents = results.get("documents", [[]])[0] if results.get("documents") else []
     metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
