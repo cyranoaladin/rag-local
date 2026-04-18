@@ -112,7 +112,9 @@ class EmbeddingService:
                 cached = await self._redis.get(cache_key)
                 if cached:
                     self._cache_hits += 1
-                    return json.loads(cached)
+                    parsed = json.loads(cached)
+                    if isinstance(parsed, list) and all(isinstance(x, int | float) for x in parsed):
+                        return [float(x) for x in parsed]
             except Exception:
                 pass
 
@@ -132,7 +134,11 @@ class EmbeddingService:
                 f"Pull it with: ollama pull {self.model}"
             )
         resp.raise_for_status()
-        embedding = resp.json()["embedding"]
+        data = resp.json()
+        embedding_any = data.get("embedding") if isinstance(data, dict) else None
+        if not (isinstance(embedding_any, list) and all(isinstance(x, int | float) for x in embedding_any)):
+            raise RuntimeError("Ollama returned an invalid embedding payload")
+        embedding = [float(x) for x in embedding_any]
 
         # Mettre en cache
         if self._redis:
@@ -193,12 +199,12 @@ class EmbeddingService:
         return results
 
     @property
-    def cache_stats(self) -> dict[str, int]:
+    def cache_stats(self) -> dict[str, float]:
         """Retourne les statistiques de cache."""
         total = self._cache_hits + self._cache_misses
         return {
-            "hits": self._cache_hits,
-            "misses": self._cache_misses,
-            "total": total,
-            "hit_rate_pct": round(self._cache_hits / total * 100, 1) if total else 0,
+            "hits": float(self._cache_hits),
+            "misses": float(self._cache_misses),
+            "total": float(total),
+            "hit_rate_pct": round(self._cache_hits / total * 100, 1) if total else 0.0,
         }

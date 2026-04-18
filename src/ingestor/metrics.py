@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
 
@@ -157,7 +157,7 @@ F = TypeVar("F", bound=Callable[..., object])
 
 
 def _guarded(func: F) -> F:
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: Any, **kwargs: Any) -> object | None:
         if not METRICS_ENABLED:
             return None
         return func(*args, **kwargs)

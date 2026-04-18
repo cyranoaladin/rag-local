@@ -9,7 +9,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
 import asyncpg
 
@@ -263,11 +263,11 @@ class RagDatabase:
         """Supprime un document et ses chunks (CASCADE)."""
         doc_uuid = uuid.UUID(document_id)
         async with self.acquire() as conn:
-            result = await conn.execute(
+            result = cast(str, await conn.execute(
                 "DELETE FROM rag_documents WHERE id = $1 AND tenant = $2",
                 doc_uuid,
                 tenant,
-            )
+            ))
             return result == "DELETE 1"
 
     async def get_stats(self, tenant: str) -> dict[str, Any]:

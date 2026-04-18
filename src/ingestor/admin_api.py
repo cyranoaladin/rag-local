@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any, Optional
 
 import requests
@@ -31,7 +32,7 @@ _audit = audit_logger.get_audit_logger()
 
 def _get_client_ip(request: Request) -> str:
     """Extract client IP from request headers."""
-    headers = request.headers or {}
+    headers: Mapping[str, str] = request.headers
     forwarded = headers.get("X-Forwarded-For") or headers.get("x-forwarded-for")
     if isinstance(forwarded, str) and forwarded.strip():
         return forwarded.split(",")[0].strip()
@@ -42,7 +43,7 @@ def _get_client_ip(request: Request) -> str:
 
 def _get_request_id(request: Request) -> Optional[str]:
     """Extract request ID from headers for tracing."""
-    headers = request.headers or {}
+    headers: Mapping[str, str] = request.headers
     return headers.get("X-Request-ID") or headers.get("x-request-id")
 
 
@@ -148,7 +149,7 @@ def list_documents(request: Request, domain: Optional[str] = Query(default=None)
         action=audit_logger.AuditAction.DOCUMENT_LIST,
         client_ip=client_ip,
         resource_type="document",
-        details={"domain_filter": domain, "count": len(docs.get("documents", []))},
+        details={"domain_filter": domain, "count": len(docs)},
         request_id=request_id,
     )
     

@@ -198,9 +198,7 @@ def _read_payload(stream: BinaryIO, timeout_s: float) -> tuple[bytes, bool]:
         chunk = stream.read(8192)
         if not chunk:
             break
-        if not isinstance(chunk, (bytes, bytearray)):  # noqa: UP038 - keep Py3.9-compatible isinstance tuple
-            chunk = bytes(chunk)
-        parts.append(bytes(chunk))
+        parts.append(chunk if isinstance(chunk, bytes) else bytes(chunk))
     duration = time.perf_counter() - start
     timed_out = bool(timeout_s and duration > timeout_s)
     _rewind(stream)

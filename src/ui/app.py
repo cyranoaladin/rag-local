@@ -18,7 +18,11 @@ from chromadb.config import Settings
 CHROMA_HOST = os.getenv("CHROMA_HOST", "chroma")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 COLLECTION = "ressources_pedagogiques_terminale"
-INGEST_BASE_URL = os.getenv("INGEST_API_BASE") or os.getenv("INGEST_BASE_URL", "http://ingestor:8001")
+INGEST_BASE_URL: str = (
+    os.getenv("INGEST_API_BASE")
+    or os.getenv("INGEST_BASE_URL")
+    or "http://ingestor:8001"
+)
 INGEST_API_TOKEN = os.getenv("INGEST_API_TOKEN") or os.getenv("INGESTOR_API_TOKEN", "")
 INGEST_AUTH_HEADER = os.getenv("INGEST_AUTH_HEADER", os.getenv("UI_INGEST_AUTH_HEADER", "Authorization"))
 UI_INGEST_AUTH_BEARER_PREFIX = (
@@ -103,7 +107,8 @@ def _chromadb_collection():
 @st.cache_data(ttl=30, show_spinner=False)
 def _collection_count() -> int:
     """Get collection document count with caching."""
-    return _chromadb_collection().count()
+    from typing import cast
+    return cast(int, _chromadb_collection().count())
 
 
 def _query_chroma(collection, query_text: str, n_results: int):
@@ -132,7 +137,8 @@ def _call_ingest_api(
         timeout=timeout or INGEST_TIMEOUT,
     )
     response.raise_for_status()
-    return response.json()
+    from typing import cast
+    return cast(dict[str, Any], response.json())
 
 
 # ═══════════════════════════════════════════════════════════════════

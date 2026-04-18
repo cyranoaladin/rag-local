@@ -36,8 +36,8 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 try:
     from .drive_sync import DriveSyncManager
-except ImportError:
-    from drive_sync import DriveSyncManager
+except (ImportError, ValueError):
+    from drive_sync import DriveSyncManager  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     from langchain.schema import Document
@@ -94,7 +94,7 @@ COLLECTION_MAP: dict[str, str] = {
 def resolve_collection_name(section: str | None = None, collection: str | None = None) -> str:
     """Resolve the ChromaDB collection name from section or explicit collection name."""
     if collection and collection.strip():
-        return collection.strip()
+        return collection.strip().lower()
     sec = (section or "default").strip().lower()
     return COLLECTION_MAP.get(sec, COLLECTION_MAP["default"])
 
@@ -518,7 +518,7 @@ class TimedOllamaEmbeddings(OllamaEmbeddings):
             )
         try:
             t = res.json()
-            return t["embedding"]
+            return cast(list[float], t["embedding"])
         except requests.exceptions.JSONDecodeError as e:
             raise ValueError(
                 f"Error raised by inference API: {e}.\nResponse: {res.text}"
@@ -547,7 +547,8 @@ def _validate_remote_url(url: str) -> None:
         raise HTTPException(
             status_code=400, detail="Schéma d'URL non autorisé")
     if not parsed.hostname:
-        raise HTTPException(status_code=400, detail="URL invalide")
+        raise HTTPException(
+            status_code=400, detail="URL invalide")
     try:
         addr_info = socket.getaddrinfo(parsed.hostname, parsed.port or (
             443 if parsed.scheme == "https" else 80))
@@ -621,7 +622,7 @@ def _fetch_remote_text(url: str) -> tuple[str, str]:
             status_code=400, detail=f"Téléchargement impossible: {exc}") from exc
 
 
-def load_from_url(url: str):
+def load_from_url(url: str) -> list[Document]:
     if url.lower().endswith(".pdf"):
         tmp_path = _download_to_temp(url, suffix=".pdf")
         try:
@@ -756,7 +757,7 @@ def _load_source_documents(req: IngestRequest) -> list[Document]:
             _lazy = getattr(loader, "lazy_load", None)
             if callable(_lazy):
                 _result = _lazy()
-                _iterable: list[Any] = list(_result) if hasattr(_result, "__iter__") else []  # type: ignore[arg-type]
+                _iterable: list[Any] = list(_result) if hasattr(_result, "__iter__") else []
                 for _d in _iterable:
                     try:
                         if _d and getattr(_d, "page_content", "").strip():
@@ -1187,19 +1188,19 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False, dir="/tmp") as tf:
                             tf.write(content_bytes)
                             tmp_doc = tf.name
-                        result = subprocess.run(
+                        conv_res = subprocess.run(
                             ["libreoffice", "--headless", "--convert-to", "docx", "--outdir", "/tmp", tmp_doc],
                             capture_output=True, timeout=60
                         )
                         tmp_docx = tmp_doc.replace(".doc", ".docx")
-                        if result.returncode == 0 and Path(tmp_docx).exists():
+                        if conv_res.returncode == 0 and Path(tmp_docx).exists():
                             docs = load_docx(tmp_docx)
                             Path(tmp_doc).unlink(missing_ok=True)
                             Path(tmp_docx).unlink(missing_ok=True)
                             logger.info(f"[{task_id}] .doc converted via libreoffice: {fname}")
                         else:
                             Path(tmp_doc).unlink(missing_ok=True)
-                            raise RuntimeError(f"libreoffice conversion failed: {result.stderr.decode()[:200]}")
+                            raise RuntimeError(f"libreoffice conversion failed: {conv_res.stderr.decode()[:200]}")
                     except Exception as _e:
                         logger.warning(f"[{task_id}] .doc conversion failed for {fid}: {_e}")
                         docs = []
@@ -1298,9 +1299,9 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
 
                 # Index
                 try:
-                    result = _index_batch(prepared, "gdrive_folder", "text", collection_name=target_col)
-                    added = result.get("added", 0)
-                    skipped = result.get("skipped", 0)
+                    batch_res = _index_batch(prepared, "gdrive_folder", "text", collection_name=target_col)
+                    added = batch_res.get("added", 0)
+                    skipped = batch_res.get("skipped", 0)
                     task.added_chunks += added
                     if added == 0 and skipped > 0:
                         task.skipped_files += 1

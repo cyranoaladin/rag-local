@@ -2,7 +2,7 @@ import logging
 import os
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -66,11 +66,11 @@ class DriveSyncManager:
         """Vérifie que le SA peut accéder au dossier. Lève une exception explicite sinon."""
         service = self._get_drive_service()
         try:
-            meta = service.files().get(
+            meta = cast(dict[str, Any], service.files().get(
                 fileId=folder_id,
                 supportsAllDrives=True,
                 fields="id,name,mimeType",
-            ).execute()
+            ).execute())
             logger.info(f"Folder access OK: {meta.get('name')} ({folder_id})")
             return meta
         except HttpError as e:
@@ -88,8 +88,12 @@ class DriveSyncManager:
             import json
             path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
             if path and Path(path).exists():
-                with open(path) as f:
-                    return json.load(f).get("client_email", "<service-account>")
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    email = data.get("client_email")
+                    if isinstance(email, str) and email:
+                        return email
         except Exception:
             pass
         return "<service-account>"
