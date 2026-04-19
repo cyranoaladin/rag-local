@@ -387,3 +387,12 @@ def test_collections_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
 
     response = client.get("/collections")
     assert response.status_code == 401
+
+
+def test_stats_requires_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /stats/{collection} requires authentication."""
+    api = reload_api(monkeypatch, token="stats-secret")
+    client = TestClient(api.app)
+
+    response = client.get("/stats/rag_education")
+    assert response.status_code == 401

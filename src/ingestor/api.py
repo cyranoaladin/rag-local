@@ -90,6 +90,12 @@ COLLECTION_MAP: dict[str, str] = {
     "default": "rag_education",
 }
 
+MATHS_PREMIERE_FALLBACK_FILTERS: dict[str, str] = {
+    "matiere": "Mathématiques",
+    "niveau": "Première",
+    "groupe": "Enseignements de spécialité (EDS)",
+}
+
 
 def resolve_collection_name(section: str | None = None, collection: str | None = None) -> str:
     """Resolve the ChromaDB collection name from section or explicit collection name."""
@@ -97,6 +103,33 @@ def resolve_collection_name(section: str | None = None, collection: str | None =
         return collection.strip().lower()
     sec = (section or "default").strip().lower()
     return COLLECTION_MAP.get(sec, COLLECTION_MAP["default"])
+
+
+def _resolve_search_target(
+    client: Any,
+    payload: SearchRequest,
+) -> tuple[str, dict[str, Any], bool]:
+    """Resolve the collection and effective filters for a search request."""
+    requested_collection = resolve_collection_name(
+        section=payload.section,
+        collection=payload.collection or None,
+    )
+    effective_filters = dict(payload.filters)
+    maths_fallback_applied = False
+
+    if (payload.section or "").strip().lower() != "maths_premiere":
+        return requested_collection, effective_filters, maths_fallback_applied
+
+    dedicated_collection = client.get_or_create_collection(
+        name=COLLECTION_MAP["maths_premiere"],
+        metadata={"hnsw:space": "cosine"},
+    )
+    if dedicated_collection.count() > 0:
+        return requested_collection, effective_filters, maths_fallback_applied
+
+    effective_filters.update(MATHS_PREMIERE_FALLBACK_FILTERS)
+    maths_fallback_applied = True
+    return COLLECTION_MAP["education"], effective_filters, maths_fallback_applied
 
 CHROMA_REQUEST_TIMEOUT = float(os.getenv("CHROMA_REQUEST_TIMEOUT", "30"))
 OLLAMA_REQUEST_TIMEOUT = float(os.getenv("OLLAMA_REQUEST_TIMEOUT", "30"))
@@ -1799,12 +1832,10 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
     _require_api_token_configured()
     _enforce_security(request, payload)
 
-    # Resolve collection from section or explicit name
-    target_col = resolve_collection_name(section=payload.section, collection=payload.collection or None)
-
     # Prepare chroma collection
     try:
         client = get_chroma_client()
+        target_col, effective_filters, maths_fallback_applied = _resolve_search_target(client, payload)
         collection = client.get_or_create_collection(name=target_col, metadata={"hnsw:space": "cosine"})
     except Exception as exc:  # pragma: no cover - defensive
         raise HTTPException(status_code=500, detail=f"Chroma client error: {exc}") from exc
@@ -1833,9 +1864,9 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
     # Build metadata filters from payload.filters
     # ChromaDB requires $and operator when multiple conditions are present
     where: dict[str, Any] = {}
-    if payload.filters:
+    if effective_filters:
         conditions = []
-        for fk, fv in payload.filters.items():
+        for fk, fv in effective_filters.items():
             if fv is not None and fv != "" and fv != "Tous":
                 conditions.append({str(fk): fv})
         if len(conditions) == 1:
@@ -1882,6 +1913,7 @@ def search_kb(payload: SearchRequest, request: Request) -> dict[str, Any]:
         "returned": len(hits),
         "filters_applied": where,
         "score_threshold": payload.score_threshold,
+        "maths_premiere_fallback": maths_fallback_applied,
         "hits": hits,
     }
 

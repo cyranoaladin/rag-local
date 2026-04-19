@@ -301,6 +301,73 @@ def test_search_omits_documents_when_not_requested(monkeypatch: pytest.MonkeyPat
     ]
 
 
+def test_search_maths_premiere_falls_back_to_education(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="search-token")
+
+    class FakeCollection:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def count(self) -> int:
+            if self.name == "rag_maths_premiere":
+                return 0
+            return 10377
+
+        def query(self, **kwargs):
+            assert kwargs["where"] == {
+                "$and": [
+                    {"type_ressource": "Exercices"},
+                    {"matiere": "Mathématiques"},
+                    {"niveau": "Première"},
+                    {"groupe": "Enseignements de spécialité (EDS)"},
+                ]
+            }
+            return {
+                "documents": [["suite"]],
+                "metadatas": [[{"source": "suites.pdf"}]],
+                "ids": [["hit-maths"]],
+                "distances": [[0.11]],
+            }
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.requested_names: list[str] = []
+
+        def get_or_create_collection(self, name: str, **_kwargs):
+            self.requested_names.append(name)
+            return FakeCollection(name)
+
+    class FakeEmbeddings:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def embed_query(self, _query):
+            return [0.1, 0.2, 0.3]
+
+    fake_client = FakeClient()
+    monkeypatch.setattr(api, "get_chroma_client", lambda: fake_client)
+    monkeypatch.setattr(api, "TimedOllamaEmbeddings", FakeEmbeddings)
+
+    client = TestClient(api.app)
+    response = client.post(
+        "/search",
+        headers={"X-API-Token": "search-token"},
+        json={
+            "q": "suites",
+            "k": 5,
+            "section": "maths_premiere",
+            "filters": {"type_ressource": "Exercices"},
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["collection"] == "rag_education"
+    assert payload["maths_premiere_fallback"] is True
+    assert payload["returned"] == 1
+    assert fake_client.requested_names == ["rag_maths_premiere", "rag_education"]
+
+
 def test_upload_media_requires_explicit_multimodal_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

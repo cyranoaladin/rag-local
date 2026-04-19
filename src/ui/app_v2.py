@@ -684,12 +684,23 @@ elif page == "🎓 Éducation":
 # ═══════════════════════════════════════════════════════════════
 elif page == "📐 Maths 1ère":
     st.title("📐 Maths Première — Spécialité")
+    maths_stats = api_get("/stats/rag_maths_premiere") or {}
+    maths_fallback_active = maths_stats.get("doc_count", 0) == 0
     st.markdown(
         "Collection dédiée **Mathématiques Première** (spécialité). "
-        "Tous les documents ingici sont indexés dans **`rag_maths_premiere`**, "
-        "collection isolée pour des résultats de recherche plus pertinents. "
-        "Elle est aussi incluse dans la recherche **Toutes** multi-collection."
+        "Les nouveaux documents ingérés ici sont indexés dans **`rag_maths_premiere`**."
     )
+    if maths_fallback_active:
+        st.warning(
+            "La collection dédiée est actuellement vide. Les recherches **Maths 1ère** "
+            "basculent temporairement sur **`rag_education`** avec les filtres "
+            "`Mathématiques / Première / Enseignements de spécialité (EDS)`."
+        )
+    else:
+        st.info(
+            "La recherche **Maths 1ère** utilise la collection dédiée "
+            "**`rag_maths_premiere`**."
+        )
 
     st.subheader("📂 Type de ressource")
     col_t, col_d = st.columns(2)
@@ -730,14 +741,18 @@ elif page == "📐 Maths 1ère":
 
     st.markdown("---")
     with st.expander("📊 Statistiques collection Maths 1ère", expanded=False):
-        stats = api_get("/stats/rag_maths_premiere")
-        if stats:
+        if maths_stats:
             c1, c2, c3 = st.columns(3)
-            c1.metric("Chunks", stats.get("doc_count", 0))
-            c2.metric("Types", len(stats.get("types_ressource", [])))
-            c3.metric("Embedding", stats.get("embed_model", "?"))
-            if stats.get("types_ressource"):
-                st.write(f"**Types** : {', '.join(stats['types_ressource'])}")
+            c1.metric("Chunks", maths_stats.get("doc_count", 0))
+            c2.metric("Types", len(maths_stats.get("types_ressource", [])))
+            c3.metric("Embedding", maths_stats.get("embed_model", "?"))
+            if maths_stats.get("types_ressource"):
+                st.write(f"**Types** : {', '.join(maths_stats['types_ressource'])}")
+            if maths_fallback_active:
+                st.caption(
+                    "Fallback actif: la recherche Maths 1ère est servie par "
+                    "`rag_education` avec filtres métier tant que cette collection reste vide."
+                )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -895,7 +910,11 @@ elif page == "🔍 Recherche":
                 filters["type_ressource"] = f_type
     elif search_section == "📐 Maths 1ère":
         section_key = "maths_premiere"
-        collection_key = "rag_maths_premiere"
+        collection_key = ""
+        st.caption(
+            "Recherche ciblée Maths 1ère. Si la collection dédiée est vide, "
+            "l'API bascule automatiquement sur `rag_education` avec les filtres adéquats."
+        )
     elif search_section == "🎓 Éducation":
         section_key = "education"
         collection_key = "rag_education"
@@ -933,11 +952,16 @@ elif page == "🔍 Recherche":
                 all_hits: list[dict[str, Any]] = []
                 searched_cols: list[str] = []
                 for col_name in ALL_COLLECTIONS:
+                    search_collection = col_name
+                    search_section = ""
+                    if col_name == "rag_maths_premiere":
+                        search_collection = ""
+                        search_section = "maths_premiere"
                     payload_col = _build_search_payload(
                         query=query,
                         k=k,
-                        collection=col_name,
-                        section="",
+                        collection=search_collection,
+                        section=search_section,
                         filters={},
                         score_threshold=score_threshold if use_score_threshold else None,
                     )
