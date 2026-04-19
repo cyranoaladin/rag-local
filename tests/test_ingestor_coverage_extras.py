@@ -490,6 +490,42 @@ def test_prepare_multimodal_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(batch.ids) == 2 and batch.modality in {"image", "text"}
 
 
+def test_extract_pdf_documents_from_bytes_falls_back_to_ocr(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+
+    class _Page:
+        def extract_text(self) -> str:
+            return ""
+
+    class _Pdf:
+        pages = [_Page()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(api.pdfplumber, "open", lambda *_args, **_kwargs: _Pdf())
+    monkeypatch.setattr(api, "_ocr_pdf_bytes", lambda *_args, **_kwargs: ["Texte OCR page 1"])
+
+    docs = api._extract_pdf_documents_from_bytes(b"%PDF-1.4", "scan.pdf")
+
+    assert len(docs) == 1
+    assert docs[0].page_content == "Texte OCR page 1"
+    assert docs[0].metadata["source"] == "scan.pdf"
+
+
+def test_documents_have_text_ignores_blank_documents(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = _reload_api(monkeypatch)
+    blank_doc = api.Document(page_content="   ", metadata={})
+    text_doc = api.Document(page_content="Texte utile", metadata={})
+
+    assert api._documents_have_text([]) is False
+    assert api._documents_have_text([blank_doc]) is False
+    assert api._documents_have_text([blank_doc, text_doc]) is True
+
+
 def test_load_markdown_empty_and_unreadable(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     api = _reload_api(monkeypatch)
     # empty file

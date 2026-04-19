@@ -14,6 +14,7 @@ _DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
+
 class DriveSyncManager:
     def __init__(self, db_path: str = "drive_sync_state.db"):
         # Use an absolute path for the DB to avoid CWD issues
@@ -98,7 +99,15 @@ class DriveSyncManager:
             pass
         return "<service-account>"
 
-    def list_updates(self, folder_id: str) -> list[dict[str, Any]]:
+    def _sync_key(self, file_id: str | None, collection_name: str | None = None) -> str:
+        """Return the storage key used in the sync DB for a given collection."""
+        normalized_file_id = str(file_id or "").strip()
+        normalized_collection = str(collection_name or "").strip().lower()
+        if not normalized_collection or normalized_collection == "rag_education":
+            return normalized_file_id
+        return f"{normalized_collection}:{normalized_file_id}"
+
+    def list_updates(self, folder_id: str, collection_name: str | None = None) -> list[dict[str, Any]]:
         """
         List files in folder (recursively) that are new or modified since last ingestion.
         Raises PermissionError if the folder is not accessible by the service account.
@@ -114,9 +123,10 @@ class DriveSyncManager:
                     file_id = f.get("id")
                     modified_time = f.get("modifiedTime")
                     drive_md5 = f.get("md5Checksum")
+                    sync_key = self._sync_key(file_id, collection_name)
                     cursor.execute(
                         "SELECT modified_time, md5_checksum FROM drive_files WHERE file_id = ?",
-                        (file_id,),
+                        (sync_key,),
                     )
                     row = cursor.fetchone()
                     if not row:
@@ -181,11 +191,19 @@ class DriveSyncManager:
         logger.info(f"Drive scan found {len(files)} files in folder tree {folder_id}")
         return files
 
-    def is_unchanged(self, file_meta: dict[str, Any], content_fingerprint: str = "") -> bool:
+    def is_unchanged(
+        self,
+        file_meta: dict[str, Any],
+        content_fingerprint: str = "",
+        collection_name: str | None = None,
+    ) -> bool:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT modified_time, md5_checksum, content_fingerprint FROM drive_files WHERE file_id = ?", (file_meta.get("id"),))
+                cursor.execute(
+                    "SELECT modified_time, md5_checksum, content_fingerprint FROM drive_files WHERE file_id = ?",
+                    (self._sync_key(file_meta.get("id"), collection_name),),
+                )
                 row = cursor.fetchone()
                 if not row:
                     return False
@@ -200,14 +218,19 @@ class DriveSyncManager:
             logger.error(f"Failed to compare file fingerprint: {e}")
             return False
 
-    def mark_as_ingested(self, file_meta: dict[str, Any], content_fingerprint: str = ""):
+    def mark_as_ingested(
+        self,
+        file_meta: dict[str, Any],
+        content_fingerprint: str = "",
+        collection_name: str | None = None,
+    ):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
                     INSERT OR REPLACE INTO drive_files (file_id, name, modified_time, md5_checksum, content_fingerprint)
                     VALUES (?, ?, ?, ?, ?)
                 """, (
-                    file_meta.get("id"),
+                    self._sync_key(file_meta.get("id"), collection_name),
                     file_meta.get("name"),
                     file_meta.get("modifiedTime"),
                     file_meta.get("md5Checksum"),
