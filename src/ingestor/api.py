@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib
 import importlib.util
 import ipaddress
@@ -579,6 +580,84 @@ def load_markdown(file_path: Path) -> list[Document]:
 
     metadata = {"source": str(file_path), "mime_type": "text/markdown"}
     return [Document(page_content=text, metadata=metadata)]
+
+
+def _ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 5) -> list[str]:
+    """OCR a PDF by rendering a bounded number of pages to images first."""
+    if not pdf_bytes:
+        return []
+
+    try:
+        import subprocess
+
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        return []
+
+    texts: list[str] = []
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+        pdf_path = Path(tmpdir) / "input.pdf"
+        pdf_path.write_bytes(pdf_bytes)
+        output_prefix = Path(tmpdir) / "page"
+        subprocess.run(
+            [
+                "pdftoppm",
+                "-png",
+                "-r",
+                "200",
+                "-f",
+                "1",
+                "-l",
+                str(max(1, max_pages)),
+                str(pdf_path),
+                str(output_prefix),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        for image_path in sorted(Path(tmpdir).glob("page-*.png")):
+            with Image.open(image_path) as image:
+                try:
+                    text = pytesseract.image_to_string(image, lang="fra+eng")
+                except Exception:
+                    text = pytesseract.image_to_string(image, lang="eng")
+            cleaned = (text or "").strip()
+            if cleaned:
+                texts.append(cleaned)
+    return texts
+
+
+def _extract_pdf_documents_from_bytes(pdf_bytes: bytes, source_name: str) -> list[Document]:
+    """Extract per-page PDF documents, using OCR only when text extraction is empty."""
+    docs: list[Document] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_doc:
+        for page_index, page in enumerate(pdf_doc.pages):
+            text = (page.extract_text() or "").strip()
+            if text:
+                docs.append(
+                    Document(
+                        page_content=text,
+                        metadata={"source": source_name, "page": page_index},
+                    )
+                )
+    if docs:
+        return docs
+
+    for page_index, text in enumerate(_ocr_pdf_bytes(pdf_bytes)):
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={"source": source_name, "page": page_index, "ocr": "true"},
+            )
+        )
+    return docs
+
+
+def _documents_have_text(docs: list[Any]) -> bool:
+    """Return True when at least one loaded document has non-empty text content."""
+    return any((getattr(doc, "page_content", "") or "").strip() for doc in docs)
 
 
 def _validate_remote_url(url: str) -> None:
@@ -1252,6 +1331,19 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                     try:
                         loader = GoogleDriveLoader(**kwargs)
                         docs = loader.load()
+                        if not _documents_have_text(docs) and mime_type == "application/pdf":
+                            from google.oauth2 import service_account as _sa2
+                            from googleapiclient.discovery import build as _build2
+
+                            _creds_path2 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+                            _creds2 = _sa2.Credentials.from_service_account_file(
+                                _creds_path2, scopes=["https://www.googleapis.com/auth/drive.readonly"]
+                            )
+                            _svc2 = _build2("drive", "v3", credentials=_creds2, cache_discovery=False)
+                            pdf_bytes = _svc2.files().get_media(fileId=fid).execute()
+                            docs = _extract_pdf_documents_from_bytes(pdf_bytes, fname)
+                            if docs:
+                                logger.info(f"[{task_id}] pdf/OCR fallback OK after empty loader result: {fname}")
                     except Exception as e:
                         error_detail = str(e)
                         # Fallback pdfplumber pour PDFs corrompus (EOF marker not found)
@@ -1260,28 +1352,17 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                             try:
                                 from google.oauth2 import service_account as _sa2
                                 from googleapiclient.discovery import build as _build2
-                                from langchain.schema import Document as _Doc2
                                 _creds_path2 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
                                 _creds2 = _sa2.Credentials.from_service_account_file(
                                     _creds_path2, scopes=["https://www.googleapis.com/auth/drive.readonly"]
                                 )
                                 _svc2 = _build2("drive", "v3", credentials=_creds2, cache_discovery=False)
                                 pdf_bytes = _svc2.files().get_media(fileId=fid).execute()
-                                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False, dir="/tmp") as tf2:
-                                    tf2.write(pdf_bytes)
-                                    tmp_pdf = tf2.name
-                                texts = []
-                                with pdfplumber.open(tmp_pdf) as pdf_doc:
-                                    for pg in pdf_doc.pages:
-                                        t = pg.extract_text()
-                                        if t and t.strip():
-                                            texts.append(t.strip())
-                                Path(tmp_pdf).unlink(missing_ok=True)
-                                if texts:
-                                    docs = [_Doc2(page_content="\n\n".join(texts), metadata={"source": fname})]
-                                    logger.info(f"[{task_id}] pdfplumber fallback OK: {fname} ({len(texts)} pages)")
+                                docs = _extract_pdf_documents_from_bytes(pdf_bytes, fname)
+                                if docs:
+                                    logger.info(f"[{task_id}] pdf/OCR fallback OK: {fname} ({len(docs)} pages)")
                                 else:
-                                    raise RuntimeError("pdfplumber extracted no text")
+                                    raise RuntimeError("pdfplumber/OCR extracted no text")
                             except Exception as _fe:
                                 logger.warning(f"[{task_id}] pdfplumber fallback failed for {fid}: {_fe}")
                                 error_detail2 = f"{error_detail} | pdfplumber: {_fe}"
