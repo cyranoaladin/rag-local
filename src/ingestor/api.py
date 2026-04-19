@@ -684,7 +684,7 @@ def _download_drive_file_bytes(file_id: str) -> bytes:
         scopes=["https://www.googleapis.com/auth/drive.readonly"],
     )
     svc = _build("drive", "v3", credentials=creds, cache_discovery=False)
-    return svc.files().get_media(fileId=file_id).execute()
+    return cast(bytes, svc.files().get_media(fileId=file_id).execute())
 
 
 def _documents_have_text(docs: list[Any]) -> bool:
