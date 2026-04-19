@@ -20,7 +20,8 @@ def test_drive_sync_is_collection_specific_for_dedicated_collections(tmp_path: P
 
     manager.mark_as_ingested(file_meta, content_fingerprint="fp-1", collection_name="rag_education")
 
-    monkeypatch.setattr(manager, "_get_drive_service", lambda: object())
+    from unittest.mock import MagicMock
+    monkeypatch.setattr(manager, "_get_drive_service", MagicMock())
     monkeypatch.setattr(manager, "_fetch_all_files", lambda _service, _folder_id: [file_meta])
 
     assert manager.list_updates("folder-1", collection_name="rag_education") == []

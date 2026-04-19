@@ -117,8 +117,9 @@ def _resolve_search_target(
     )
     effective_filters = dict(payload.filters)
     maths_fallback_applied = False
+    explicit_collection_override = bool(payload.collection and payload.collection.strip())
 
-    if (payload.section or "").strip().lower() != "maths_premiere":
+    if explicit_collection_override or (payload.section or "").strip().lower() != "maths_premiere":
         return requested_collection, effective_filters, maths_fallback_applied
 
     dedicated_collection = client.get_or_create_collection(
@@ -619,23 +620,28 @@ def _ocr_pdf_bytes(pdf_bytes: bytes, max_pages: int = 5) -> list[str]:
         pdf_path = Path(tmpdir) / "input.pdf"
         pdf_path.write_bytes(pdf_bytes)
         output_prefix = Path(tmpdir) / "page"
-        subprocess.run(
-            [
-                "pdftoppm",
-                "-png",
-                "-r",
-                "200",
-                "-f",
-                "1",
-                "-l",
-                str(max(1, max_pages)),
-                str(pdf_path),
-                str(output_prefix),
-            ],
-            check=True,
-            capture_output=True,
-            timeout=120,
-        )
+        try:
+            subprocess.run(
+                [
+                    "pdftoppm",
+                    "-png",
+                    "-r",
+                    "200",
+                    "-f",
+                    "1",
+                    "-l",
+                    str(max(1, max_pages)),
+                    str(pdf_path),
+                    str(output_prefix),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=120,
+            )
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"pdftoppm failed or not installed: {e}")
+            return []
+
         for image_path in sorted(Path(tmpdir).glob("page-*.png")):
             with Image.open(image_path) as image:
                 try:

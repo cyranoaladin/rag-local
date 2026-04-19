@@ -65,6 +65,12 @@ def select_rows_for_backfill(
     for idx, chunk_id in enumerate(ids):
         if chunk_id in existing_ids:
             continue
+            
+        emb = embeddings[idx] if idx < len(embeddings) else None
+        if emb is None:
+            # Skip rows without embeddings to avoid Chroma errors
+            continue
+
         ids_to_add.append(chunk_id)
         docs_to_add.append(str(documents[idx]))
         metas_to_add.append(
@@ -74,7 +80,6 @@ def select_rows_for_backfill(
                 target_section=target_section,
             )
         )
-        emb = embeddings[idx] if idx < len(embeddings) else None
         if hasattr(emb, "tolist"):
             emb = emb.tolist()
         embs_to_add.append(emb)
@@ -104,33 +109,51 @@ def backfill_collection(
         metadata={"hnsw:space": "cosine"},
     )
 
-    rows = source.get(
-        where=build_where(filters),
-        include=["documents", "metadatas", "embeddings"],
-    )
-    ids = list(rows.get("ids") or [])
-    existing_ids = set((target.get(ids=ids) or {}).get("ids", [])) if ids else set()
-    ids_to_add, docs_to_add, metas_to_add, embs_to_add = select_rows_for_backfill(
-        rows=rows,
-        target_collection=target_collection,
-        target_section=target_section,
-        existing_ids=existing_ids,
-    )
+    offset = 0
+    source_matches = 0
+    preexisting = 0
+    added = 0
 
-    if not dry_run:
-        for start in range(0, len(ids_to_add), batch_size):
+    where = build_where(filters)
+
+    while True:
+        rows = source.get(
+            where=where,
+            include=["documents", "metadatas", "embeddings"],
+            limit=batch_size,
+            offset=offset,
+        )
+        ids = list(rows.get("ids") or [])
+        if not ids:
+            break
+
+        source_matches += len(ids)
+        existing_ids = set((target.get(ids=ids) or {}).get("ids", [])) if ids else set()
+        preexisting += len(existing_ids)
+
+        ids_to_add, docs_to_add, metas_to_add, embs_to_add = select_rows_for_backfill(
+            rows=rows,
+            target_collection=target_collection,
+            target_section=target_section,
+            existing_ids=existing_ids,
+        )
+
+        if not dry_run and ids_to_add:
             target.add(
-                ids=ids_to_add[start:start + batch_size],
-                documents=docs_to_add[start:start + batch_size],
-                metadatas=metas_to_add[start:start + batch_size],
-                embeddings=embs_to_add[start:start + batch_size],
+                ids=ids_to_add,
+                documents=docs_to_add,
+                metadatas=metas_to_add,
+                embeddings=embs_to_add,
             )
+            added += len(ids_to_add)
+
+        offset += len(ids)
 
     return {
-        "source_matches": len(ids),
-        "preexisting": len(existing_ids),
-        "added": 0 if dry_run else len(ids_to_add),
-        "target_count": target.count() if not dry_run else target.count(),
+        "source_matches": source_matches,
+        "preexisting": preexisting,
+        "added": 0 if dry_run else added,
+        "target_count": target.count(),
     }
 
 
