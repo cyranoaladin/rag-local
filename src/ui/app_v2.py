@@ -971,9 +971,22 @@ elif page == "🔍 Recherche":
                             h["_collection"] = col_name
                         all_hits.extend(r["hits"])
                         searched_cols.append(col_name)
+                deduped_hits: dict[str, dict[str, Any]] = {}
+                for hit in all_hits:
+                    meta = hit.get("metadata", {})
+                    dedupe_key = str(
+                        meta.get("sha256")
+                        or hit.get("id")
+                        or meta.get("source")
+                        or ""
+                    ).strip()
+                    if not dedupe_key:
+                        dedupe_key = f"anon-{len(deduped_hits)}"
+                    current = deduped_hits.get(dedupe_key)
+                    if current is None or hit.get("score", 1.0) < current.get("score", 1.0):
+                        deduped_hits[dedupe_key] = hit
                 # Trier par score ascendant (distance cosinus — plus petit = meilleur)
-                all_hits.sort(key=lambda h: h.get("score", 1.0))
-                merged_hits = all_hits[:k]
+                merged_hits = sorted(deduped_hits.values(), key=lambda h: h.get("score", 1.0))[:k]
                 result: dict[str, Any] | None = {
                     "hits": merged_hits,
                     "collection": "toutes (" + ", ".join(searched_cols) + ")",
