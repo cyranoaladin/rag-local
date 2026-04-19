@@ -1099,7 +1099,7 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
             task.finished_at = time.time()
             return
 
-        updates = sync_manager.list_updates(folder_id)
+        updates = sync_manager.list_updates(folder_id, collection_name=target_col)
         if not updates:
             logger.info(f"[{task_id}] Aucune mise à jour pour le dossier Drive.")
             task.status = "done"
@@ -1304,7 +1304,11 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                     continue
 
                 content_fingerprint = get_content_fingerprint([(doc.page_content or "") for doc in docs])
-                if sync_manager.is_unchanged(file_meta, content_fingerprint):
+                if sync_manager.is_unchanged(
+                    file_meta,
+                    content_fingerprint,
+                    collection_name=target_col,
+                ):
                     logger.info(f"[{task_id}] Skipping unchanged file {fid} ({fname})")
                     task.skipped_files += 1
                     task.processed_files += 1
@@ -1356,7 +1360,11 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                     continue
 
                 # Mark as ingested
-                sync_manager.mark_as_ingested(file_meta, content_fingerprint=content_fingerprint)
+                sync_manager.mark_as_ingested(
+                    file_meta,
+                    content_fingerprint=content_fingerprint,
+                    collection_name=target_col,
+                )
 
             except Exception as e:
                 logger.error(f"[{task_id}] Error processing file {fid}: {e}")
