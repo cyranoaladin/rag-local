@@ -368,6 +368,69 @@ def test_search_maths_premiere_falls_back_to_education(monkeypatch: pytest.Monke
     assert fake_client.requested_names == ["rag_maths_premiere", "rag_education"]
 
 
+def test_background_drive_ingest_loads_docx_files(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="drive-token")
+
+    file_meta = {
+        "id": "docx-1",
+        "name": "cours.docx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "modifiedTime": "2026-04-19T07:00:00Z",
+    }
+    task = api.DriveTaskProgress(task_id="task-docx", folder_id="folder", target_collection="rag_maths_premiere")
+    api._drive_tasks["task-docx"] = task
+
+    monkeypatch.setattr(api.sync_manager, "verify_folder_access", lambda _folder_id: {"id": "folder"})
+    monkeypatch.setattr(api.sync_manager, "list_updates", lambda _folder_id, collection_name=None: [file_meta])
+    monkeypatch.setattr(api.sync_manager, "is_unchanged", lambda *args, **kwargs: False)
+    monkeypatch.setattr(api.sync_manager, "mark_as_ingested", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        api,
+        "_load_docx_documents_from_bytes",
+        lambda content_bytes, source_name: [api.Document(page_content="DOCX texte", metadata={"source": source_name})],
+    )
+    monkeypatch.setattr(api, "_download_drive_file_bytes", lambda file_id: b"docx-bytes")
+    monkeypatch.setattr(
+        api,
+        "_prepare_chunks_for_chroma",
+        lambda req, docs, extra_metadata=None: api.PreparedBatch(
+            ids=["h1"],
+            documents=[docs[0].page_content],
+            metadatas=[{"source": docs[0].metadata["source"]}],
+            modality="text",
+        ),
+    )
+    monkeypatch.setattr(api, "_index_batch", lambda *args, **kwargs: {"added": 1, "skipped": 0})
+
+    api.background_drive_ingest("folder", {"collection": "rag_maths_premiere"}, "task-docx")
+
+    assert task.status == "done"
+    assert task.file_results[0]["status"] == "ok"
+    assert task.added_chunks == 1
+
+
+def test_background_drive_ingest_marks_xlsx_as_unsupported(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = reload_api(monkeypatch, token="drive-token")
+
+    file_meta = {
+        "id": "xlsx-1",
+        "name": "planning.xlsx",
+        "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "modifiedTime": "2026-04-19T07:00:00Z",
+    }
+    task = api.DriveTaskProgress(task_id="task-xlsx", folder_id="folder", target_collection="rag_maths_premiere")
+    api._drive_tasks["task-xlsx"] = task
+
+    monkeypatch.setattr(api.sync_manager, "verify_folder_access", lambda _folder_id: {"id": "folder"})
+    monkeypatch.setattr(api.sync_manager, "list_updates", lambda _folder_id, collection_name=None: [file_meta])
+
+    api.background_drive_ingest("folder", {"collection": "rag_maths_premiere"}, "task-xlsx")
+
+    assert task.status == "done"
+    assert task.file_results[0]["status"] == "unsupported"
+    assert "spreadsheet" in task.file_results[0]["detail"].lower()
+
+
 def test_upload_media_requires_explicit_multimodal_mode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

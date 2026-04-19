@@ -532,6 +532,25 @@ def load_docx(file_path: str) -> list[Document]:
     return documents
 
 
+def _load_docx_documents_from_bytes(content_bytes: bytes, source_name: str) -> list[Document]:
+    """Persist Drive DOCX bytes briefly to reuse the existing DOCX loader pipeline."""
+    if not content_bytes:
+        return []
+
+    with tempfile.NamedTemporaryFile(suffix=".docx", delete=False, dir="/tmp") as tmp_docx:
+        tmp_docx.write(content_bytes)
+        tmp_path = tmp_docx.name
+    try:
+        documents = load_docx(tmp_path)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+    for document in documents:
+        if not document.metadata.get("source"):
+            document.metadata["source"] = source_name
+    return documents
+
+
 class TimedOllamaEmbeddings(OllamaEmbeddings):
     """Ollama embeddings client with explicit network timeout."""
 
@@ -655,9 +674,41 @@ def _extract_pdf_documents_from_bytes(pdf_bytes: bytes, source_name: str) -> lis
     return docs
 
 
+def _download_drive_file_bytes(file_id: str) -> bytes:
+    from google.oauth2 import service_account as _sa
+    from googleapiclient.discovery import build as _build
+
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    creds = _sa.Credentials.from_service_account_file(
+        creds_path,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+    )
+    svc = _build("drive", "v3", credentials=creds, cache_discovery=False)
+    return svc.files().get_media(fileId=file_id).execute()
+
+
 def _documents_have_text(docs: list[Any]) -> bool:
     """Return True when at least one loaded document has non-empty text content."""
     return any((getattr(doc, "page_content", "") or "").strip() for doc in docs)
+
+
+def _is_pdf_drive_file(file_name: str, mime_type: str) -> bool:
+    return str(file_name or "").lower().endswith(".pdf") or mime_type == "application/pdf"
+
+
+def _is_docx_drive_file(file_name: str, mime_type: str) -> bool:
+    return str(file_name or "").lower().endswith(".docx") or (
+        mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+
+def _is_office_spreadsheet_file(file_name: str, mime_type: str) -> bool:
+    file_name_lower = str(file_name or "").lower()
+    spreadsheet_mimes = {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+    }
+    return file_name_lower.endswith((".xlsx", ".xls")) or mime_type in spreadsheet_mimes
 
 
 def _validate_remote_url(url: str) -> None:
@@ -1256,8 +1307,22 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                 })
                 continue
 
+            if _is_office_spreadsheet_file(fname, mime_type):
+                logger.info(f"[{task_id}] Skipping unsupported spreadsheet Drive file {fid} ({fname}) [{mime_type}]")
+                task.skipped_files += 1
+                task.processed_files += 1
+                task.file_results.append({
+                    "name": fname,
+                    "status": "unsupported",
+                    "added": 0,
+                    "skipped": 1,
+                    "detail": "Type spreadsheet Office non supporté pour ce flux.",
+                })
+                continue
+
             # .doc ancien → conversion libreoffice avant chargement
             is_legacy_doc = fname_lower.endswith(".doc") or mime_type == "application/msword"
+            is_modern_docx = _is_docx_drive_file(fname, mime_type)
 
             try:
                 logger.info(f"[{task_id}] Processing file {fid} ({fname})")
@@ -1292,18 +1357,21 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                         # Fallback: tenter GoogleDriveLoader
                         docs = []
 
-                # Cas 2 : .doc ancien → libreoffice → .docx → python-docx
+                # Cas 2 : .docx moderne → téléchargement direct → pipeline DOCX
+                elif is_modern_docx:
+                    try:
+                        content_bytes = _download_drive_file_bytes(fid)
+                        docs = _load_docx_documents_from_bytes(content_bytes, fname)
+                        logger.info(f"[{task_id}] .docx loaded directly: {fname}")
+                    except Exception as _e:
+                        logger.warning(f"[{task_id}] .docx load failed for {fid}: {_e}")
+                        docs = []
+
+                # Cas 3 : .doc ancien → libreoffice → .docx → python-docx
                 elif is_legacy_doc:
                     try:
-                        from google.oauth2 import service_account as _sa
-                        from googleapiclient.discovery import build as _build
                         import subprocess
-                        _creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-                        _creds = _sa.Credentials.from_service_account_file(
-                            _creds_path, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-                        )
-                        _svc = _build("drive", "v3", credentials=_creds, cache_discovery=False)
-                        content_bytes = _svc.files().get_media(fileId=fid).execute()
+                        content_bytes = _download_drive_file_bytes(fid)
                         with tempfile.NamedTemporaryFile(suffix=".doc", delete=False, dir="/tmp") as tf:
                             tf.write(content_bytes)
                             tmp_doc = tf.name
@@ -1324,23 +1392,15 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                         logger.warning(f"[{task_id}] .doc conversion failed for {fid}: {_e}")
                         docs = []
 
-                # Cas 3 : chargement standard via GoogleDriveLoader
-                if not docs and mime_type not in google_workspace_export and not is_legacy_doc:
+                # Cas 4 : chargement standard via GoogleDriveLoader
+                if not docs and mime_type not in google_workspace_export and not is_legacy_doc and not is_modern_docx:
                     kwargs = loader_kwargs_base.copy()
                     kwargs["file_ids"] = [fid]
                     try:
                         loader = GoogleDriveLoader(**kwargs)
                         docs = loader.load()
-                        if not _documents_have_text(docs) and mime_type == "application/pdf":
-                            from google.oauth2 import service_account as _sa2
-                            from googleapiclient.discovery import build as _build2
-
-                            _creds_path2 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-                            _creds2 = _sa2.Credentials.from_service_account_file(
-                                _creds_path2, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-                            )
-                            _svc2 = _build2("drive", "v3", credentials=_creds2, cache_discovery=False)
-                            pdf_bytes = _svc2.files().get_media(fileId=fid).execute()
+                        if not _documents_have_text(docs) and _is_pdf_drive_file(fname, mime_type):
+                            pdf_bytes = _download_drive_file_bytes(fid)
                             docs = _extract_pdf_documents_from_bytes(pdf_bytes, fname)
                             if docs:
                                 logger.info(f"[{task_id}] pdf/OCR fallback OK after empty loader result: {fname}")
@@ -1348,16 +1408,9 @@ def background_drive_ingest(folder_id: str, metadata: dict, task_id: str) -> Non
                         error_detail = str(e)
                         # Fallback pdfplumber pour PDFs corrompus (EOF marker not found)
                         pdf_error_markers = ("eof marker", "startxref", "cannot read an empty", "trailer", "malformed pdf", "invalid pdf", "file is not a pdf")
-                        if any(m in error_detail.lower() for m in pdf_error_markers):
+                        if _is_pdf_drive_file(fname, mime_type) and any(m in error_detail.lower() for m in pdf_error_markers):
                             try:
-                                from google.oauth2 import service_account as _sa2
-                                from googleapiclient.discovery import build as _build2
-                                _creds_path2 = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
-                                _creds2 = _sa2.Credentials.from_service_account_file(
-                                    _creds_path2, scopes=["https://www.googleapis.com/auth/drive.readonly"]
-                                )
-                                _svc2 = _build2("drive", "v3", credentials=_creds2, cache_discovery=False)
-                                pdf_bytes = _svc2.files().get_media(fileId=fid).execute()
+                                pdf_bytes = _download_drive_file_bytes(fid)
                                 docs = _extract_pdf_documents_from_bytes(pdf_bytes, fname)
                                 if docs:
                                     logger.info(f"[{task_id}] pdf/OCR fallback OK: {fname} ({len(docs)} pages)")
